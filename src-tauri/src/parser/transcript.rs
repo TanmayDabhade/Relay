@@ -66,7 +66,7 @@ mod tests {
     impl TempFile {
         fn new(name: &str) -> Self {
             let path = std::env::temp_dir().join(format!(
-                "manageai-transcript-test-{}-{name}.jsonl",
+                "relay-transcript-test-{}-{name}.jsonl",
                 std::process::id()
             ));
             Self(path)

@@ -16,6 +16,10 @@ export function useDataChangedEvents() {
     const unlisten = listen("data-changed", () => {
       queryClient.invalidateQueries({ queryKey: ["projects"] });
       queryClient.invalidateQueries({ queryKey: ["sessions"] });
+      // Prefix match: invalidates every ["session-detail", id] entry regardless of which
+      // session it's for, so an open SessionDetailModal picks up a just-finished summary,
+      // tags, or finalized cost without the user having to close and reopen it.
+      queryClient.invalidateQueries({ queryKey: ["session-detail"] });
     });
 
     return () => {

@@ -79,22 +79,23 @@ multiple sentences."
     )
 }
 
-/// Builds the summarization prompt for `session_id`, or `Ok(None)` if there's nothing worth
-/// summarizing (no `raw_log_path` row, or the transcript has no captured first-user text).
-/// The caller treats `Ok(None)` as "skip the API call entirely, leave `summary` `NULL`."
-/// Synchronous and DB/filesystem-bound — callers must not hold this call across an `.await`
-/// on the network request that follows it, only around the (brief) DB lock needed to run it.
-pub fn prompt_for_session(
+/// The DB-derived inputs a prompt needs, gathered while the DB lock is held — deliberately
+/// separate from the file read that follows, so a caller can drop the lock before doing that
+/// I/O. See [`build_prompt_from_context`].
+pub struct SessionPromptContext {
+    pub raw_log_path: String,
+    pub file_paths: Vec<String>,
+}
+
+/// DB-only half of prompt construction: two quick queries, no filesystem access. Callers hold
+/// the DB lock for this call and this call alone — `None` means "no `raw_log_path` row for
+/// this session," the same "nothing to summarize" signal `build_prompt_from_context` gives for
+/// its own no-data case.
+pub fn session_prompt_context(
     conn: &rusqlite::Connection,
     session_id: &str,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<Option<SessionPromptContext>> {
     let Some(raw_log_path) = queries::session_raw_log_path(conn, session_id)? else {
-        return Ok(None);
-    };
-
-    let excerpts = parser::extract_excerpts(&raw_log_path)?;
-
-    let Some(first_user_text) = excerpts.first_user_text else {
         return Ok(None);
     };
 
@@ -110,10 +111,34 @@ pub fn prompt_for_session(
         None => Vec::new(),
     };
 
+    Ok(Some(SessionPromptContext {
+        raw_log_path,
+        file_paths,
+    }))
+}
+
+/// Filesystem half of prompt construction: re-reads the session's raw log (via
+/// `parser::extract_excerpts`) and composes the final prompt. Takes no DB connection and does
+/// no locking — callers must call this *after* dropping the DB lock used to obtain `ctx` via
+/// [`session_prompt_context`], never while still holding it, since this does a full-file read
+/// and parse that can be slow on a large session log (PLAN.md notes real sessions "can exceed
+/// 1000 lines"). Holding the process's single shared DB connection mutex across that would
+/// block every other DB access — every UI command, the next sweep tick, everything — for as
+/// long as this read takes.
+///
+/// `Ok(None)` (no captured first-user text) means the same thing it did in the pre-split
+/// `prompt_for_session`: skip the API call entirely, leave `summary` `NULL`.
+pub fn build_prompt_from_context(ctx: &SessionPromptContext) -> anyhow::Result<Option<String>> {
+    let excerpts = parser::extract_excerpts(&ctx.raw_log_path)?;
+
+    let Some(first_user_text) = excerpts.first_user_text else {
+        return Ok(None);
+    };
+
     Ok(Some(build_prompt(&PromptInputs {
         first_user_text,
         last_assistant_text: excerpts.last_assistant_text,
-        file_paths,
+        file_paths: ctx.file_paths.clone(),
     })))
 }
 
@@ -205,14 +230,40 @@ mod tests {
     }
 
     #[test]
-    fn prompt_for_session_returns_none_for_unknown_session_id() {
+    fn session_prompt_context_returns_none_for_unknown_session_id() {
         // Mirrors `parser::session_builder::tests::in_memory_db` — a fresh in-memory DB with
         // the schema applied but no rows, so `session_raw_log_path` legitimately finds nothing.
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch(include_str!("../../migrations/0001_init.sql"))
             .unwrap();
 
-        let result = prompt_for_session(&conn, "does-not-exist").unwrap();
+        let result = session_prompt_context(&conn, "does-not-exist").unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn build_prompt_from_context_reads_the_real_log_file_and_composes_a_prompt() {
+        // Glue test for the split (context-gathering vs. file-reading) — the two halves are
+        // each already covered above (build_prompt) and in parser::transcript's own tests
+        // (extract_excerpts against this same fixture), so this only needs to confirm the glue
+        // works end to end, not re-prove either half's correctness.
+        let ctx = SessionPromptContext {
+            raw_log_path: concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/session_basic.jsonl")
+                .to_string(),
+            file_paths: vec!["src/main.rs".to_string()],
+        };
+
+        let prompt = build_prompt_from_context(&ctx).unwrap().unwrap();
+        assert!(prompt.contains("Add a hello world main function"));
+        assert!(prompt.contains("src/main.rs"));
+    }
+
+    #[test]
+    fn build_prompt_from_context_errors_on_unreadable_path_without_panicking() {
+        let ctx = SessionPromptContext {
+            raw_log_path: "/nonexistent/path/does-not-exist.jsonl".to_string(),
+            file_paths: vec![],
+        };
+        assert!(build_prompt_from_context(&ctx).is_err());
     }
 }

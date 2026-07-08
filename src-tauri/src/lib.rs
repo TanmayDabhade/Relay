@@ -29,7 +29,7 @@ pub fn run() {
       }
 
       let app_data_dir = app.path().app_data_dir()?;
-      let db_path = app_data_dir.join("manageai.db");
+      let db_path = app_data_dir.join("relay.db");
       let conn = db::open(&db_path)?;
       // Backfill cost_usd once at startup for sessions ingested before cost calculation
       // existed (their cost_usd is stuck at 0 in the DB otherwise).
@@ -96,6 +96,15 @@ fn backfill_session_costs(conn: &rusqlite::Connection) {
 /// Ticks every `SWEEP_INTERVAL_SECS`, finalizing any session that has gone idle for longer
 /// than `IDLE_THRESHOLD_SECS`. Runs on Tauri's async runtime (not a raw OS thread, unlike the
 /// watcher's blocking `notify` loop — this is a plain async interval loop).
+///
+/// Lock discipline: the DB connection is behind a single shared `Mutex` that every UI command
+/// also contends on, so this tick never holds it across the file I/O that tag-classification
+/// needs (a full read + parse of a session's raw log — PLAN.md notes real sessions "can exceed
+/// 1000 lines"). The tick runs in three phases instead of one long locked section: gather
+/// (locked, DB-only), compute (unlocked, file I/O + classification), write (locked again,
+/// briefly). A backlog of many idle sessions at once — e.g. the first tick after a long time
+/// away from the app — would otherwise stall every other DB access for the whole backlog's
+/// combined read time.
 fn spawn_idle_sweep(app_handle: tauri::AppHandle) {
   tauri::async_runtime::spawn(async move {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(SWEEP_INTERVAL_SECS));
@@ -103,53 +112,95 @@ fn spawn_idle_sweep(app_handle: tauri::AppHandle) {
       interval.tick().await;
 
       let db = app_handle.state::<db::Db>();
-      let conn = db.0.lock().unwrap();
       let now = chrono::Utc::now().timestamp();
 
-      let ids = match db::queries::sessions_to_finalize(&conn, IDLE_THRESHOLD_SECS, now) {
-        Ok(ids) => ids,
-        Err(e) => {
-          log::warn!("idle sweep: failed to query sessions_to_finalize: {e:#}");
-          continue;
-        }
-      };
+      // Phase 1 (locked, DB-only): finalize idle sessions, then gather what tag
+      // classification needs — just an id + raw_log_path pair per session, no file I/O yet.
+      let (any_finalized, tag_targets) = {
+        let conn = db.0.lock().unwrap();
 
-      let mut any_finalized = false;
-      for id in &ids {
-        match db::queries::finalize_session(&conn, id) {
-          Ok(()) => any_finalized = true,
-          Err(e) => log::warn!("idle sweep: failed to finalize session {id}: {e:#}"),
-        }
-      }
+        let ids = match db::queries::sessions_to_finalize(&conn, IDLE_THRESHOLD_SECS, now) {
+          Ok(ids) => ids,
+          Err(e) => {
+            log::warn!("idle sweep: failed to query sessions_to_finalize: {e:#}");
+            Vec::new()
+          }
+        };
 
-      // Tag classification runs after finalize in this same tick, since `sessions_needing_tags`
-      // only returns 'ended' sessions — a session finalized above becomes eligible immediately.
-      // This also naturally backfills tags for any session finalized before this feature
-      // existed, same pattern as `backfill_session_costs` at startup.
-      let mut any_tagged = false;
-      match db::queries::sessions_needing_tags(&conn) {
-        Ok(tag_ids) => {
-          for id in &tag_ids {
-            if tag_session(&conn, id) {
-              any_tagged = true;
-            }
+        let mut any_finalized = false;
+        for id in &ids {
+          match db::queries::finalize_session(&conn, id) {
+            Ok(()) => any_finalized = true,
+            Err(e) => log::warn!("idle sweep: failed to finalize session {id}: {e:#}"),
           }
         }
-        Err(e) => log::warn!("idle sweep: failed to query sessions_needing_tags: {e:#}"),
-      }
 
-      // Summary generation runs after tag classification in this same tick, for the same
-      // reason `tag_session` above does: `sessions_needing_summary` only returns 'ended'
-      // sessions, so a session finalized earlier in this tick is eligible immediately. Unlike
-      // finalize/tag (synchronous, DB-only), this step's work is a real network call, so each
-      // eligible session's summarization runs as its own spawned task rather than inline here
-      // — see `spawn_summary_tasks` for why, and for the DB-lock discipline that requires.
-      // Its tasks emit their own `data-changed` events on success (they complete well after
-      // this tick's synchronous work and its emit below), so they don't contribute to
-      // `any_finalized`/`any_tagged` here.
-      spawn_summary_tasks(&app_handle, &conn);
+        // Tag classification runs after finalize in this same tick, since `sessions_needing_tags`
+        // only returns 'ended' sessions — a session finalized above becomes eligible immediately.
+        // This also naturally backfills tags for any session finalized before this feature
+        // existed, same pattern as `backfill_session_costs` at startup.
+        let tag_targets = match db::queries::sessions_needing_tags(&conn) {
+          Ok(tag_ids) => tag_ids
+            .into_iter()
+            .map(|id| {
+              let raw_log_path = match db::queries::session_raw_log_path(&conn, &id) {
+                Ok(Some(path)) => path,
+                Ok(None) => {
+                  log::warn!("idle sweep: session {id} has no raw_log_path row, tagging as empty");
+                  String::new()
+                }
+                Err(e) => {
+                  log::warn!("idle sweep: failed to look up raw_log_path for session {id}: {e:#}");
+                  String::new()
+                }
+              };
+              (id, raw_log_path)
+            })
+            .collect::<Vec<_>>(),
+          Err(e) => {
+            log::warn!("idle sweep: failed to query sessions_needing_tags: {e:#}");
+            Vec::new()
+          }
+        };
 
-      drop(conn);
+        (any_finalized, tag_targets)
+      }; // conn dropped here — file I/O below runs with no lock held.
+
+      // Phase 2 (unlocked): the actual file reads + classification, one per session needing
+      // tags. This is the I/O this whole three-phase split exists to keep off the DB lock.
+      let tag_writes: Vec<(String, String)> = tag_targets
+        .into_iter()
+        .map(|(id, raw_log_path)| {
+          let tags_json = compute_tags_json(&id, &raw_log_path);
+          (id, tags_json)
+        })
+        .collect();
+
+      // Phase 3 (locked again, briefly): write the computed tags back, then hand off to
+      // summary generation — which only needs the lock for its own quick `sessions_needing_summary`
+      // query here; each spawned summary task re-acquires the lock independently and briefly,
+      // for the same reason this phase does (see `spawn_summary_tasks`'s doc comment).
+      let any_tagged = {
+        let conn = db.0.lock().unwrap();
+
+        let mut any_tagged = false;
+        for (id, tags_json) in &tag_writes {
+          match db::queries::update_tags(&conn, id, tags_json) {
+            Ok(()) => any_tagged = true,
+            Err(e) => log::warn!("idle sweep: failed to write tags for session {id}: {e:#}"),
+          }
+        }
+
+        // Summary generation runs after tag classification in this same tick, for the same
+        // reason tag classification runs after finalize: `sessions_needing_summary` only
+        // returns 'ended' sessions, so a session finalized earlier in this tick is eligible
+        // immediately. Its tasks emit their own `data-changed` events on success (they
+        // complete well after this tick's synchronous work and its emit below), so they don't
+        // contribute to `any_finalized`/`any_tagged` here.
+        spawn_summary_tasks(&app_handle, &conn);
+
+        any_tagged
+      }; // conn dropped here.
 
       if any_finalized || any_tagged {
         let _ = app_handle.emit(
@@ -161,30 +212,20 @@ fn spawn_idle_sweep(app_handle: tauri::AppHandle) {
   });
 }
 
-/// Computes and stores tags for one session: reads its raw log, extracts the first user
-/// prompt's text, classifies it, and writes the result back. On any failure along the way
-/// (missing raw_log_path row, unreadable/missing log file, no first_user_text at all) still
-/// writes an empty tag list (`"[]"`) rather than leaving `tags` `NULL` — otherwise a session
-/// with an unreadable log would be retried, and logged about, on every single sweep tick
-/// forever. Returns whether a write actually happened (it always does, barring a DB error
-/// on the `update_tags` call itself) so the caller knows whether to emit `data-changed`.
-fn tag_session(conn: &rusqlite::Connection, session_id: &str) -> bool {
-  let raw_log_path = match db::queries::session_raw_log_path(conn, session_id) {
-    Ok(Some(path)) => path,
-    Ok(None) => {
-      log::warn!("idle sweep: session {session_id} has no raw_log_path row, tagging as empty");
-      String::new()
-    }
-    Err(e) => {
-      log::warn!("idle sweep: failed to look up raw_log_path for session {session_id}: {e:#}");
-      String::new()
-    }
-  };
-
+/// Computes the tag list for one session as a JSON array string: reads its raw log (no DB
+/// access — takes a path, not a connection, so it can run without any lock held), extracts the
+/// first user prompt's text, and classifies it. On any failure along the way (empty
+/// `raw_log_path`, unreadable/missing log file, no first_user_text at all) still returns an
+/// empty tag list (`"[]"`) rather than a value the caller would have to treat as "leave `tags`
+/// NULL" — otherwise a session with an unreadable log would be retried, and logged about, on
+/// every single sweep tick forever.
+fn compute_tags_json(session_id: &str, raw_log_path: &str) -> String {
+  // An empty raw_log_path means the gather phase already logged why (missing row or DB error)
+  // — nothing further to log here, just fall through to "no text captured."
   let first_user_text = if raw_log_path.is_empty() {
     None
   } else {
-    match parser::extract_excerpts(&raw_log_path) {
+    match parser::extract_excerpts(raw_log_path) {
       Ok(excerpts) => excerpts.first_user_text,
       Err(e) => {
         log::warn!(
@@ -196,15 +237,7 @@ fn tag_session(conn: &rusqlite::Connection, session_id: &str) -> bool {
   };
 
   let tags = tags::classify(&first_user_text.unwrap_or_default());
-  let tags_json = serde_json::to_string(&tags).unwrap_or_else(|_| "[]".to_string());
-
-  match db::queries::update_tags(conn, session_id, &tags_json) {
-    Ok(()) => true,
-    Err(e) => {
-      log::warn!("idle sweep: failed to write tags for session {session_id}: {e:#}");
-      false
-    }
-  }
+  serde_json::to_string(&tags).unwrap_or_else(|_| "[]".to_string())
 }
 
 /// Looks at every session with `status='ended' AND summary IS NULL`, skips any session
@@ -216,12 +249,14 @@ fn tag_session(conn: &rusqlite::Connection, session_id: &str) -> bool {
 /// the caller) for the synchronous `sessions_needing_summary` query below — it never awaits
 /// anything, so holding the caller's lock through this call is fine. Each *spawned* task,
 /// however, re-acquires the DB lock independently via its own `app_handle.state::<db::Db>()`
-/// call, only for its own brief synchronous parts (building the prompt, and later writing the
-/// result) — never across the `.await` on `summarize::call_anthropic_api` in between. Holding
-/// a `MutexGuard<Connection>` across that `.await` would be the bug this function exists to
-/// avoid: a slow/hanging network call would hold the single shared DB connection hostage,
-/// blocking every other DB access (including this same sweep's next tick, and any UI command)
-/// for as long as the request takes.
+/// call, and only for its two brief DB-only steps — gathering prompt context
+/// (`session_prompt_context`) and, later, writing the result — never across the file read in
+/// between (`build_prompt_from_context`, a full read + parse of the session's raw log) or the
+/// `.await` on `summarize::call_anthropic_api` that follows it. Holding a
+/// `MutexGuard<Connection>` across either of those would be the bug this function exists to
+/// avoid: a slow file read or a hanging network call would hold the single shared DB
+/// connection hostage, blocking every other DB access (including this same sweep's next tick,
+/// and any UI command) for as long as it takes.
 fn spawn_summary_tasks(app_handle: &tauri::AppHandle, conn: &rusqlite::Connection) {
   let api_key = app_handle.state::<summarize::ApiKeyState>().0.clone();
   let Some(api_key) = api_key else {
@@ -273,15 +308,33 @@ fn spawn_summary_tasks(app_handle: &tauri::AppHandle, conn: &rusqlite::Connectio
       // branches. See `InFlightGuard`'s doc comment.
       let _guard = summarize::InFlightGuard::new(app_handle.clone(), session_id.clone());
 
-      let prompt_result = {
+      // DB-only: gather what's needed to build a prompt. `conn` (the MutexGuard) is dropped
+      // at the end of this block — held only for these two quick queries, never across the
+      // file read that follows or the `.await` after that.
+      let context_result = {
         let db = app_handle.state::<db::Db>();
         let conn = db.0.lock().unwrap();
-        // `conn` (the MutexGuard) is dropped at the end of this block, before the `.await`
-        // below — never held across it.
-        summarize::prompts::prompt_for_session(&conn, &session_id)
+        summarize::prompts::session_prompt_context(&conn, &session_id)
       };
 
-      let prompt = match prompt_result {
+      let context = match context_result {
+        Ok(Some(context)) => context,
+        Ok(None) => {
+          log::debug!(
+            "idle sweep: session {session_id} has no raw_log_path row; leaving summary NULL"
+          );
+          return;
+        }
+        Err(e) => {
+          log::warn!("idle sweep: failed to gather prompt context for session {session_id}: {e:#}");
+          return;
+        }
+      };
+
+      // Filesystem, no lock held: re-reads the session's raw log. This is the I/O the
+      // DB-lock/file-read split exists to keep off the shared connection mutex — see
+      // `build_prompt_from_context`'s doc comment.
+      let prompt = match summarize::prompts::build_prompt_from_context(&context) {
         Ok(Some(prompt)) => prompt,
         Ok(None) => {
           log::debug!(

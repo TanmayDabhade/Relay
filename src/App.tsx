@@ -13,7 +13,7 @@ function App() {
 
   return (
     <div className="app-shell">
-      <Sidebar active={activeView} onSelect={setActiveView} footer="Manageai v0.1.0" />
+      <Sidebar active={activeView} onSelect={setActiveView} footer="Relay v0.1.0" />
       <main className="app-main">
         {activeView === "projects" && <ProjectsView />}
         {activeView === "sessions" && <SessionsView />}

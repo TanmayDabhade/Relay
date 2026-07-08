@@ -24,7 +24,7 @@ interface SidebarProps {
 export function Sidebar({ active, onSelect, footer }: SidebarProps) {
   return (
     <aside className="sidebar">
-      <div className="sidebar-brand">Manageai</div>
+      <div className="sidebar-brand">Relay</div>
       <div className="sidebar-section-label">Workspace</div>
       <nav>
         {NAV_ITEMS.map((item) => (

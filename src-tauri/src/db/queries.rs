@@ -360,6 +360,21 @@ pub fn update_tags(conn: &Connection, session_id: &str, tags_json: &str) -> rusq
     Ok(())
 }
 
+/// Looks up just `raw_log_path` for a single session — used by the tag-classification sweep,
+/// which needs this one field per id and shouldn't pull a full `list_sessions()` scan to get
+/// it.
+pub fn session_raw_log_path(
+    conn: &Connection,
+    session_id: &str,
+) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT raw_log_path FROM sessions WHERE id = ?1",
+        params![session_id],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
 // --- Cost recompute (pricing-table edits applied without re-parsing logs) ---
 
 pub fn update_cost(conn: &Connection, session_id: &str, cost_usd: f64) -> rusqlite::Result<()> {
@@ -368,6 +383,31 @@ pub fn update_cost(conn: &Connection, session_id: &str, cost_usd: f64) -> rusqli
         params![session_id, cost_usd],
     )?;
     Ok(())
+}
+
+/// Single-session variant of `all_session_token_totals`, used right after `upsert_session` to
+/// read back the now-updated accumulated totals for cost recomputation (see
+/// `session_builder::ingest_record`) without re-parsing logs.
+pub fn session_token_totals(
+    conn: &Connection,
+    session_id: &str,
+) -> rusqlite::Result<Option<SessionTokenTotals>> {
+    conn.query_row(
+        "SELECT id, model, prompt_tokens, completion_tokens, cache_read_tokens, cache_creation_tokens
+         FROM sessions WHERE id = ?1",
+        params![session_id],
+        |row| {
+            Ok(SessionTokenTotals {
+                id: row.get(0)?,
+                model: row.get(1)?,
+                prompt_tokens: row.get(2)?,
+                completion_tokens: row.get(3)?,
+                cache_read_tokens: row.get(4)?,
+                cache_creation_tokens: row.get(5)?,
+            })
+        },
+    )
+    .optional()
 }
 
 pub fn all_session_token_totals(conn: &Connection) -> rusqlite::Result<Vec<SessionTokenTotals>> {

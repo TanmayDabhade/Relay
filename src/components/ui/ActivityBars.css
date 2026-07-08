@@ -1,0 +1,14 @@
+.activity-bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 16px;
+}
+
+.activity-bar {
+  flex: 1;
+  min-width: 2px;
+  max-width: 4px;
+  border-radius: 1px;
+  background: var(--border-strong);
+}

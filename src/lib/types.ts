@@ -41,3 +41,8 @@ export interface Session {
   tags: string | null;
   raw_log_path: string;
 }
+
+export interface SessionDetail {
+  session: Session;
+  files_changed: FileChanged[];
+}

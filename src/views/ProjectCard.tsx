@@ -1,22 +1,28 @@
+import { useQuery } from "@tanstack/react-query";
+import { ActivityBars } from "../components/ui/ActivityBars";
 import { Pill } from "../components/ui/Pill";
+import { formatRelativeTime } from "../lib/format";
+import { getProjectActivity } from "../lib/tauri";
 import type { ProjectSummary } from "../lib/types";
 import "./ProjectCard.css";
-
-function formatRelativeTime(unixSeconds: number): string {
-  const diffMs = Date.now() - unixSeconds * 1000;
-  const diffMin = Math.round(diffMs / 60000);
-  if (diffMin < 1) return "just now";
-  if (diffMin < 60) return `${diffMin}m ago`;
-  const diffHr = Math.round(diffMin / 60);
-  if (diffHr < 24) return `${diffHr}h ago`;
-  return `${Math.round(diffHr / 24)}d ago`;
-}
 
 interface ProjectCardProps {
   project: ProjectSummary;
 }
 
+/** All-zero 14-day placeholder shown while activity data hasn't loaded yet (or failed to,
+ * e.g. outside a real Tauri context) — never blocks the rest of the card's render. */
+const EMPTY_ACTIVITY = new Array(14).fill(0);
+
 export function ProjectCard({ project }: ProjectCardProps) {
+  const { data: activity } = useQuery({
+    queryKey: ["project-activity", project.path],
+    queryFn: () => getProjectActivity(project.path),
+    // Decorative only — a failure here (e.g. dev-server smoke test outside a real Tauri
+    // context) should just leave the placeholder shown, not retry noisily or surface an error.
+    retry: false,
+  });
+
   return (
     <div className="project-card">
       <div className="project-card-header">
@@ -33,6 +39,7 @@ export function ProjectCard({ project }: ProjectCardProps) {
         <span>${project.total_cost_usd.toFixed(2)} spent</span>
         <span>active {formatRelativeTime(project.last_active)}</span>
       </div>
+      <ActivityBars data={activity ?? EMPTY_ACTIVITY} />
     </div>
   );
 }

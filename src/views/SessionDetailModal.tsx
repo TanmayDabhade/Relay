@@ -1,6 +1,8 @@
 import { useQuery } from "@tanstack/react-query";
+import { Button } from "../components/ui/Button";
 import { Modal } from "../components/ui/Modal";
 import { Pill } from "../components/ui/Pill";
+import { StatTile } from "../components/ui/StatTile";
 import { getSessionDetail, openInEditor } from "../lib/tauri";
 import "./SessionDetailModal.css";
 
@@ -65,55 +67,29 @@ function SessionDetailContent({
   const { session, files_changed } = detail;
   const tags = parseTags(session.tags);
 
+  const durationDisplay =
+    session.status === "ended" && session.duration_seconds !== null
+      ? `${session.duration_seconds}s`
+      : "—";
+
   return (
     <div className="session-detail">
+      <div className="session-detail-identity">
+        <Pill variant="status" tone={session.status === "active" ? "green" : "gray"}>
+          {session.status}
+        </Pill>
+        <span className="session-detail-model">{session.model ?? "unknown model"}</span>
+      </div>
+
       <div className="session-detail-stats">
-        <div>
-          <span className="session-detail-label">Status</span>
-          <Pill variant="status" tone={session.status === "active" ? "green" : "gray"}>
-            {session.status}
-          </Pill>
-        </div>
-        <div>
-          <span className="session-detail-label">Model</span>
-          <span>{session.model ?? "unknown"}</span>
-        </div>
-        <div>
-          <span className="session-detail-label">Duration</span>
-          <span>
-            {session.status === "ended" && session.duration_seconds !== null
-              ? `${session.duration_seconds}s`
-              : "—"}
-          </span>
-        </div>
-        <div>
-          <span className="session-detail-label">Cost</span>
-          <span>${session.cost_usd.toFixed(2)}</span>
-        </div>
-        <div>
-          <span className="session-detail-label">Prompt tokens</span>
-          <span>{session.prompt_tokens}</span>
-        </div>
-        <div>
-          <span className="session-detail-label">Completion tokens</span>
-          <span>{session.completion_tokens}</span>
-        </div>
-        <div>
-          <span className="session-detail-label">Cache read tokens</span>
-          <span>{session.cache_read_tokens}</span>
-        </div>
-        <div>
-          <span className="session-detail-label">Cache creation tokens</span>
-          <span>{session.cache_creation_tokens}</span>
-        </div>
-        <div>
-          <span className="session-detail-label">Lines added</span>
-          <span>{session.lines_added}</span>
-        </div>
-        <div>
-          <span className="session-detail-label">Lines removed</span>
-          <span>{session.lines_removed}</span>
-        </div>
+        <StatTile value={durationDisplay} label="Duration" />
+        <StatTile value={`$${session.cost_usd.toFixed(2)}`} label="Cost" />
+        <StatTile value={session.prompt_tokens} label="Prompt tokens" />
+        <StatTile value={session.completion_tokens} label="Completion tokens" />
+        <StatTile value={session.cache_read_tokens} label="Cache read tokens" />
+        <StatTile value={session.cache_creation_tokens} label="Cache creation tokens" />
+        <StatTile value={session.lines_added} label="Lines added" />
+        <StatTile value={session.lines_removed} label="Lines removed" />
       </div>
 
       {tags.length > 0 && (
@@ -146,12 +122,13 @@ function SessionDetailContent({
                     {file.change_type} · +{file.lines_added} / -{file.lines_removed}
                   </span>
                 </div>
-                <button
+                <Button
+                  variant="secondary"
                   className="session-detail-file-open"
                   onClick={() => handleOpenInEditor(file.file_path)}
                 >
                   Open
-                </button>
+                </Button>
               </li>
             ))}
           </ul>

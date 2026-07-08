@@ -1,0 +1,1392 @@
+# Review package: Task G2 (baseline b6d02ca..working tree, Batch G2 files only)
+
+NOTE: src/App.tsx, src/views/SessionsView.tsx/.css, src/views/TimelineView.tsx/.css,
+src/views/ProjectCard.tsx, src/views/SessionDetailModal.tsx/.css,
+src/components/ui/Modal.css, and src/main.tsx also carry already-approved changes
+from earlier tasks (nothing committed this session, diffs stack against the same
+baseline). Only judge the incremental G2 addition in each — layout/topbar/component-swap
+changes — against this task's brief; do not re-flag already-reviewed content
+(e.g. SessionsView's original row-rendering logic before extraction, TimelineView's
+filter logic itself, SessionDetailModal's data-fetching, Modal's G1 value fixes).
+
+## Files changed for Task G2
+src/views/ProjectDetail.tsx + ProjectDetail.css (new)
+src/views/SessionRow.tsx + SessionRow.css (new — extracted from SessionsView)
+src/views/ProjectsView.tsx + ProjectsView.css (modified — master-detail layout)
+src/views/ProjectCard.tsx (modified — selected state)
+src/views/SessionsView.tsx + SessionsView.css (modified — topbar, uses extracted SessionRow)
+src/views/TimelineView.tsx + TimelineView.css (modified — topbar, Select/Button swap)
+src/views/SessionDetailModal.tsx + SessionDetailModal.css (modified — StatTile/Button swap)
+src/views/ComingSoonView.tsx + ComingSoonView.css (modified — card wrapper)
+src/styles/global.css (modified — .view-topbar-title shared class)
+src/App.tsx (modified — any wiring adjustments)
+
+## Diff
+diff --git a/src/App.tsx b/src/App.tsx
+index a66b5ef..eb9173e 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -1,122 +1,28 @@
+-import { useState } from 'react'
+-import reactLogo from './assets/react.svg'
+-import viteLogo from './assets/vite.svg'
+-import heroImg from './assets/hero.png'
+-import './App.css'
++import { useState } from "react";
++import { Sidebar, type View } from "./components/nav/Sidebar";
++import { useDataChangedEvents } from "./hooks/useDataChangedEvents";
++import { ProjectsView } from "./views/ProjectsView";
++import { SessionsView } from "./views/SessionsView";
++import { TimelineView } from "./views/TimelineView";
++import { ComingSoonView } from "./views/ComingSoonView";
+ 
+ function App() {
+-  const [count, setCount] = useState(0)
++  const [activeView, setActiveView] = useState<View>("projects");
+ 
+-  return (
+-    <>
+-      <section id="center">
+-        <div className="hero">
+-          <img src={heroImg} className="base" width="170" height="179" alt="" />
+-          <img src={reactLogo} className="framework" alt="React logo" />
+-          <img src={viteLogo} className="vite" alt="Vite logo" />
+-        </div>
+-        <div>
+-          <h1>Get started</h1>
+-          <p>
+-            Edit <code>src/App.tsx</code> and save to test <code>HMR</code>
+-          </p>
+-        </div>
+-        <button
+-          type="button"
+-          className="counter"
+-          onClick={() => setCount((count) => count + 1)}
+-        >
+-          Count is {count}
+-        </button>
+-      </section>
+-
+-      <div className="ticks"></div>
++  useDataChangedEvents();
+ 
+-      <section id="next-steps">
+-        <div id="docs">
+-          <svg className="icon" role="presentation" aria-hidden="true">
+-            <use href="/icons.svg#documentation-icon"></use>
+-          </svg>
+-          <h2>Documentation</h2>
+-          <p>Your questions, answered</p>
+-          <ul>
+-            <li>
+-              <a href="https://vite.dev/" target="_blank">
+-                <img className="logo" src={viteLogo} alt="" />
+-                Explore Vite
+-              </a>
+-            </li>
+-            <li>
+-              <a href="https://react.dev/" target="_blank">
+-                <img className="button-icon" src={reactLogo} alt="" />
+-                Learn more
+-              </a>
+-            </li>
+-          </ul>
+-        </div>
+-        <div id="social">
+-          <svg className="icon" role="presentation" aria-hidden="true">
+-            <use href="/icons.svg#social-icon"></use>
+-          </svg>
+-          <h2>Connect with us</h2>
+-          <p>Join the Vite community</p>
+-          <ul>
+-            <li>
+-              <a href="https://github.com/vitejs/vite" target="_blank">
+-                <svg
+-                  className="button-icon"
+-                  role="presentation"
+-                  aria-hidden="true"
+-                >
+-                  <use href="/icons.svg#github-icon"></use>
+-                </svg>
+-                GitHub
+-              </a>
+-            </li>
+-            <li>
+-              <a href="https://chat.vite.dev/" target="_blank">
+-                <svg
+-                  className="button-icon"
+-                  role="presentation"
+-                  aria-hidden="true"
+-                >
+-                  <use href="/icons.svg#discord-icon"></use>
+-                </svg>
+-                Discord
+-              </a>
+-            </li>
+-            <li>
+-              <a href="https://x.com/vite_js" target="_blank">
+-                <svg
+-                  className="button-icon"
+-                  role="presentation"
+-                  aria-hidden="true"
+-                >
+-                  <use href="/icons.svg#x-icon"></use>
+-                </svg>
+-                X.com
+-              </a>
+-            </li>
+-            <li>
+-              <a href="https://bsky.app/profile/vite.dev" target="_blank">
+-                <svg
+-                  className="button-icon"
+-                  role="presentation"
+-                  aria-hidden="true"
+-                >
+-                  <use href="/icons.svg#bluesky-icon"></use>
+-                </svg>
+-                Bluesky
+-              </a>
+-            </li>
+-          </ul>
+-        </div>
+-      </section>
+-
+-      <div className="ticks"></div>
+-      <section id="spacer"></section>
+-    </>
+-  )
++  return (
++    <div className="app-shell">
++      <Sidebar active={activeView} onSelect={setActiveView} footer="Manageai v0.1.0" />
++      <main className="app-main">
++        {activeView === "projects" && <ProjectsView />}
++        {activeView === "sessions" && <SessionsView />}
++        {activeView === "timeline" && <TimelineView />}
++        {activeView === "connections" && <ComingSoonView title="Connections" />}
++        {activeView === "agent-manager" && <ComingSoonView title="Agent Manager" />}
++      </main>
++    </div>
++  );
+ }
+ 
+-export default App
++export default App;
+diff --git a/src/styles/global.css b/src/styles/global.css
+index 7e59ca3..d165625 100644
+--- a/src/styles/global.css
++++ b/src/styles/global.css
+@@ -34,10 +34,19 @@ button {
+   display: flex;
+   height: 100vh;
+   overflow: hidden;
+ }
+ 
+ .app-main {
+   flex: 1;
+   overflow-y: auto;
+   padding: var(--space-6);
+ }
++
++/* Shared "topbar with title" pattern for full-width single-column views
++   (Sessions, Timeline) per SPEC §8.7. */
++.view-topbar-title {
++  font-size: var(--text-lg);
++  font-weight: 600;
++  color: var(--text-primary);
++  margin: 0;
++}
+diff --git a/src/views/ComingSoonView.css b/src/views/ComingSoonView.css
+new file mode 100644
+index 0000000..bc29313
+--- /dev/null
++++ b/src/views/ComingSoonView.css
+@@ -0,0 +1,33 @@
++.coming-soon-view {
++  height: 100%;
++  display: flex;
++  align-items: center;
++  justify-content: center;
++}
++
++/* Card treatment matches ProjectCard.css's established pattern: surface-card bg,
++   border-default border, 8px radius — reused here rather than inventing new values. */
++.coming-soon-card {
++  display: flex;
++  flex-direction: column;
++  align-items: center;
++  gap: var(--space-2);
++  padding: var(--space-8) var(--space-6);
++  border: 1px solid var(--border-default);
++  border-radius: 8px;
++  background: var(--surface-card);
++  text-align: center;
++  min-width: 280px;
++}
++
++.coming-soon-title {
++  font-size: var(--text-lg);
++  font-weight: 600;
++  color: var(--text-primary);
++  margin: 0;
++}
++
++.coming-soon-text {
++  color: var(--text-muted);
++  margin: 0;
++}
+diff --git a/src/views/ComingSoonView.tsx b/src/views/ComingSoonView.tsx
+index 7c4f366..a2bf179 100644
+--- a/src/views/ComingSoonView.tsx
++++ b/src/views/ComingSoonView.tsx
+@@ -1,14 +1,16 @@
++import "./ComingSoonView.css";
++
+ interface ComingSoonViewProps {
+   title: string;
+ }
+ 
+ export function ComingSoonView({ title }: ComingSoonViewProps) {
+   return (
+-    <div>
+-      <h1 style={{ fontSize: "var(--text-lg)", marginBottom: "var(--space-2)" }}>
+-        {title}
+-      </h1>
+-      <p style={{ color: "var(--text-muted)" }}>Coming soon.</p>
++    <div className="coming-soon-view">
++      <div className="coming-soon-card">
++        <h1 className="coming-soon-title">{title}</h1>
++        <p className="coming-soon-text">Coming soon.</p>
++      </div>
+     </div>
+   );
+ }
+diff --git a/src/views/ProjectCard.tsx b/src/views/ProjectCard.tsx
+index bed67a2..2e72305 100644
+--- a/src/views/ProjectCard.tsx
++++ b/src/views/ProjectCard.tsx
+@@ -1,38 +1,51 @@
++import { useQuery } from "@tanstack/react-query";
++import { ActivityBars } from "../components/ui/ActivityBars";
+ import { Pill } from "../components/ui/Pill";
++import { formatRelativeTime } from "../lib/format";
++import { getProjectActivity } from "../lib/tauri";
+ import type { ProjectSummary } from "../lib/types";
+ import "./ProjectCard.css";
+ 
+-function formatRelativeTime(unixSeconds: number): string {
+-  const diffMs = Date.now() - unixSeconds * 1000;
+-  const diffMin = Math.round(diffMs / 60000);
+-  if (diffMin < 1) return "just now";
+-  if (diffMin < 60) return `${diffMin}m ago`;
+-  const diffHr = Math.round(diffMin / 60);
+-  if (diffHr < 24) return `${diffHr}h ago`;
+-  return `${Math.round(diffHr / 24)}d ago`;
+-}
+-
+ interface ProjectCardProps {
+   project: ProjectSummary;
++  /** Whether this card represents the currently-selected project in a master-detail layout
++   * (e.g. `ProjectsView`). Purely a visual affordance — omit for standalone usage. */
++  selected?: boolean;
++  onClick?: () => void;
+ }
+ 
+-export function ProjectCard({ project }: ProjectCardProps) {
++/** All-zero 14-day placeholder shown while activity data hasn't loaded yet (or failed to,
++ * e.g. outside a real Tauri context) — never blocks the rest of the card's render. */
++const EMPTY_ACTIVITY = new Array(14).fill(0);
++
++export function ProjectCard({ project, selected = false, onClick }: ProjectCardProps) {
++  const { data: activity } = useQuery({
++    queryKey: ["project-activity", project.path],
++    queryFn: () => getProjectActivity(project.path),
++    // Decorative only — a failure here (e.g. dev-server smoke test outside a real Tauri
++    // context) should just leave the placeholder shown, not retry noisily or surface an error.
++    retry: false,
++  });
++
++  const classes = "project-card" + (selected ? " project-card-selected" : "");
++
+   return (
+-    <div className="project-card">
++    <button className={classes} onClick={onClick}>
+       <div className="project-card-header">
+         <span className="project-card-name">{project.name}</span>
+         <Pill variant="agent" tone="accent">
+           claude
+         </Pill>
+       </div>
+       <div className="project-card-path">{project.path}</div>
+       <div className="project-card-stats">
+         <span>
+           {project.session_count} session{project.session_count === 1 ? "" : "s"}
+         </span>
+         <span>${project.total_cost_usd.toFixed(2)} spent</span>
+         <span>active {formatRelativeTime(project.last_active)}</span>
+       </div>
+-    </div>
++      <ActivityBars data={activity ?? EMPTY_ACTIVITY} />
++    </button>
+   );
+ }
+diff --git a/src/views/ProjectDetail.css b/src/views/ProjectDetail.css
+new file mode 100644
+index 0000000..516f289
+--- /dev/null
++++ b/src/views/ProjectDetail.css
+@@ -0,0 +1,65 @@
++.project-detail {
++  display: flex;
++  flex-direction: column;
++  gap: var(--space-6);
++}
++
++.project-detail-overview {
++  display: flex;
++  flex-direction: column;
++  gap: var(--space-3);
++}
++
++.project-detail-header {
++  display: flex;
++  flex-direction: column;
++  gap: var(--space-1);
++}
++
++.project-detail-name {
++  font-size: var(--text-lg);
++  font-weight: 600;
++  color: var(--text-primary);
++  margin: 0;
++}
++
++.project-detail-path {
++  font-family: var(--font-mono);
++  font-size: var(--text-sm);
++  color: var(--text-muted);
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.project-detail-stats {
++  display: flex;
++  gap: var(--space-3);
++}
++
++.project-detail-stats > * {
++  flex: 1;
++}
++
++.project-detail-sessions {
++  display: flex;
++  flex-direction: column;
++  gap: var(--space-2);
++}
++
++.project-detail-sessions-title {
++  font-size: var(--text-base);
++  font-weight: 600;
++  color: var(--text-primary);
++  margin: 0;
++}
++
++.project-detail-session-list {
++  display: flex;
++  flex-direction: column;
++  gap: var(--space-2);
++}
++
++.project-detail-status {
++  color: var(--text-muted);
++}
+diff --git a/src/views/ProjectDetail.tsx b/src/views/ProjectDetail.tsx
+new file mode 100644
+index 0000000..a7218db
+--- /dev/null
++++ b/src/views/ProjectDetail.tsx
+@@ -0,0 +1,96 @@
++import { useMemo, useState } from "react";
++import { useQuery } from "@tanstack/react-query";
++import { ActivityBars } from "../components/ui/ActivityBars";
++import { StatTile } from "../components/ui/StatTile";
++import { getProjectActivity, listSessions } from "../lib/tauri";
++import type { ProjectSummary } from "../lib/types";
++import { SessionDetailModal } from "./SessionDetailModal";
++import { SessionRow } from "./SessionRow";
++import "./ProjectDetail.css";
++
++interface ProjectDetailProps {
++  project: ProjectSummary;
++}
++
++/** All-zero 14-day placeholder shown while activity data hasn't loaded yet (or failed to,
++ * e.g. outside a real Tauri context) — mirrors `ProjectCard`'s same fallback. */
++const EMPTY_ACTIVITY = new Array(14).fill(0);
++
++/**
++ * Right-panel detail for the currently-selected project in `ProjectsView`'s master-detail
++ * layout. A single scrollable column rather than literal tabs — this app's actual content
++ * density (a handful of stats + a session list) reads fine always-visible, and avoids
++ * hiding the session list behind an extra click for projects with only a couple of
++ * sessions. Reuses `SessionRow` (shared with `SessionsView`) rather than re-implementing
++ * row rendering here.
++ */
++export function ProjectDetail({ project }: ProjectDetailProps) {
++  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
++
++  const {
++    data: sessions,
++    isLoading,
++    isError,
++  } = useQuery({ queryKey: ["sessions"], queryFn: listSessions });
++
++  const { data: activity } = useQuery({
++    queryKey: ["project-activity", project.path],
++    queryFn: () => getProjectActivity(project.path),
++    retry: false,
++  });
++
++  const projectSessions = useMemo(
++    () => sessions?.filter((session) => session.project_id === project.id) ?? [],
++    [sessions, project.id],
++  );
++
++  return (
++    <div className="project-detail">
++      <div className="project-detail-overview">
++        <div className="project-detail-header">
++          <h1 className="project-detail-name">{project.name}</h1>
++          <div className="project-detail-path">{project.path}</div>
++        </div>
++
++        <div className="project-detail-stats">
++          <StatTile value={project.session_count} label="Sessions" />
++          <StatTile value={`$${project.total_cost_usd.toFixed(2)}`} label="Total cost" />
++        </div>
++
++        <ActivityBars data={activity ?? EMPTY_ACTIVITY} />
++      </div>
++
++      <div className="project-detail-sessions">
++        <h2 className="project-detail-sessions-title">Sessions</h2>
++
++        {isLoading && <p className="project-detail-status">Loading sessions…</p>}
++
++        {isError && (
++          <p className="project-detail-status">Couldn't load sessions.</p>
++        )}
++
++        {!isLoading && !isError && projectSessions.length === 0 && (
++          <p className="project-detail-status">No sessions yet for this project.</p>
++        )}
++
++        {!isLoading && !isError && projectSessions.length > 0 && (
++          <div className="project-detail-session-list">
++            {projectSessions.map((session) => (
++              <SessionRow
++                key={session.id}
++                session={session}
++                projectName={project.name}
++                onClick={() => setSelectedSessionId(session.id)}
++              />
++            ))}
++          </div>
++        )}
++      </div>
++
++      <SessionDetailModal
++        sessionId={selectedSessionId}
++        onClose={() => setSelectedSessionId(null)}
++      />
++    </div>
++  );
++}
+diff --git a/src/views/ProjectsView.css b/src/views/ProjectsView.css
+new file mode 100644
+index 0000000..3cd45d9
+--- /dev/null
++++ b/src/views/ProjectsView.css
+@@ -0,0 +1,24 @@
++.projects-view-status {
++  color: var(--text-muted);
++}
++
++/* Master-detail layout per SPEC §8.7: 296px left panel (project cards) + flex-1 right
++   panel (project detail). */
++.projects-view {
++  display: flex;
++  align-items: flex-start;
++  gap: var(--space-4);
++}
++
++.projects-view-list {
++  width: 296px;
++  flex-shrink: 0;
++  display: flex;
++  flex-direction: column;
++  gap: var(--space-2);
++}
++
++.projects-view-detail {
++  flex: 1;
++  min-width: 0;
++}
+diff --git a/src/views/ProjectsView.tsx b/src/views/ProjectsView.tsx
+new file mode 100644
+index 0000000..951fe75
+--- /dev/null
++++ b/src/views/ProjectsView.tsx
+@@ -0,0 +1,60 @@
++import { useState } from "react";
++import { useQuery } from "@tanstack/react-query";
++import { listProjects } from "../lib/tauri";
++import { ProjectCard } from "./ProjectCard";
++import { ProjectDetail } from "./ProjectDetail";
++import "./ProjectsView.css";
++
++export function ProjectsView() {
++  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
++
++  const { data, isLoading, isError } = useQuery({
++    queryKey: ["projects"],
++    queryFn: listProjects,
++  });
++
++  if (isLoading) {
++    return <p className="projects-view-status">Loading projects…</p>;
++  }
++
++  if (isError) {
++    return (
++      <p className="projects-view-status">
++        Couldn't load projects. Is the backend running?
++      </p>
++    );
++  }
++
++  if (!data || data.length === 0) {
++    return (
++      <p className="projects-view-status">
++        No projects yet — start a Claude Code session in any repo and it will
++        appear here.
++      </p>
++    );
++  }
++
++  // Auto-select the first project once data has loaded, rather than showing an extra
++  // empty "select a project" state on first render — a reasonable default per the brief,
++  // since there's always at least one project by this point.
++  const selectedProject =
++    data.find((project) => project.id === selectedProjectId) ?? data[0];
++
++  return (
++    <div className="projects-view">
++      <div className="projects-view-list">
++        {data.map((project) => (
++          <ProjectCard
++            key={project.id}
++            project={project}
++            selected={project.id === selectedProject.id}
++            onClick={() => setSelectedProjectId(project.id)}
++          />
++        ))}
++      </div>
++      <div className="projects-view-detail">
++        <ProjectDetail project={selectedProject} />
++      </div>
++    </div>
++  );
++}
+diff --git a/src/views/SessionDetailModal.css b/src/views/SessionDetailModal.css
+new file mode 100644
+index 0000000..0bb1c3a
+--- /dev/null
++++ b/src/views/SessionDetailModal.css
+@@ -0,0 +1,92 @@
++.session-detail-status {
++  color: var(--text-muted);
++}
++
++.session-detail {
++  display: flex;
++  flex-direction: column;
++  gap: var(--space-4);
++}
++
++.session-detail-identity {
++  display: flex;
++  align-items: center;
++  gap: var(--space-2);
++}
++
++.session-detail-model {
++  font-family: var(--font-mono);
++  font-size: var(--text-sm);
++  color: var(--text-muted);
++}
++
++.session-detail-stats {
++  display: grid;
++  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
++  gap: var(--space-3);
++}
++
++.session-detail-tags {
++  display: flex;
++  flex-wrap: wrap;
++  gap: var(--space-1);
++}
++
++.session-detail-summary {
++  color: var(--text-secondary);
++  font-size: var(--text-base);
++  margin: 0;
++}
++
++.session-detail-files-title {
++  font-size: var(--text-base);
++  font-weight: 600;
++  color: var(--text-primary);
++  margin: 0 0 var(--space-2);
++}
++
++.session-detail-file-list {
++  display: flex;
++  flex-direction: column;
++  gap: var(--space-2);
++  list-style: none;
++  margin: 0;
++  padding: 0;
++}
++
++.session-detail-file-row {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  gap: var(--space-3);
++  padding: var(--space-2) var(--space-3);
++  border: 1px solid var(--border-default);
++  border-radius: 6px;
++}
++
++.session-detail-file-info {
++  display: flex;
++  flex-direction: column;
++  gap: 2px;
++  min-width: 0;
++}
++
++.session-detail-file-path {
++  font-family: var(--font-mono);
++  font-size: var(--text-sm);
++  color: var(--text-primary);
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.session-detail-file-meta {
++  font-size: var(--text-xs);
++  color: var(--text-muted);
++}
++
++.session-detail-file-open {
++  flex-shrink: 0;
++  font-size: var(--text-sm);
++  padding: var(--space-1) var(--space-3);
++}
+diff --git a/src/views/SessionDetailModal.tsx b/src/views/SessionDetailModal.tsx
+new file mode 100644
+index 0000000..7f8ca88
+--- /dev/null
++++ b/src/views/SessionDetailModal.tsx
+@@ -0,0 +1,139 @@
++import { useQuery } from "@tanstack/react-query";
++import { Button } from "../components/ui/Button";
++import { Modal } from "../components/ui/Modal";
++import { Pill } from "../components/ui/Pill";
++import { StatTile } from "../components/ui/StatTile";
++import { getSessionDetail, openInEditor } from "../lib/tauri";
++import "./SessionDetailModal.css";
++
++interface SessionDetailModalProps {
++  sessionId: string | null;
++  onClose: () => void;
++}
++
++/** `tags` is stored as a JSON array string (e.g. `["bugfix","refactor"]`); fall back to
++ * treating the raw string as a single tag if it doesn't parse, rather than hiding it. */
++function parseTags(tags: string | null): string[] {
++  if (!tags) return [];
++  try {
++    const parsed = JSON.parse(tags);
++    if (Array.isArray(parsed)) {
++      return parsed.filter((t): t is string => typeof t === "string");
++    }
++    return [tags];
++  } catch {
++    return [tags];
++  }
++}
++
++function handleOpenInEditor(path: string) {
++  openInEditor(path).catch((err) => {
++    console.error(`Failed to open ${path} in editor:`, err);
++  });
++}
++
++export function SessionDetailModal({ sessionId, onClose }: SessionDetailModalProps) {
++  const { data, isLoading, isError } = useQuery({
++    queryKey: ["session-detail", sessionId],
++    queryFn: () => getSessionDetail(sessionId!),
++    enabled: sessionId !== null,
++  });
++
++  if (sessionId === null) {
++    return null;
++  }
++
++  return (
++    <Modal isOpen={sessionId !== null} onClose={onClose} title="Session detail">
++      {isLoading && <p className="session-detail-status">Loading session…</p>}
++      {isError && (
++        <p className="session-detail-status">Couldn't load this session.</p>
++      )}
++      {!isLoading && !isError && !data && (
++        <p className="session-detail-status">
++          This session no longer exists.
++        </p>
++      )}
++      {data && <SessionDetailContent detail={data} />}
++    </Modal>
++  );
++}
++
++function SessionDetailContent({
++  detail,
++}: {
++  detail: NonNullable<Awaited<ReturnType<typeof getSessionDetail>>>;
++}) {
++  const { session, files_changed } = detail;
++  const tags = parseTags(session.tags);
++
++  const durationDisplay =
++    session.status === "ended" && session.duration_seconds !== null
++      ? `${session.duration_seconds}s`
++      : "—";
++
++  return (
++    <div className="session-detail">
++      <div className="session-detail-identity">
++        <Pill variant="status" tone={session.status === "active" ? "green" : "gray"}>
++          {session.status}
++        </Pill>
++        <span className="session-detail-model">{session.model ?? "unknown model"}</span>
++      </div>
++
++      <div className="session-detail-stats">
++        <StatTile value={durationDisplay} label="Duration" />
++        <StatTile value={`$${session.cost_usd.toFixed(2)}`} label="Cost" />
++        <StatTile value={session.prompt_tokens} label="Prompt tokens" />
++        <StatTile value={session.completion_tokens} label="Completion tokens" />
++        <StatTile value={session.cache_read_tokens} label="Cache read tokens" />
++        <StatTile value={session.cache_creation_tokens} label="Cache creation tokens" />
++        <StatTile value={session.lines_added} label="Lines added" />
++        <StatTile value={session.lines_removed} label="Lines removed" />
++      </div>
++
++      {tags.length > 0 && (
++        <div className="session-detail-tags">
++          {tags.map((tag) => (
++            <Pill key={tag} variant="tag">
++              {tag}
++            </Pill>
++          ))}
++        </div>
++      )}
++
++      <p className="session-detail-summary">
++        {session.summary ?? "No summary yet"}
++      </p>
++
++      <div className="session-detail-files">
++        <h3 className="session-detail-files-title">
++          Files changed ({files_changed.length})
++        </h3>
++        {files_changed.length === 0 ? (
++          <p className="session-detail-status">No file changes recorded.</p>
++        ) : (
++          <ul className="session-detail-file-list">
++            {files_changed.map((file) => (
++              <li key={file.id} className="session-detail-file-row">
++                <div className="session-detail-file-info">
++                  <span className="session-detail-file-path">{file.file_path}</span>
++                  <span className="session-detail-file-meta">
++                    {file.change_type} · +{file.lines_added} / -{file.lines_removed}
++                  </span>
++                </div>
++                <Button
++                  variant="secondary"
++                  className="session-detail-file-open"
++                  onClick={() => handleOpenInEditor(file.file_path)}
++                >
++                  Open
++                </Button>
++              </li>
++            ))}
++          </ul>
++        )}
++      </div>
++    </div>
++  );
++}
+diff --git a/src/views/SessionRow.css b/src/views/SessionRow.css
+new file mode 100644
+index 0000000..53b480f
+--- /dev/null
++++ b/src/views/SessionRow.css
+@@ -0,0 +1,61 @@
++.session-row {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  gap: var(--space-4);
++  padding: var(--space-4);
++  border: 1px solid var(--border-default);
++  border-radius: 8px;
++  background: var(--surface-card);
++  text-align: left;
++  cursor: pointer;
++  font: inherit;
++  color: inherit;
++  width: 100%;
++}
++
++.session-row:hover {
++  border-color: var(--border-strong);
++}
++
++.session-row-main {
++  display: flex;
++  flex-direction: column;
++  gap: var(--space-1);
++  min-width: 0;
++}
++
++.session-row-top {
++  display: flex;
++  align-items: center;
++  gap: var(--space-2);
++}
++
++.session-row-project {
++  font-weight: 600;
++  color: var(--text-primary);
++}
++
++.session-row-model {
++  font-family: var(--font-mono);
++  font-size: var(--text-sm);
++  color: var(--text-muted);
++}
++
++.session-row-summary {
++  font-size: var(--text-sm);
++  color: var(--text-secondary);
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.session-row-stats {
++  display: flex;
++  flex-direction: column;
++  align-items: flex-end;
++  gap: var(--space-1);
++  font-size: var(--text-sm);
++  color: var(--text-secondary);
++  flex-shrink: 0;
++}
+diff --git a/src/views/SessionRow.tsx b/src/views/SessionRow.tsx
+new file mode 100644
+index 0000000..a18c72a
+--- /dev/null
++++ b/src/views/SessionRow.tsx
+@@ -0,0 +1,40 @@
++import { Pill } from "../components/ui/Pill";
++import { formatRelativeTime } from "../lib/format";
++import type { Session } from "../lib/types";
++import "./SessionRow.css";
++
++interface SessionRowProps {
++  session: Session;
++  projectName: string;
++  onClick: () => void;
++}
++
++/**
++ * Single-session summary row: project + status + model on top, summary below, stats
++ * (relative time / cost / tokens) on the right. Shared between `SessionsView` (flat list of
++ * all sessions) and `ProjectDetail` (sessions scoped to one project) so this rendering logic
++ * lives in exactly one place.
++ */
++export function SessionRow({ session, projectName, onClick }: SessionRowProps) {
++  return (
++    <button className="session-row" onClick={onClick}>
++      <div className="session-row-main">
++        <div className="session-row-top">
++          <span className="session-row-project">{projectName}</span>
++          <Pill variant="status" tone={session.status === "active" ? "green" : "gray"}>
++            {session.status}
++          </Pill>
++          <span className="session-row-model">{session.model ?? "unknown model"}</span>
++        </div>
++        <div className="session-row-summary">{session.summary ?? "No summary yet"}</div>
++      </div>
++      <div className="session-row-stats">
++        <span>{formatRelativeTime(session.last_activity_at)}</span>
++        <span>${session.cost_usd.toFixed(2)}</span>
++        <span>
++          {session.prompt_tokens + session.completion_tokens} tokens
++        </span>
++      </div>
++    </button>
++  );
++}
+diff --git a/src/views/SessionsView.css b/src/views/SessionsView.css
+new file mode 100644
+index 0000000..646d1d0
+--- /dev/null
++++ b/src/views/SessionsView.css
+@@ -0,0 +1,15 @@
++.sessions-view {
++  display: flex;
++  flex-direction: column;
++  gap: var(--space-4);
++}
++
++.sessions-view-status {
++  color: var(--text-muted);
++}
++
++.sessions-view-list {
++  display: flex;
++  flex-direction: column;
++  gap: var(--space-2);
++}
+diff --git a/src/views/SessionsView.tsx b/src/views/SessionsView.tsx
+new file mode 100644
+index 0000000..e039d48
+--- /dev/null
++++ b/src/views/SessionsView.tsx
+@@ -0,0 +1,64 @@
++import { useState } from "react";
++import { useQuery } from "@tanstack/react-query";
++import { listProjects, listSessions } from "../lib/tauri";
++import { SessionDetailModal } from "./SessionDetailModal";
++import { SessionRow } from "./SessionRow";
++import type { ProjectSummary } from "../lib/types";
++import "./SessionsView.css";
++
++function projectNameFor(projects: ProjectSummary[] | undefined, projectId: string): string {
++  return projects?.find((p) => p.id === projectId)?.name ?? projectId;
++}
++
++export function SessionsView() {
++  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
++
++  const {
++    data: sessions,
++    isLoading,
++    isError,
++  } = useQuery({ queryKey: ["sessions"], queryFn: listSessions });
++
++  const { data: projects } = useQuery({ queryKey: ["projects"], queryFn: listProjects });
++
++  return (
++    <div className="sessions-view">
++      <div className="view-topbar">
++        <h1 className="view-topbar-title">Sessions</h1>
++      </div>
++
++      {isLoading && <p className="sessions-view-status">Loading sessions…</p>}
++
++      {isError && (
++        <p className="sessions-view-status">
++          Couldn't load sessions. Is the backend running?
++        </p>
++      )}
++
++      {!isLoading && !isError && (!sessions || sessions.length === 0) && (
++        <p className="sessions-view-status">
++          No sessions yet — start a Claude Code session in any repo and it will
++          appear here.
++        </p>
++      )}
++
++      {!isLoading && !isError && sessions && sessions.length > 0 && (
++        <div className="sessions-view-list">
++          {sessions.map((session) => (
++            <SessionRow
++              key={session.id}
++              session={session}
++              projectName={projectNameFor(projects, session.project_id)}
++              onClick={() => setSelectedSessionId(session.id)}
++            />
++          ))}
++        </div>
++      )}
++
++      <SessionDetailModal
++        sessionId={selectedSessionId}
++        onClose={() => setSelectedSessionId(null)}
++      />
++    </div>
++  );
++}
+diff --git a/src/views/TimelineView.css b/src/views/TimelineView.css
+new file mode 100644
+index 0000000..90ad965
+--- /dev/null
++++ b/src/views/TimelineView.css
+@@ -0,0 +1,94 @@
++.timeline-view-status {
++  color: var(--text-muted);
++}
++
++.timeline-view {
++  display: flex;
++  flex-direction: column;
++  gap: var(--space-4);
++}
++
++.timeline-filters {
++  display: flex;
++  flex-wrap: wrap;
++  align-items: center;
++  gap: var(--space-2);
++}
++
++.timeline-filter-presets {
++  display: flex;
++  gap: var(--space-1);
++}
++
++.timeline-filter-preset-active {
++  background: var(--accent-subtle);
++  border-color: var(--accent);
++  color: var(--accent);
++}
++
++.timeline-list {
++  display: flex;
++  flex-direction: column;
++  gap: var(--space-2);
++}
++
++.timeline-entry {
++  display: flex;
++  align-items: flex-start;
++  gap: var(--space-3);
++  padding: var(--space-4);
++  border: 1px solid var(--border-default);
++  border-radius: 8px;
++  background: var(--surface-card);
++  text-align: left;
++  cursor: pointer;
++  font: inherit;
++  color: inherit;
++  width: 100%;
++}
++
++.timeline-entry:hover {
++  border-color: var(--border-strong);
++}
++
++.timeline-entry-dot {
++  flex-shrink: 0;
++  width: 10px;
++  height: 10px;
++  border-radius: 50%;
++  margin-top: 4px;
++}
++
++.timeline-entry-main {
++  display: flex;
++  flex-direction: column;
++  gap: var(--space-1);
++  min-width: 0;
++  flex: 1;
++}
++
++.timeline-entry-top {
++  display: flex;
++  align-items: center;
++  flex-wrap: wrap;
++  gap: var(--space-2);
++}
++
++.timeline-entry-project {
++  font-weight: 600;
++  color: var(--text-primary);
++}
++
++.timeline-entry-time {
++  margin-left: auto;
++  font-size: var(--text-sm);
++  color: var(--text-muted);
++}
++
++.timeline-entry-summary {
++  font-size: var(--text-sm);
++  color: var(--text-secondary);
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
+diff --git a/src/views/TimelineView.tsx b/src/views/TimelineView.tsx
+new file mode 100644
+index 0000000..0c2dbdc
+--- /dev/null
++++ b/src/views/TimelineView.tsx
+@@ -0,0 +1,239 @@
++import { useMemo, useState } from "react";
++import { useQuery } from "@tanstack/react-query";
++import { listProjects, listSessions } from "../lib/tauri";
++import { formatRelativeTime } from "../lib/format";
++import { Button } from "../components/ui/Button";
++import { Pill } from "../components/ui/Pill";
++import { Select } from "../components/ui/Select";
++import { SessionDetailModal } from "./SessionDetailModal";
++import type { ProjectSummary, Session } from "../lib/types";
++import "./TimelineView.css";
++
++/** Single color for now — `agent` is always `"claude"` today (per PLAN.md's explicit
++ * scope). Structured as a lookup so a future multi-agent phase can extend the map
++ * rather than restructuring the render logic. */
++const AGENT_COLORS: Record<string, string> = {
++  claude: "var(--accent)",
++};
++const DEFAULT_AGENT_COLOR = "var(--gray)";
++
++function colorForAgent(agent: string): string {
++  return AGENT_COLORS[agent] ?? DEFAULT_AGENT_COLOR;
++}
++
++/** `tags` is stored as a JSON array string (e.g. `["bugfix","refactor"]`); fall back to
++ * treating the raw string as a single tag if it doesn't parse, rather than hiding it.
++ * Kept identical to `SessionDetailModal`'s `parseTags` so the two views never diverge
++ * in how they interpret the same stored value. */
++function parseTags(tags: string | null): string[] {
++  if (!tags) return [];
++  try {
++    const parsed = JSON.parse(tags);
++    if (Array.isArray(parsed)) {
++      return parsed.filter((t): t is string => typeof t === "string");
++    }
++    return [tags];
++  } catch {
++    return [tags];
++  }
++}
++
++/** Timestamp used for both sorting and date filtering: `started_at` when known, falling
++ * back to `last_activity_at` for the rare case a session hasn't recorded a start yet. */
++function timelineTimestamp(session: Session): number {
++  return session.started_at ?? session.last_activity_at;
++}
++
++function projectNameFor(projects: ProjectSummary[] | undefined, projectId: string): string {
++  return projects?.find((p) => p.id === projectId)?.name ?? projectId;
++}
++
++type DatePreset = "all" | "today" | "week";
++
++function isWithinDatePreset(timestampSeconds: number, preset: DatePreset): boolean {
++  if (preset === "all") return true;
++  const now = new Date();
++  if (preset === "today") {
++    const startOfToday =
++      new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime() / 1000;
++    return timestampSeconds >= startOfToday;
++  }
++  // "week": since the start of the current calendar week (Sunday).
++  const startOfWeek =
++    new Date(now.getFullYear(), now.getMonth(), now.getDate() - now.getDay()).getTime() / 1000;
++  return timestampSeconds >= startOfWeek;
++}
++
++interface TimelineEntryProps {
++  session: Session;
++  projectName: string;
++  onClick: () => void;
++}
++
++function TimelineEntry({ session, projectName, onClick }: TimelineEntryProps) {
++  const tags = parseTags(session.tags);
++
++  return (
++    <button className="timeline-entry" onClick={onClick}>
++      <span
++        className="timeline-entry-dot"
++        style={{ backgroundColor: colorForAgent(session.agent) }}
++        aria-hidden="true"
++      />
++      <div className="timeline-entry-main">
++        <div className="timeline-entry-top">
++          <span className="timeline-entry-project">{projectName}</span>
++          <Pill variant="status" tone={session.status === "active" ? "green" : "gray"}>
++            {session.status}
++          </Pill>
++          {tags.map((tag) => (
++            <Pill key={tag} variant="tag">
++              {tag}
++            </Pill>
++          ))}
++          <span className="timeline-entry-time">
++            {formatRelativeTime(timelineTimestamp(session))}
++          </span>
++        </div>
++        <div className="timeline-entry-summary">
++          {session.summary ?? "No summary yet"}
++        </div>
++      </div>
++    </button>
++  );
++}
++
++export function TimelineView() {
++  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
++  const [projectFilter, setProjectFilter] = useState<string>("all");
++  const [tagFilter, setTagFilter] = useState<string>("all");
++  const [datePreset, setDatePreset] = useState<DatePreset>("all");
++
++  const {
++    data: sessions,
++    isLoading,
++    isError,
++  } = useQuery({ queryKey: ["sessions"], queryFn: listSessions });
++
++  const { data: projects } = useQuery({ queryKey: ["projects"], queryFn: listProjects });
++
++  const availableTags = useMemo(() => {
++    if (!sessions) return [];
++    const tagSet = new Set<string>();
++    for (const session of sessions) {
++      for (const tag of parseTags(session.tags)) {
++        tagSet.add(tag);
++      }
++    }
++    return Array.from(tagSet).sort();
++  }, [sessions]);
++
++  const sortedAndFiltered = useMemo(() => {
++    if (!sessions) return [];
++    return sessions
++      .filter((session) => {
++        if (projectFilter !== "all" && session.project_id !== projectFilter) {
++          return false;
++        }
++        if (tagFilter !== "all" && !parseTags(session.tags).includes(tagFilter)) {
++          return false;
++        }
++        if (!isWithinDatePreset(timelineTimestamp(session), datePreset)) {
++          return false;
++        }
++        return true;
++      })
++      .sort((a, b) => timelineTimestamp(b) - timelineTimestamp(a));
++  }, [sessions, projectFilter, tagFilter, datePreset]);
++
++  return (
++    <div className="timeline-view">
++      <div className="view-topbar">
++        <h1 className="view-topbar-title">Timeline</h1>
++      </div>
++
++      {isLoading && <p className="timeline-view-status">Loading timeline…</p>}
++
++      {isError && (
++        <p className="timeline-view-status">
++          Couldn't load sessions. Is the backend running?
++        </p>
++      )}
++
++      {!isLoading && !isError && (!sessions || sessions.length === 0) && (
++        <p className="timeline-view-status">
++          No sessions yet — start a Claude Code session in any repo and it will
++          appear here.
++        </p>
++      )}
++
++      {!isLoading && !isError && sessions && sessions.length > 0 && (
++        <>
++          <div className="timeline-filters">
++            <Select
++              value={projectFilter}
++              onChange={(e) => setProjectFilter(e.target.value)}
++              aria-label="Filter by project"
++            >
++              <option value="all">All projects</option>
++              {projects?.map((project) => (
++                <option key={project.id} value={project.id}>
++                  {project.name}
++                </option>
++              ))}
++            </Select>
++
++            <Select
++              value={tagFilter}
++              onChange={(e) => setTagFilter(e.target.value)}
++              aria-label="Filter by tag"
++            >
++              <option value="all">All tags</option>
++              {availableTags.map((tag) => (
++                <option key={tag} value={tag}>
++                  {tag}
++                </option>
++              ))}
++            </Select>
++
++            <div className="timeline-filter-presets" role="group" aria-label="Filter by date">
++              {(["all", "today", "week"] as const).map((preset) => (
++                <Button
++                  key={preset}
++                  type="button"
++                  variant="secondary"
++                  className={
++                    datePreset === preset ? "timeline-filter-preset-active" : undefined
++                  }
++                  onClick={() => setDatePreset(preset)}
++                >
++                  {preset === "all" ? "All time" : preset === "today" ? "Today" : "This week"}
++                </Button>
++              ))}
++            </div>
++          </div>
++
++          {sortedAndFiltered.length === 0 ? (
++            <p className="timeline-view-status">No sessions match the current filters.</p>
++          ) : (
++            <div className="timeline-list">
++              {sortedAndFiltered.map((session) => (
++                <TimelineEntry
++                  key={session.id}
++                  session={session}
++                  projectName={projectNameFor(projects, session.project_id)}
++                  onClick={() => setSelectedSessionId(session.id)}
++                />
++              ))}
++            </div>
++          )}
++        </>
++      )}
++
++      <SessionDetailModal
++        sessionId={selectedSessionId}
++        onClose={() => setSelectedSessionId(null)}
++      />
++    </div>
++  );
++}

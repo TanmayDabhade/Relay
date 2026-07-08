@@ -1,8 +1,8 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
-  "productName": "Manageai",
+  "productName": "Relay",
   "version": "0.1.0",
-  "identifier": "com.manageai.app",
+  "identifier": "com.relay.app",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:5173",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Manageai",
+        "title": "Relay",
         "width": 800,
         "height": 600,
         "resizable": true,

@@ -1,0 +1,420 @@
+# Review package: Task G1 (baseline b6d02ca..working tree, Batch G1 files only)
+
+## Files changed for Task G1
+package.json + package-lock.json (modified — added @fontsource/inter, @fontsource/ibm-plex-mono)
+src/main.tsx (modified — font imports)
+src/styles/tokens.css (modified — added --accent-border)
+src/components/ui/Modal.css (modified — 4 spec-value fixes)
+src/components/ui/Pill.css + Pill.tsx (modified — accent border, tag font-size, status dot)
+src/components/ui/StatTile.tsx + StatTile.css (new)
+src/components/ui/Button.tsx + Button.css (new)
+src/components/ui/Select.tsx + Select.css (new)
+src/components/ui/TextInput.tsx + TextInput.css (new)
+
+## Diff
+diff --git a/package.json b/package.json
+index 27faa26..26edc93 100644
+--- a/package.json
++++ b/package.json
+@@ -1,22 +1,25 @@
+ {
+   "name": "manageai",
+   "private": true,
+   "version": "0.0.0",
+   "type": "module",
+   "scripts": {
+     "dev": "vite",
+     "build": "tsc -b && vite build",
+     "lint": "oxlint",
+-    "preview": "vite preview"
++    "preview": "vite preview",
++    "tauri": "tauri"
+   },
+   "dependencies": {
++    "@fontsource/ibm-plex-mono": "^5.2.7",
++    "@fontsource/inter": "^5.2.8",
+     "@tanstack/react-query": "^5.101.2",
+     "@tauri-apps/api": "^2.11.1",
+     "react": "^19.2.7",
+     "react-dom": "^19.2.7"
+   },
+   "devDependencies": {
+     "@tauri-apps/cli": "^2.11.4",
+     "@types/node": "^24.13.2",
+     "@types/react": "^19.2.17",
+     "@types/react-dom": "^19.2.3",
+diff --git a/src/components/ui/Button.css b/src/components/ui/Button.css
+new file mode 100644
+index 0000000..b147ee4
+--- /dev/null
++++ b/src/components/ui/Button.css
+@@ -0,0 +1,37 @@
++.btn {
++  display: inline-flex;
++  align-items: center;
++  justify-content: center;
++  gap: var(--space-1);
++  font-family: var(--font-sans);
++  font-size: var(--text-base);
++  border-radius: 7px;
++  padding: var(--space-2) var(--space-3);
++  cursor: pointer;
++  transition: background-color 0.15s ease, border-color 0.15s ease;
++}
++
++.btn:disabled {
++  cursor: not-allowed;
++  opacity: 0.5;
++}
++
++.btn-primary {
++  background: var(--accent);
++  color: #ffffff;
++  border: none;
++}
++
++.btn-primary:hover:not(:disabled) {
++  filter: brightness(0.92);
++}
++
++.btn-secondary {
++  background: var(--surface-raised);
++  color: var(--text-secondary);
++  border: 1px solid var(--border-strong);
++}
++
++.btn-secondary:hover:not(:disabled) {
++  background: var(--surface-muted);
++}
+diff --git a/src/components/ui/Button.tsx b/src/components/ui/Button.tsx
+new file mode 100644
+index 0000000..3227be1
+--- /dev/null
++++ b/src/components/ui/Button.tsx
+@@ -0,0 +1,10 @@
++import "./Button.css";
++
++interface ButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElement> {
++  variant?: "primary" | "secondary";
++}
++
++export function Button({ variant = "primary", className, ...rest }: ButtonProps) {
++  const classes = ["btn", `btn-${variant}`, className].filter(Boolean).join(" ");
++  return <button className={classes} {...rest} />;
++}
+diff --git a/src/components/ui/Modal.css b/src/components/ui/Modal.css
+new file mode 100644
+index 0000000..46f86ff
+--- /dev/null
++++ b/src/components/ui/Modal.css
+@@ -0,0 +1,57 @@
++.modal-backdrop {
++  position: fixed;
++  inset: 0;
++  background: rgba(42, 42, 40, 0.3);
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  z-index: 100;
++}
++
++.modal-panel {
++  display: flex;
++  flex-direction: column;
++  max-width: 540px;
++  width: 90%;
++  max-height: 80vh;
++  background: var(--surface-card);
++  border: 1px solid var(--border-default);
++  border-radius: 12px;
++  box-shadow: 0 8px 40px rgba(0, 0, 0, 0.13);
++  overflow: hidden;
++}
++
++.modal-header {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  gap: var(--space-3);
++  padding: var(--space-4);
++  border-bottom: 1px solid var(--border-default);
++}
++
++.modal-title {
++  font-size: var(--text-md);
++  font-weight: 600;
++  color: var(--text-primary);
++  margin: 0;
++}
++
++.modal-close {
++  background: none;
++  border: none;
++  font-size: var(--text-lg);
++  line-height: 1;
++  color: var(--text-muted);
++  cursor: pointer;
++  padding: var(--space-1);
++}
++
++.modal-close:hover {
++  color: var(--text-primary);
++}
++
++.modal-body {
++  padding: var(--space-4);
++  overflow-y: auto;
++}
+diff --git a/src/components/ui/Pill.css b/src/components/ui/Pill.css
+index 1f710e7..7eb0bdd 100644
+--- a/src/components/ui/Pill.css
++++ b/src/components/ui/Pill.css
+@@ -10,20 +10,32 @@
+ }
+ 
+ .pill-stack {
+   font-family: var(--font-mono);
+   border-radius: 4px;
+   background: var(--surface-muted);
+   border-color: var(--border-default);
+   color: var(--text-secondary);
+ }
+ 
++.pill-tag {
++  font-size: var(--text-xs);
++}
++
++.pill-dot {
++  width: 6px;
++  height: 6px;
++  border-radius: 50%;
++  background: currentColor;
++  flex-shrink: 0;
++}
++
+ .pill-tone-green {
+   background: var(--green-bg);
+   border-color: var(--green-border);
+   color: var(--green);
+ }
+ 
+ .pill-tone-blue {
+   background: var(--blue-bg);
+   border-color: var(--blue-border);
+   color: var(--blue);
+@@ -40,12 +52,13 @@
+ }
+ 
+ .pill-tone-gray {
+   background: var(--gray-bg);
+   border-color: var(--gray-border);
+   color: var(--gray);
+ }
+ 
+ .pill-tone-accent {
+   background: var(--accent-subtle);
++  border-color: var(--accent-border);
+   color: var(--accent);
+ }
+diff --git a/src/components/ui/Pill.tsx b/src/components/ui/Pill.tsx
+index bbcc857..9dae919 100644
+--- a/src/components/ui/Pill.tsx
++++ b/src/components/ui/Pill.tsx
+@@ -3,13 +3,16 @@ import "./Pill.css";
+ type PillVariant = "agent" | "status" | "tag" | "stack";
+ 
+ interface PillProps {
+   variant: PillVariant;
+   tone?: "green" | "blue" | "red" | "amber" | "gray" | "accent";
+   children: React.ReactNode;
+ }
+ 
+ export function Pill({ variant, tone = "gray", children }: PillProps) {
+   return (
+-    <span className={`pill pill-${variant} pill-tone-${tone}`}>{children}</span>
++    <span className={`pill pill-${variant} pill-tone-${tone}`}>
++      {variant === "status" && <span className="pill-dot" />}
++      {children}
++    </span>
+   );
+ }
+diff --git a/src/components/ui/Select.css b/src/components/ui/Select.css
+new file mode 100644
+index 0000000..7008c3e
+--- /dev/null
++++ b/src/components/ui/Select.css
+@@ -0,0 +1,14 @@
++.select-input {
++  font-family: var(--font-sans);
++  font-size: var(--text-base);
++  color: var(--text-primary);
++  background: var(--surface-card);
++  border: 1px solid var(--border-strong);
++  border-radius: 7px;
++  padding: 7px;
++}
++
++.select-input:focus {
++  outline: none;
++  border-color: var(--accent);
++}
+diff --git a/src/components/ui/Select.tsx b/src/components/ui/Select.tsx
+new file mode 100644
+index 0000000..902052d
+--- /dev/null
++++ b/src/components/ui/Select.tsx
+@@ -0,0 +1,12 @@
++import "./Select.css";
++
++type SelectProps = React.SelectHTMLAttributes<HTMLSelectElement>;
++
++export function Select({ className, children, ...rest }: SelectProps) {
++  const classes = ["select-input", className].filter(Boolean).join(" ");
++  return (
++    <select className={classes} {...rest}>
++      {children}
++    </select>
++  );
++}
+diff --git a/src/components/ui/StatTile.css b/src/components/ui/StatTile.css
+new file mode 100644
+index 0000000..7bc640e
+--- /dev/null
++++ b/src/components/ui/StatTile.css
+@@ -0,0 +1,19 @@
++.stat-tile {
++  display: flex;
++  flex-direction: column;
++  gap: var(--space-1);
++  background: var(--surface-muted);
++  border-radius: 8px;
++  padding: var(--space-3);
++}
++
++.stat-tile-value {
++  font-family: var(--font-mono);
++  font-size: var(--text-md);
++  color: var(--text-primary);
++}
++
++.stat-tile-label {
++  font-size: var(--text-xs);
++  color: var(--text-muted);
++}
+diff --git a/src/components/ui/StatTile.tsx b/src/components/ui/StatTile.tsx
+new file mode 100644
+index 0000000..e2105ce
+--- /dev/null
++++ b/src/components/ui/StatTile.tsx
+@@ -0,0 +1,15 @@
++import "./StatTile.css";
++
++interface StatTileProps {
++  value: string | number;
++  label: string;
++}
++
++export function StatTile({ value, label }: StatTileProps) {
++  return (
++    <div className="stat-tile">
++      <div className="stat-tile-value">{value}</div>
++      <div className="stat-tile-label">{label}</div>
++    </div>
++  );
++}
+diff --git a/src/components/ui/TextInput.css b/src/components/ui/TextInput.css
+new file mode 100644
+index 0000000..ec29865
+--- /dev/null
++++ b/src/components/ui/TextInput.css
+@@ -0,0 +1,14 @@
++.text-input {
++  font-family: var(--font-sans);
++  font-size: var(--text-base);
++  color: var(--text-primary);
++  background: var(--surface-card);
++  border: 1px solid var(--border-strong);
++  border-radius: 7px;
++  padding: 7px;
++}
++
++.text-input:focus {
++  outline: none;
++  border-color: var(--accent);
++}
+diff --git a/src/components/ui/TextInput.tsx b/src/components/ui/TextInput.tsx
+new file mode 100644
+index 0000000..afe4f1e
+--- /dev/null
++++ b/src/components/ui/TextInput.tsx
+@@ -0,0 +1,8 @@
++import "./TextInput.css";
++
++type TextInputProps = React.InputHTMLAttributes<HTMLInputElement>;
++
++export function TextInput({ className, ...rest }: TextInputProps) {
++  const classes = ["text-input", className].filter(Boolean).join(" ");
++  return <input className={classes} {...rest} />;
++}
+diff --git a/src/main.tsx b/src/main.tsx
+index bef5202..d99c35d 100644
+--- a/src/main.tsx
++++ b/src/main.tsx
+@@ -1,10 +1,29 @@
+ import { StrictMode } from 'react'
+ import { createRoot } from 'react-dom/client'
+-import './index.css'
++import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
++// Self-hosted fonts (bundled via @fontsource — no CDN, no network fetch at runtime).
++// Only the weights actually referenced in this codebase's CSS are imported.
++import '@fontsource/inter/400.css'
++import '@fontsource/inter/500.css'
++import '@fontsource/inter/600.css'
++import '@fontsource/ibm-plex-mono/400.css'
++import '@fontsource/ibm-plex-mono/600.css'
++import './styles/tokens.css'
++import './styles/global.css'
+ import App from './App.tsx'
+ 
++const queryClient = new QueryClient({
++  defaultOptions: {
++    queries: {
++      staleTime: 30_000,
++    },
++  },
++})
++
+ createRoot(document.getElementById('root')!).render(
+   <StrictMode>
+-    <App />
++    <QueryClientProvider client={queryClient}>
++      <App />
++    </QueryClientProvider>
+   </StrictMode>,
+ )
+diff --git a/src/styles/tokens.css b/src/styles/tokens.css
+index 22192c1..2246ea7 100644
+--- a/src/styles/tokens.css
++++ b/src/styles/tokens.css
+@@ -13,20 +13,21 @@
+ 
+   /* Borders */
+   --border-default: #e8e7e2;
+   --border-strong: #d0cfc9;
+   --border-selected: #c96a3a;
+ 
+   /* Brand */
+   --accent: #c96a3a;
+   --accent-muted: #f0ece8;
+   --accent-subtle: #fdf3ee;
++  --accent-border: #e3b6a2;
+ 
+   /* Semantic */
+   --green: #2d7d5a;
+   --green-bg: #eef8f4;
+   --green-border: #b0decA;
+ 
+   --blue: #4a5fc4;
+   --blue-bg: #eef0fc;
+   --blue-border: #b8c1ee;
+ 

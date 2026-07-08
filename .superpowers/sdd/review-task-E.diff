@@ -1,0 +1,1023 @@
+# Review package: Task E (baseline b6d02ca..working tree, Batch E files only)
+
+## Files changed for Task E
+
+NOTE: src-tauri/src/commands.rs and src-tauri/src/lib.rs were also touched by
+the already-approved Task B (cost calc, list_sessions/get_session_detail,
+idle sweep) — nothing has been committed this session, so this diff against
+baseline b6d02ca shows both Task B's and Task E's changes to those two files
+stacked together. Task B was already reviewed and approved separately; only
+judge the *incremental* addition in this diff relevant to Task E's brief (the
+open_in_editor command + its registration) for those two files - do not
+re-flag Task B's content.
+
+src-tauri/src/commands.rs (modified — added open_in_editor)
+src-tauri/src/lib.rs (modified — registered open_in_editor)
+src/lib/types.ts (modified — added SessionDetail)
+src/lib/tauri.ts (modified — added listSessions/getSessionDetail/openInEditor)
+src/lib/format.ts (new — extracted formatRelativeTime)
+src/views/ProjectCard.tsx (modified — use extracted formatRelativeTime)
+src/components/ui/Modal.tsx + Modal.css (new)
+src/views/SessionsView.tsx + SessionsView.css (new)
+src/views/SessionDetailModal.tsx + SessionDetailModal.css (new)
+src/App.tsx (modified — wire SessionsView in)
+
+## Diff
+diff --git a/src-tauri/src/commands.rs b/src-tauri/src/commands.rs
+index eabed4c..19a8bd9 100644
+--- a/src-tauri/src/commands.rs
++++ b/src-tauri/src/commands.rs
+@@ -1,8 +1,59 @@
+ use crate::db::{queries, Db};
++use serde::Serialize;
++use std::process::Command;
+ use tauri::State;
+ 
+ #[tauri::command]
+ pub fn list_projects(db: State<'_, Db>) -> Result<Vec<queries::ProjectSummary>, String> {
+     let conn = db.0.lock().map_err(|e| e.to_string())?;
+     queries::list_projects(&conn).map_err(|e| e.to_string())
+ }
++
++#[tauri::command]
++pub fn list_sessions(db: State<'_, Db>) -> Result<Vec<queries::Session>, String> {
++    let conn = db.0.lock().map_err(|e| e.to_string())?;
++    queries::list_sessions(&conn).map_err(|e| e.to_string())
++}
++
++/// Return shape for `get_session_detail` — wraps the session row together with its file
++/// changes, since a frontend detail view needs both.
++#[derive(Debug, Clone, Serialize)]
++pub struct SessionDetail {
++    pub session: queries::Session,
++    pub files_changed: Vec<queries::FileChanged>,
++}
++
++#[tauri::command]
++pub fn get_session_detail(
++    db: State<'_, Db>,
++    session_id: String,
++) -> Result<Option<SessionDetail>, String> {
++    let conn = db.0.lock().map_err(|e| e.to_string())?;
++    queries::get_session_detail(&conn, &session_id)
++        .map(|opt| opt.map(|(session, files_changed)| SessionDetail { session, files_changed }))
++        .map_err(|e| e.to_string())
++}
++
++/// Opens `path` in the user's editor: `$EDITOR <path>` if that env var is set, otherwise falls
++/// back to VS Code's `code <path>` CLI. Spawns and returns immediately (doesn't wait for the
++/// editor to exit) — this is triggered by a button click in the session detail modal and
++/// shouldn't block the UI. A spawn failure (e.g. neither `$EDITOR` nor `code` is on `PATH`) is
++/// an expected, recoverable case surfaced to the caller as an `Err`, not a panic.
++#[tauri::command]
++pub fn open_in_editor(path: String) -> Result<(), String> {
++    if let Ok(editor) = std::env::var("EDITOR") {
++        if !editor.trim().is_empty() {
++            return Command::new(&editor)
++                .arg(&path)
++                .spawn()
++                .map(|_| ())
++                .map_err(|e| format!("failed to launch $EDITOR ({editor}): {e}"));
++        }
++    }
++
++    Command::new("code")
++        .arg(&path)
++        .spawn()
++        .map(|_| ())
++        .map_err(|e| format!("failed to launch editor: $EDITOR is not set and `code` failed to start: {e}"))
++}
+diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
+index 6c999ca..69768f2 100644
+--- a/src-tauri/src/lib.rs
++++ b/src-tauri/src/lib.rs
+@@ -1,33 +1,116 @@
+ mod commands;
++mod cost;
+ mod db;
+ mod parser;
+ mod watcher;
+ 
+ use std::sync::Mutex;
+-use tauri::Manager;
++use tauri::{Emitter, Manager};
++
++/// Idle-session sweep: a session with no new activity for this long is considered ended.
++/// Constant, not yet user-configurable (per the plan).
++const IDLE_THRESHOLD_SECS: i64 = 120;
++/// How often the sweep checks for idle sessions.
++const SWEEP_INTERVAL_SECS: u64 = 20;
+ 
+ #[cfg_attr(mobile, tauri::mobile_entry_point)]
+ pub fn run() {
+   tauri::Builder::default()
+     .setup(|app| {
+       if cfg!(debug_assertions) {
+         app.handle().plugin(
+           tauri_plugin_log::Builder::default()
+             .level(log::LevelFilter::Info)
+             .build(),
+         )?;
+       }
+ 
+       let app_data_dir = app.path().app_data_dir()?;
+       let db_path = app_data_dir.join("manageai.db");
+       let conn = db::open(&db_path)?;
++      // Backfill cost_usd once at startup for sessions ingested before cost calculation
++      // existed (their cost_usd is stuck at 0 in the DB otherwise).
++      backfill_session_costs(&conn);
+       app.manage(db::Db(Mutex::new(conn)));
+ 
+       watcher::start(app.handle().clone());
++      spawn_idle_sweep(app.handle().clone());
+ 
+       Ok(())
+     })
+-    .invoke_handler(tauri::generate_handler![commands::list_projects])
++    .invoke_handler(tauri::generate_handler![
++      commands::list_projects,
++      commands::list_sessions,
++      commands::get_session_detail,
++      commands::open_in_editor,
++    ])
+     .run(tauri::generate_context!())
+     .expect("error while running tauri application");
+ }
++
++/// Recomputes cost_usd for every session from its currently-stored token totals against the
++/// bundled pricing table. Runs once at startup, synchronously, before the DB is handed off as
++/// managed state — cheap enough at this scale that an equality check before writing isn't
++/// worth the complexity.
++fn backfill_session_costs(conn: &rusqlite::Connection) {
++  let totals = match db::queries::all_session_token_totals(conn) {
++    Ok(totals) => totals,
++    Err(e) => {
++      log::warn!("failed to load session token totals for cost backfill: {e:#}");
++      return;
++    }
++  };
++
++  for t in totals {
++    let cost = cost::pricing::cost_usd(
++      t.model.as_deref(),
++      t.prompt_tokens,
++      t.completion_tokens,
++      t.cache_read_tokens,
++      t.cache_creation_tokens,
++    );
++    if let Err(e) = db::queries::update_cost(conn, &t.id, cost) {
++      log::warn!("failed to backfill cost for session {}: {e:#}", t.id);
++    }
++  }
++}
++
++/// Ticks every `SWEEP_INTERVAL_SECS`, finalizing any session that has gone idle for longer
++/// than `IDLE_THRESHOLD_SECS`. Runs on Tauri's async runtime (not a raw OS thread, unlike the
++/// watcher's blocking `notify` loop — this is a plain async interval loop).
++fn spawn_idle_sweep(app_handle: tauri::AppHandle) {
++  tauri::async_runtime::spawn(async move {
++    let mut interval = tokio::time::interval(std::time::Duration::from_secs(SWEEP_INTERVAL_SECS));
++    loop {
++      interval.tick().await;
++
++      let db = app_handle.state::<db::Db>();
++      let conn = db.0.lock().unwrap();
++      let now = chrono::Utc::now().timestamp();
++
++      let ids = match db::queries::sessions_to_finalize(&conn, IDLE_THRESHOLD_SECS, now) {
++        Ok(ids) => ids,
++        Err(e) => {
++          log::warn!("idle sweep: failed to query sessions_to_finalize: {e:#}");
++          continue;
++        }
++      };
++
++      let mut any_finalized = false;
++      for id in &ids {
++        match db::queries::finalize_session(&conn, id) {
++          Ok(()) => any_finalized = true,
++          Err(e) => log::warn!("idle sweep: failed to finalize session {id}: {e:#}"),
++        }
++      }
++      drop(conn);
++
++      if any_finalized {
++        let _ = app_handle.emit(
++          "data-changed",
++          serde_json::json!({ "entity": "session", "kind": "updated" }),
++        );
++      }
++    }
++  });
++}
+diff --git a/src/App.tsx b/src/App.tsx
+index a66b5ef..5d13239 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -1,122 +1,27 @@
+-import { useState } from 'react'
+-import reactLogo from './assets/react.svg'
+-import viteLogo from './assets/vite.svg'
+-import heroImg from './assets/hero.png'
+-import './App.css'
++import { useState } from "react";
++import { Sidebar, type View } from "./components/nav/Sidebar";
++import { useDataChangedEvents } from "./hooks/useDataChangedEvents";
++import { ProjectsView } from "./views/ProjectsView";
++import { SessionsView } from "./views/SessionsView";
++import { ComingSoonView } from "./views/ComingSoonView";
+ 
+ function App() {
+-  const [count, setCount] = useState(0)
++  const [activeView, setActiveView] = useState<View>("projects");
+ 
+-  return (
+-    <>
+-      <section id="center">
+-        <div className="hero">
+-          <img src={heroImg} className="base" width="170" height="179" alt="" />
+-          <img src={reactLogo} className="framework" alt="React logo" />
+-          <img src={viteLogo} className="vite" alt="Vite logo" />
+-        </div>
+-        <div>
+-          <h1>Get started</h1>
+-          <p>
+-            Edit <code>src/App.tsx</code> and save to test <code>HMR</code>
+-          </p>
+-        </div>
+-        <button
+-          type="button"
+-          className="counter"
+-          onClick={() => setCount((count) => count + 1)}
+-        >
+-          Count is {count}
+-        </button>
+-      </section>
+-
+-      <div className="ticks"></div>
++  useDataChangedEvents();
+ 
+-      <section id="next-steps">
+-        <div id="docs">
+-          <svg className="icon" role="presentation" aria-hidden="true">
+-            <use href="/icons.svg#documentation-icon"></use>
+-          </svg>
+-          <h2>Documentation</h2>
+-          <p>Your questions, answered</p>
+-          <ul>
+-            <li>
+-              <a href="https://vite.dev/" target="_blank">
+-                <img className="logo" src={viteLogo} alt="" />
+-                Explore Vite
+-              </a>
+-            </li>
+-            <li>
+-              <a href="https://react.dev/" target="_blank">
+-                <img className="button-icon" src={reactLogo} alt="" />
+-                Learn more
+-              </a>
+-            </li>
+-          </ul>
+-        </div>
+-        <div id="social">
+-          <svg className="icon" role="presentation" aria-hidden="true">
+-            <use href="/icons.svg#social-icon"></use>
+-          </svg>
+-          <h2>Connect with us</h2>
+-          <p>Join the Vite community</p>
+-          <ul>
+-            <li>
+-              <a href="https://github.com/vitejs/vite" target="_blank">
+-                <svg
+-                  className="button-icon"
+-                  role="presentation"
+-                  aria-hidden="true"
+-                >
+-                  <use href="/icons.svg#github-icon"></use>
+-                </svg>
+-                GitHub
+-              </a>
+-            </li>
+-            <li>
+-              <a href="https://chat.vite.dev/" target="_blank">
+-                <svg
+-                  className="button-icon"
+-                  role="presentation"
+-                  aria-hidden="true"
+-                >
+-                  <use href="/icons.svg#discord-icon"></use>
+-                </svg>
+-                Discord
+-              </a>
+-            </li>
+-            <li>
+-              <a href="https://x.com/vite_js" target="_blank">
+-                <svg
+-                  className="button-icon"
+-                  role="presentation"
+-                  aria-hidden="true"
+-                >
+-                  <use href="/icons.svg#x-icon"></use>
+-                </svg>
+-                X.com
+-              </a>
+-            </li>
+-            <li>
+-              <a href="https://bsky.app/profile/vite.dev" target="_blank">
+-                <svg
+-                  className="button-icon"
+-                  role="presentation"
+-                  aria-hidden="true"
+-                >
+-                  <use href="/icons.svg#bluesky-icon"></use>
+-                </svg>
+-                Bluesky
+-              </a>
+-            </li>
+-          </ul>
+-        </div>
+-      </section>
+-
+-      <div className="ticks"></div>
+-      <section id="spacer"></section>
+-    </>
+-  )
++  return (
++    <div className="app-shell">
++      <Sidebar active={activeView} onSelect={setActiveView} footer="Manageai v0.1.0" />
++      <main className="app-main">
++        {activeView === "projects" && <ProjectsView />}
++        {activeView === "sessions" && <SessionsView />}
++        {activeView === "timeline" && <ComingSoonView title="Timeline" />}
++        {activeView === "connections" && <ComingSoonView title="Connections" />}
++        {activeView === "agent-manager" && <ComingSoonView title="Agent Manager" />}
++      </main>
++    </div>
++  );
+ }
+ 
+-export default App
++export default App;
+diff --git a/src/components/ui/Modal.css b/src/components/ui/Modal.css
+new file mode 100644
+index 0000000..470377a
+--- /dev/null
++++ b/src/components/ui/Modal.css
+@@ -0,0 +1,57 @@
++.modal-backdrop {
++  position: fixed;
++  inset: 0;
++  background: rgba(0, 0, 0, 0.35);
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  z-index: 100;
++}
++
++.modal-panel {
++  display: flex;
++  flex-direction: column;
++  max-width: 640px;
++  width: 90%;
++  max-height: 80vh;
++  background: var(--surface-card);
++  border: 1px solid var(--border-default);
++  border-radius: 10px;
++  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.18);
++  overflow: hidden;
++}
++
++.modal-header {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  gap: var(--space-3);
++  padding: var(--space-4);
++  border-bottom: 1px solid var(--border-default);
++}
++
++.modal-title {
++  font-size: var(--text-md);
++  font-weight: 600;
++  color: var(--text-primary);
++  margin: 0;
++}
++
++.modal-close {
++  background: none;
++  border: none;
++  font-size: var(--text-lg);
++  line-height: 1;
++  color: var(--text-muted);
++  cursor: pointer;
++  padding: var(--space-1);
++}
++
++.modal-close:hover {
++  color: var(--text-primary);
++}
++
++.modal-body {
++  padding: var(--space-4);
++  overflow-y: auto;
++}
+diff --git a/src/components/ui/Modal.tsx b/src/components/ui/Modal.tsx
+new file mode 100644
+index 0000000..1321b36
+--- /dev/null
++++ b/src/components/ui/Modal.tsx
+@@ -0,0 +1,46 @@
++import { useEffect } from "react";
++import "./Modal.css";
++
++interface ModalProps {
++  isOpen: boolean;
++  onClose: () => void;
++  title?: string;
++  children: React.ReactNode;
++}
++
++/**
++ * Minimal, reusable modal: backdrop + centered panel. Clicking the backdrop or pressing
++ * Escape closes it. Not hard-coded to any particular content — callers own what goes inside.
++ */
++export function Modal({ isOpen, onClose, title, children }: ModalProps) {
++  useEffect(() => {
++    if (!isOpen) return;
++
++    function handleKeyDown(event: KeyboardEvent) {
++      if (event.key === "Escape") {
++        onClose();
++      }
++    }
++
++    window.addEventListener("keydown", handleKeyDown);
++    return () => window.removeEventListener("keydown", handleKeyDown);
++  }, [isOpen, onClose]);
++
++  if (!isOpen) {
++    return null;
++  }
++
++  return (
++    <div className="modal-backdrop" onClick={onClose}>
++      <div className="modal-panel" onClick={(event) => event.stopPropagation()}>
++        <div className="modal-header">
++          {title ? <h2 className="modal-title">{title}</h2> : <span />}
++          <button className="modal-close" onClick={onClose} aria-label="Close">
++            ×
++          </button>
++        </div>
++        <div className="modal-body">{children}</div>
++      </div>
++    </div>
++  );
++}
+diff --git a/src/lib/format.ts b/src/lib/format.ts
+new file mode 100644
+index 0000000..f8edb61
+--- /dev/null
++++ b/src/lib/format.ts
+@@ -0,0 +1,10 @@
++/** Formats a unix-seconds timestamp as a short relative time string, e.g. "5m ago". */
++export function formatRelativeTime(unixSeconds: number): string {
++  const diffMs = Date.now() - unixSeconds * 1000;
++  const diffMin = Math.round(diffMs / 60000);
++  if (diffMin < 1) return "just now";
++  if (diffMin < 60) return `${diffMin}m ago`;
++  const diffHr = Math.round(diffMin / 60);
++  if (diffHr < 24) return `${diffHr}h ago`;
++  return `${Math.round(diffHr / 24)}d ago`;
++}
+diff --git a/src/lib/tauri.ts b/src/lib/tauri.ts
+index f54b6ab..fbbdaf8 100644
+--- a/src/lib/tauri.ts
++++ b/src/lib/tauri.ts
+@@ -1,6 +1,18 @@
+ import { invoke } from "@tauri-apps/api/core";
+-import type { ProjectSummary } from "./types";
++import type { ProjectSummary, Session, SessionDetail } from "./types";
+ 
+ export function listProjects(): Promise<ProjectSummary[]> {
+   return invoke("list_projects");
+ }
++
++export function listSessions(): Promise<Session[]> {
++  return invoke("list_sessions");
++}
++
++export function getSessionDetail(sessionId: string): Promise<SessionDetail | null> {
++  return invoke("get_session_detail", { sessionId });
++}
++
++export function openInEditor(path: string): Promise<void> {
++  return invoke("open_in_editor", { path });
++}
+diff --git a/src/lib/types.ts b/src/lib/types.ts
+index 17e2421..34ccb04 100644
+--- a/src/lib/types.ts
++++ b/src/lib/types.ts
+@@ -32,12 +32,17 @@ export interface Session {
+   duration_seconds: number | null;
+   summary: string | null;
+   prompt_tokens: number;
+   completion_tokens: number;
+   cache_read_tokens: number;
+   cache_creation_tokens: number;
+   cost_usd: number;
+   lines_added: number;
+   lines_removed: number;
+   tags: string | null;
+   raw_log_path: string;
+ }
++
++export interface SessionDetail {
++  session: Session;
++  files_changed: FileChanged[];
++}
+diff --git a/src/views/ProjectCard.tsx b/src/views/ProjectCard.tsx
+index bed67a2..ed995a4 100644
+--- a/src/views/ProjectCard.tsx
++++ b/src/views/ProjectCard.tsx
+@@ -1,26 +1,17 @@
+ import { Pill } from "../components/ui/Pill";
++import { formatRelativeTime } from "../lib/format";
+ import type { ProjectSummary } from "../lib/types";
+ import "./ProjectCard.css";
+ 
+-function formatRelativeTime(unixSeconds: number): string {
+-  const diffMs = Date.now() - unixSeconds * 1000;
+-  const diffMin = Math.round(diffMs / 60000);
+-  if (diffMin < 1) return "just now";
+-  if (diffMin < 60) return `${diffMin}m ago`;
+-  const diffHr = Math.round(diffMin / 60);
+-  if (diffHr < 24) return `${diffHr}h ago`;
+-  return `${Math.round(diffHr / 24)}d ago`;
+-}
+-
+ interface ProjectCardProps {
+   project: ProjectSummary;
+ }
+ 
+ export function ProjectCard({ project }: ProjectCardProps) {
+   return (
+     <div className="project-card">
+       <div className="project-card-header">
+         <span className="project-card-name">{project.name}</span>
+         <Pill variant="agent" tone="accent">
+           claude
+         </Pill>
+diff --git a/src/views/SessionDetailModal.css b/src/views/SessionDetailModal.css
+new file mode 100644
+index 0000000..1a25633
+--- /dev/null
++++ b/src/views/SessionDetailModal.css
+@@ -0,0 +1,103 @@
++.session-detail-status {
++  color: var(--text-muted);
++}
++
++.session-detail {
++  display: flex;
++  flex-direction: column;
++  gap: var(--space-4);
++}
++
++.session-detail-stats {
++  display: grid;
++  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
++  gap: var(--space-3);
++  font-size: var(--text-sm);
++}
++
++.session-detail-stats > div {
++  display: flex;
++  flex-direction: column;
++  gap: var(--space-1);
++}
++
++.session-detail-label {
++  color: var(--text-muted);
++  font-size: var(--text-xs);
++  text-transform: uppercase;
++  letter-spacing: 0.02em;
++}
++
++.session-detail-tags {
++  display: flex;
++  flex-wrap: wrap;
++  gap: var(--space-1);
++}
++
++.session-detail-summary {
++  color: var(--text-secondary);
++  font-size: var(--text-base);
++  margin: 0;
++}
++
++.session-detail-files-title {
++  font-size: var(--text-base);
++  font-weight: 600;
++  color: var(--text-primary);
++  margin: 0 0 var(--space-2);
++}
++
++.session-detail-file-list {
++  display: flex;
++  flex-direction: column;
++  gap: var(--space-2);
++  list-style: none;
++  margin: 0;
++  padding: 0;
++}
++
++.session-detail-file-row {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  gap: var(--space-3);
++  padding: var(--space-2) var(--space-3);
++  border: 1px solid var(--border-default);
++  border-radius: 6px;
++}
++
++.session-detail-file-info {
++  display: flex;
++  flex-direction: column;
++  gap: 2px;
++  min-width: 0;
++}
++
++.session-detail-file-path {
++  font-family: var(--font-mono);
++  font-size: var(--text-sm);
++  color: var(--text-primary);
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.session-detail-file-meta {
++  font-size: var(--text-xs);
++  color: var(--text-muted);
++}
++
++.session-detail-file-open {
++  flex-shrink: 0;
++  font-size: var(--text-sm);
++  padding: var(--space-1) var(--space-3);
++  border: 1px solid var(--border-default);
++  border-radius: 6px;
++  background: var(--surface-muted);
++  color: var(--text-primary);
++  cursor: pointer;
++}
++
++.session-detail-file-open:hover {
++  border-color: var(--border-strong);
++}
+diff --git a/src/views/SessionDetailModal.tsx b/src/views/SessionDetailModal.tsx
+new file mode 100644
+index 0000000..4bae2b9
+--- /dev/null
++++ b/src/views/SessionDetailModal.tsx
+@@ -0,0 +1,162 @@
++import { useQuery } from "@tanstack/react-query";
++import { Modal } from "../components/ui/Modal";
++import { Pill } from "../components/ui/Pill";
++import { getSessionDetail, openInEditor } from "../lib/tauri";
++import "./SessionDetailModal.css";
++
++interface SessionDetailModalProps {
++  sessionId: string | null;
++  onClose: () => void;
++}
++
++/** `tags` is stored as a JSON array string (e.g. `["bugfix","refactor"]`); fall back to
++ * treating the raw string as a single tag if it doesn't parse, rather than hiding it. */
++function parseTags(tags: string | null): string[] {
++  if (!tags) return [];
++  try {
++    const parsed = JSON.parse(tags);
++    if (Array.isArray(parsed)) {
++      return parsed.filter((t): t is string => typeof t === "string");
++    }
++    return [tags];
++  } catch {
++    return [tags];
++  }
++}
++
++function handleOpenInEditor(path: string) {
++  openInEditor(path).catch((err) => {
++    console.error(`Failed to open ${path} in editor:`, err);
++  });
++}
++
++export function SessionDetailModal({ sessionId, onClose }: SessionDetailModalProps) {
++  const { data, isLoading, isError } = useQuery({
++    queryKey: ["session-detail", sessionId],
++    queryFn: () => getSessionDetail(sessionId!),
++    enabled: sessionId !== null,
++  });
++
++  if (sessionId === null) {
++    return null;
++  }
++
++  return (
++    <Modal isOpen={sessionId !== null} onClose={onClose} title="Session detail">
++      {isLoading && <p className="session-detail-status">Loading session…</p>}
++      {isError && (
++        <p className="session-detail-status">Couldn't load this session.</p>
++      )}
++      {!isLoading && !isError && !data && (
++        <p className="session-detail-status">
++          This session no longer exists.
++        </p>
++      )}
++      {data && <SessionDetailContent detail={data} />}
++    </Modal>
++  );
++}
++
++function SessionDetailContent({
++  detail,
++}: {
++  detail: NonNullable<Awaited<ReturnType<typeof getSessionDetail>>>;
++}) {
++  const { session, files_changed } = detail;
++  const tags = parseTags(session.tags);
++
++  return (
++    <div className="session-detail">
++      <div className="session-detail-stats">
++        <div>
++          <span className="session-detail-label">Status</span>
++          <Pill variant="status" tone={session.status === "active" ? "green" : "gray"}>
++            {session.status}
++          </Pill>
++        </div>
++        <div>
++          <span className="session-detail-label">Model</span>
++          <span>{session.model ?? "unknown"}</span>
++        </div>
++        <div>
++          <span className="session-detail-label">Duration</span>
++          <span>
++            {session.status === "ended" && session.duration_seconds !== null
++              ? `${session.duration_seconds}s`
++              : "—"}
++          </span>
++        </div>
++        <div>
++          <span className="session-detail-label">Cost</span>
++          <span>${session.cost_usd.toFixed(2)}</span>
++        </div>
++        <div>
++          <span className="session-detail-label">Prompt tokens</span>
++          <span>{session.prompt_tokens}</span>
++        </div>
++        <div>
++          <span className="session-detail-label">Completion tokens</span>
++          <span>{session.completion_tokens}</span>
++        </div>
++        <div>
++          <span className="session-detail-label">Cache read tokens</span>
++          <span>{session.cache_read_tokens}</span>
++        </div>
++        <div>
++          <span className="session-detail-label">Cache creation tokens</span>
++          <span>{session.cache_creation_tokens}</span>
++        </div>
++        <div>
++          <span className="session-detail-label">Lines added</span>
++          <span>{session.lines_added}</span>
++        </div>
++        <div>
++          <span className="session-detail-label">Lines removed</span>
++          <span>{session.lines_removed}</span>
++        </div>
++      </div>
++
++      {tags.length > 0 && (
++        <div className="session-detail-tags">
++          {tags.map((tag) => (
++            <Pill key={tag} variant="tag">
++              {tag}
++            </Pill>
++          ))}
++        </div>
++      )}
++
++      <p className="session-detail-summary">
++        {session.summary ?? "No summary yet"}
++      </p>
++
++      <div className="session-detail-files">
++        <h3 className="session-detail-files-title">
++          Files changed ({files_changed.length})
++        </h3>
++        {files_changed.length === 0 ? (
++          <p className="session-detail-status">No file changes recorded.</p>
++        ) : (
++          <ul className="session-detail-file-list">
++            {files_changed.map((file) => (
++              <li key={file.id} className="session-detail-file-row">
++                <div className="session-detail-file-info">
++                  <span className="session-detail-file-path">{file.file_path}</span>
++                  <span className="session-detail-file-meta">
++                    {file.change_type} · +{file.lines_added} / -{file.lines_removed}
++                  </span>
++                </div>
++                <button
++                  className="session-detail-file-open"
++                  onClick={() => handleOpenInEditor(file.file_path)}
++                >
++                  Open
++                </button>
++              </li>
++            ))}
++          </ul>
++        )}
++      </div>
++    </div>
++  );
++}
+diff --git a/src/views/SessionsView.css b/src/views/SessionsView.css
+new file mode 100644
+index 0000000..172d5e3
+--- /dev/null
++++ b/src/views/SessionsView.css
+@@ -0,0 +1,71 @@
++.sessions-view-status {
++  color: var(--text-muted);
++}
++
++.sessions-view-list {
++  display: flex;
++  flex-direction: column;
++  gap: var(--space-2);
++}
++
++.session-row {
++  display: flex;
++  align-items: center;
++  justify-content: space-between;
++  gap: var(--space-4);
++  padding: var(--space-4);
++  border: 1px solid var(--border-default);
++  border-radius: 8px;
++  background: var(--surface-card);
++  text-align: left;
++  cursor: pointer;
++  font: inherit;
++  color: inherit;
++  width: 100%;
++}
++
++.session-row:hover {
++  border-color: var(--border-strong);
++}
++
++.session-row-main {
++  display: flex;
++  flex-direction: column;
++  gap: var(--space-1);
++  min-width: 0;
++}
++
++.session-row-top {
++  display: flex;
++  align-items: center;
++  gap: var(--space-2);
++}
++
++.session-row-project {
++  font-weight: 600;
++  color: var(--text-primary);
++}
++
++.session-row-model {
++  font-family: var(--font-mono);
++  font-size: var(--text-sm);
++  color: var(--text-muted);
++}
++
++.session-row-summary {
++  font-size: var(--text-sm);
++  color: var(--text-secondary);
++  overflow: hidden;
++  text-overflow: ellipsis;
++  white-space: nowrap;
++}
++
++.session-row-stats {
++  display: flex;
++  flex-direction: column;
++  align-items: flex-end;
++  gap: var(--space-1);
++  font-size: var(--text-sm);
++  color: var(--text-secondary);
++  flex-shrink: 0;
++}
+diff --git a/src/views/SessionsView.tsx b/src/views/SessionsView.tsx
+new file mode 100644
+index 0000000..c833359
+--- /dev/null
++++ b/src/views/SessionsView.tsx
+@@ -0,0 +1,94 @@
++import { useState } from "react";
++import { useQuery } from "@tanstack/react-query";
++import { listProjects, listSessions } from "../lib/tauri";
++import { formatRelativeTime } from "../lib/format";
++import { Pill } from "../components/ui/Pill";
++import { SessionDetailModal } from "./SessionDetailModal";
++import type { ProjectSummary, Session } from "../lib/types";
++import "./SessionsView.css";
++
++function projectNameFor(projects: ProjectSummary[] | undefined, projectId: string): string {
++  return projects?.find((p) => p.id === projectId)?.name ?? projectId;
++}
++
++interface SessionRowProps {
++  session: Session;
++  projectName: string;
++  onClick: () => void;
++}
++
++function SessionRow({ session, projectName, onClick }: SessionRowProps) {
++  return (
++    <button className="session-row" onClick={onClick}>
++      <div className="session-row-main">
++        <div className="session-row-top">
++          <span className="session-row-project">{projectName}</span>
++          <Pill variant="status" tone={session.status === "active" ? "green" : "gray"}>
++            {session.status}
++          </Pill>
++          <span className="session-row-model">{session.model ?? "unknown model"}</span>
++        </div>
++        <div className="session-row-summary">{session.summary ?? "No summary yet"}</div>
++      </div>
++      <div className="session-row-stats">
++        <span>{formatRelativeTime(session.last_activity_at)}</span>
++        <span>${session.cost_usd.toFixed(2)}</span>
++        <span>
++          {session.prompt_tokens + session.completion_tokens} tokens
++        </span>
++      </div>
++    </button>
++  );
++}
++
++export function SessionsView() {
++  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
++
++  const {
++    data: sessions,
++    isLoading,
++    isError,
++  } = useQuery({ queryKey: ["sessions"], queryFn: listSessions });
++
++  const { data: projects } = useQuery({ queryKey: ["projects"], queryFn: listProjects });
++
++  if (isLoading) {
++    return <p className="sessions-view-status">Loading sessions…</p>;
++  }
++
++  if (isError) {
++    return (
++      <p className="sessions-view-status">
++        Couldn't load sessions. Is the backend running?
++      </p>
++    );
++  }
++
++  if (!sessions || sessions.length === 0) {
++    return (
++      <p className="sessions-view-status">
++        No sessions yet — start a Claude Code session in any repo and it will
++        appear here.
++      </p>
++    );
++  }
++
++  return (
++    <div className="sessions-view">
++      <div className="sessions-view-list">
++        {sessions.map((session) => (
++          <SessionRow
++            key={session.id}
++            session={session}
++            projectName={projectNameFor(projects, session.project_id)}
++            onClick={() => setSelectedSessionId(session.id)}
++          />
++        ))}
++      </div>
++      <SessionDetailModal
++        sessionId={selectedSessionId}
++        onClose={() => setSelectedSessionId(null)}
++      />
++    </div>
++  );
++}

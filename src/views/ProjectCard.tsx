@@ -8,13 +8,17 @@ import "./ProjectCard.css";
 
 interface ProjectCardProps {
   project: ProjectSummary;
+  /** Whether this card represents the currently-selected project in a master-detail layout
+   * (e.g. `ProjectsView`). Purely a visual affordance — omit for standalone usage. */
+  selected?: boolean;
+  onClick?: () => void;
 }
 
 /** All-zero 14-day placeholder shown while activity data hasn't loaded yet (or failed to,
  * e.g. outside a real Tauri context) — never blocks the rest of the card's render. */
 const EMPTY_ACTIVITY = new Array(14).fill(0);
 
-export function ProjectCard({ project }: ProjectCardProps) {
+export function ProjectCard({ project, selected = false, onClick }: ProjectCardProps) {
   const { data: activity } = useQuery({
     queryKey: ["project-activity", project.path],
     queryFn: () => getProjectActivity(project.path),
@@ -23,8 +27,10 @@ export function ProjectCard({ project }: ProjectCardProps) {
     retry: false,
   });
 
+  const classes = "project-card" + (selected ? " project-card-selected" : "");
+
   return (
-    <div className="project-card">
+    <button className={classes} onClick={onClick}>
       <div className="project-card-header">
         <span className="project-card-name">{project.name}</span>
         <Pill variant="agent" tone="accent">
@@ -40,6 +46,6 @@ export function ProjectCard({ project }: ProjectCardProps) {
         <span>active {formatRelativeTime(project.last_active)}</span>
       </div>
       <ActivityBars data={activity ?? EMPTY_ACTIVITY} />
-    </div>
+    </button>
   );
 }

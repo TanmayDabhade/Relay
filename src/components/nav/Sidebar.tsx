@@ -7,12 +7,12 @@ export type View =
   | "connections"
   | "agent-manager";
 
-const NAV_ITEMS: { id: View; label: string; icon: string }[] = [
+const NAV_ITEMS: { id: View; label: string; icon: string; disabled?: boolean }[] = [
   { id: "projects", label: "Projects", icon: "⊞" },
   { id: "sessions", label: "Sessions", icon: "◷" },
   { id: "timeline", label: "Timeline", icon: "⋮" },
-  { id: "connections", label: "Connections", icon: "⟳" },
-  { id: "agent-manager", label: "Agent Manager", icon: "▶" },
+  { id: "connections", label: "Connections", icon: "⟳", disabled: true },
+  { id: "agent-manager", label: "Agent Manager", icon: "▶", disabled: true },
 ];
 
 interface SidebarProps {
@@ -30,7 +30,8 @@ export function Sidebar({ active, onSelect, footer }: SidebarProps) {
         {NAV_ITEMS.map((item) => (
           <button
             key={item.id}
-            className={`sidebar-nav-item${active === item.id ? " active" : ""}`}
+            className={`sidebar-nav-item${active === item.id ? " active" : ""}${item.disabled ? " disabled" : ""}`}
+            aria-disabled={item.disabled}
             onClick={() => onSelect(item.id)}
           >
             <span className="sidebar-nav-icon">{item.icon}</span>

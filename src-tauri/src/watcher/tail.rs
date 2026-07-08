@@ -50,3 +50,125 @@ pub fn read_new_lines(conn: &Connection, path: &Path) -> anyhow::Result<Vec<Stri
 
     Ok(lines.into_iter().filter(|l| !l.trim().is_empty()).collect())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Cleans up its file on drop so a failing assertion can't leak a stray temp file.
+    struct TempFile(std::path::PathBuf);
+
+    impl TempFile {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "manageai-tail-test-{}-{name}.jsonl",
+                std::process::id()
+            ));
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+
+        fn write(&self, contents: &str) {
+            std::fs::write(&self.0, contents).unwrap();
+        }
+
+        fn append(&self, contents: &str) {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&self.0)
+                .unwrap();
+            f.write_all(contents.as_bytes()).unwrap();
+        }
+    }
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn in_memory_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!("../../migrations/0001_init.sql"))
+            .unwrap();
+        conn
+    }
+
+    const MALFORMED_FIXTURE: &str = include_str!("../../tests/fixtures/malformed_line.jsonl");
+
+    #[test]
+    fn returns_all_complete_lines_including_malformed_ones_and_advances_offset_to_eof() {
+        // tail.rs's job is byte-accurate line splitting, not JSON validity - a malformed but
+        // newline-terminated line is a "complete line" at this layer (parser::parse_line is
+        // what rejects it later). This mirrors PLAN.md verification item: "truncated mid-JSON
+        // line is skipped [by the parser], rest of file still processes, byte_offset still
+        // advances past it" - the byte_offset half of that guarantee lives here.
+        let file = TempFile::new("malformed");
+        file.write(MALFORMED_FIXTURE);
+        let conn = in_memory_db();
+
+        let lines = read_new_lines(&conn, file.path()).unwrap();
+        assert_eq!(lines.len(), 3, "all 3 newline-terminated lines returned, malformed one included");
+
+        let expected_offset = MALFORMED_FIXTURE.len() as i64;
+        let state = queries::get_ingest_state(&conn, &file.path().to_string_lossy()).unwrap();
+        assert_eq!(state.byte_offset, expected_offset);
+        assert_eq!(state.partial_line, "");
+    }
+
+    #[test]
+    fn trailing_incomplete_line_is_buffered_not_returned() {
+        let file = TempFile::new("partial");
+        // No trailing newline - simulates the watcher firing mid-write.
+        file.write(r#"{"type":"user","sessionId":"s","timestamp":"2026-01-01T00:00:00Z","cwd":"/tmp","message":{"role":"user","content":"a"}}
+{"type":"user","sessionId":"s","timestamp":"2026-01-01T00:00:01Z","cwd":"/tmp","message":{"role":"user","conte"#);
+        let conn = in_memory_db();
+
+        let lines = read_new_lines(&conn, file.path()).unwrap();
+        assert_eq!(lines.len(), 1, "only the first, complete line is returned");
+
+        let state = queries::get_ingest_state(&conn, &file.path().to_string_lossy()).unwrap();
+        assert!(
+            state.partial_line.starts_with(r#"{"type":"user","sessionId":"s","timestamp":"2026-01-01T00:00:01Z"#),
+            "incomplete trailing line must be buffered as partial_line, got: {}",
+            state.partial_line
+        );
+
+        // Claude Code finishes the flush: the rest of the line plus its newline arrive.
+        file.append(r#"nt":"b"}}"#);
+        file.append("\n");
+
+        let lines = read_new_lines(&conn, file.path()).unwrap();
+        assert_eq!(lines.len(), 1, "the now-completed line is returned on the next tail");
+        assert!(lines[0].contains(r#""content":"b"}}"#));
+
+        let state = queries::get_ingest_state(&conn, &file.path().to_string_lossy()).unwrap();
+        assert_eq!(state.partial_line, "");
+    }
+
+    #[test]
+    fn resumes_from_stored_byte_offset_instead_of_reprocessing_from_scratch() {
+        // Simulates an app restart mid-session: read once, then simulate a fresh process by
+        // calling read_new_lines again against the *same* ingest_state row without the file
+        // changing - it must return nothing new, not re-deliver already-tailed lines.
+        let file = TempFile::new("resume");
+        file.write("line one is not valid json but is newline-terminated\n");
+        let conn = in_memory_db();
+
+        let first = read_new_lines(&conn, file.path()).unwrap();
+        assert_eq!(first.len(), 1);
+
+        let second = read_new_lines(&conn, file.path()).unwrap();
+        assert!(second.is_empty(), "no new bytes since last tail - nothing should be re-delivered");
+
+        // Now Claude Code appends more while we were "away".
+        file.append("line two also newline-terminated\n");
+        let third = read_new_lines(&conn, file.path()).unwrap();
+        assert_eq!(third.len(), 1);
+        assert!(third[0].contains("line two"));
+    }
+}

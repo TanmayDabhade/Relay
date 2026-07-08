@@ -50,6 +50,10 @@
   font-weight: 500;
 }
 
+.sidebar-nav-item.disabled {
+  color: var(--text-ghost);
+}
+
 .sidebar-nav-icon {
   width: 1.2em;
   display: inline-flex;

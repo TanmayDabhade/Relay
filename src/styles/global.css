@@ -41,3 +41,12 @@ button {
   overflow-y: auto;
   padding: var(--space-6);
 }
+
+/* Shared "topbar with title" pattern for full-width single-column views
+   (Sessions, Timeline) per SPEC §8.7. */
+.view-topbar-title {
+  font-size: var(--text-lg);
+  font-weight: 600;
+  color: var(--text-primary);
+  margin: 0;
+}

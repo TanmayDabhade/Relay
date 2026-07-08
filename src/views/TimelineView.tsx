@@ -2,7 +2,9 @@ import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { listProjects, listSessions } from "../lib/tauri";
 import { formatRelativeTime } from "../lib/format";
+import { Button } from "../components/ui/Button";
 import { Pill } from "../components/ui/Pill";
+import { Select } from "../components/ui/Select";
 import { SessionDetailModal } from "./SessionDetailModal";
 import type { ProjectSummary, Session } from "../lib/types";
 import "./TimelineView.css";
@@ -144,88 +146,88 @@ export function TimelineView() {
       .sort((a, b) => timelineTimestamp(b) - timelineTimestamp(a));
   }, [sessions, projectFilter, tagFilter, datePreset]);
 
-  if (isLoading) {
-    return <p className="timeline-view-status">Loading timeline…</p>;
-  }
-
-  if (isError) {
-    return (
-      <p className="timeline-view-status">
-        Couldn't load sessions. Is the backend running?
-      </p>
-    );
-  }
-
-  if (!sessions || sessions.length === 0) {
-    return (
-      <p className="timeline-view-status">
-        No sessions yet — start a Claude Code session in any repo and it will
-        appear here.
-      </p>
-    );
-  }
-
   return (
     <div className="timeline-view">
-      <div className="timeline-filters">
-        <select
-          className="timeline-filter-select"
-          value={projectFilter}
-          onChange={(e) => setProjectFilter(e.target.value)}
-          aria-label="Filter by project"
-        >
-          <option value="all">All projects</option>
-          {projects?.map((project) => (
-            <option key={project.id} value={project.id}>
-              {project.name}
-            </option>
-          ))}
-        </select>
-
-        <select
-          className="timeline-filter-select"
-          value={tagFilter}
-          onChange={(e) => setTagFilter(e.target.value)}
-          aria-label="Filter by tag"
-        >
-          <option value="all">All tags</option>
-          {availableTags.map((tag) => (
-            <option key={tag} value={tag}>
-              {tag}
-            </option>
-          ))}
-        </select>
-
-        <div className="timeline-filter-presets" role="group" aria-label="Filter by date">
-          {(["all", "today", "week"] as const).map((preset) => (
-            <button
-              key={preset}
-              type="button"
-              className={
-                "timeline-filter-preset" +
-                (datePreset === preset ? " timeline-filter-preset-active" : "")
-              }
-              onClick={() => setDatePreset(preset)}
-            >
-              {preset === "all" ? "All time" : preset === "today" ? "Today" : "This week"}
-            </button>
-          ))}
-        </div>
+      <div className="view-topbar">
+        <h1 className="view-topbar-title">Timeline</h1>
       </div>
 
-      {sortedAndFiltered.length === 0 ? (
-        <p className="timeline-view-status">No sessions match the current filters.</p>
-      ) : (
-        <div className="timeline-list">
-          {sortedAndFiltered.map((session) => (
-            <TimelineEntry
-              key={session.id}
-              session={session}
-              projectName={projectNameFor(projects, session.project_id)}
-              onClick={() => setSelectedSessionId(session.id)}
-            />
-          ))}
-        </div>
+      {isLoading && <p className="timeline-view-status">Loading timeline…</p>}
+
+      {isError && (
+        <p className="timeline-view-status">
+          Couldn't load sessions. Is the backend running?
+        </p>
+      )}
+
+      {!isLoading && !isError && (!sessions || sessions.length === 0) && (
+        <p className="timeline-view-status">
+          No sessions yet — start a Claude Code session in any repo and it will
+          appear here.
+        </p>
+      )}
+
+      {!isLoading && !isError && sessions && sessions.length > 0 && (
+        <>
+          <div className="timeline-filters">
+            <Select
+              value={projectFilter}
+              onChange={(e) => setProjectFilter(e.target.value)}
+              aria-label="Filter by project"
+            >
+              <option value="all">All projects</option>
+              {projects?.map((project) => (
+                <option key={project.id} value={project.id}>
+                  {project.name}
+                </option>
+              ))}
+            </Select>
+
+            <Select
+              value={tagFilter}
+              onChange={(e) => setTagFilter(e.target.value)}
+              aria-label="Filter by tag"
+            >
+              <option value="all">All tags</option>
+              {availableTags.map((tag) => (
+                <option key={tag} value={tag}>
+                  {tag}
+                </option>
+              ))}
+            </Select>
+
+            <div className="timeline-filter-presets" role="group" aria-label="Filter by date">
+              {(["all", "today", "week"] as const).map((preset) => (
+                <Button
+                  key={preset}
+                  type="button"
+                  variant="secondary"
+                  className={
+                    datePreset === preset ? "timeline-filter-preset-active" : undefined
+                  }
+                  onClick={() => setDatePreset(preset)}
+                >
+                  {preset === "all" ? "All time" : preset === "today" ? "Today" : "This week"}
+                </Button>
+              ))}
+            </div>
+          </div>
+
+          {sortedAndFiltered.length === 0 ? (
+            <p className="timeline-view-status">No sessions match the current filters.</p>
+          ) : (
+            <div className="timeline-list">
+              {sortedAndFiltered.map((session) => (
+                <TimelineEntry
+                  key={session.id}
+                  session={session}
+                  projectName={projectNameFor(projects, session.project_id)}
+                  onClick={() => setSelectedSessionId(session.id)}
+                />
+              ))}
+            </div>
+          )}
+        </>
       )}
 
       <SessionDetailModal

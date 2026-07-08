@@ -17,6 +17,18 @@
   color: var(--text-secondary);
 }
 
+.pill-tag {
+  font-size: var(--text-xs);
+}
+
+.pill-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  flex-shrink: 0;
+}
+
 .pill-tone-green {
   background: var(--green-bg);
   border-color: var(--green-border);
@@ -47,5 +59,6 @@
 
 .pill-tone-accent {
   background: var(--accent-subtle);
+  border-color: var(--accent-border);
   color: var(--accent);
 }

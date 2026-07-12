@@ -32,6 +32,13 @@
   color: var(--text-primary);
 }
 
+.project-card-agents {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+}
+
 .project-card-path {
   font-family: var(--font-mono);
   font-size: var(--text-sm);

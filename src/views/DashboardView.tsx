@@ -2,22 +2,12 @@ import { useQuery } from "@tanstack/react-query";
 import { ActivityHeatmap } from "../components/ui/ActivityHeatmap";
 import { ProjectDot } from "../components/ui/ProjectDot";
 import { StatTile } from "../components/ui/StatTile";
+import { agentMeta, KNOWN_AGENT_IDS } from "../lib/agents";
 import { sessionDisplayName } from "../lib/format";
 import { colorForProject } from "../lib/projectColor";
 import { getDashboardStats } from "../lib/tauri";
 import type { AgentUsage } from "../lib/types";
 import "./DashboardView.css";
-
-/** Fixed display order + metadata for every agent Relay knows about, regardless of
- * whether it's wired up for ingestion yet. Keeping this list here (rather than deriving
- * it from `agent_usage`) is what lets Codex/Gemini/Cursor show up as "coming soon" tiles
- * even though no rows for them exist in the DB. */
-const KNOWN_AGENTS: { id: string; label: string; icon: string; live: boolean }[] = [
-  { id: "claude", label: "Claude Code", icon: "✳", live: true },
-  { id: "codex", label: "Codex", icon: "◆", live: false },
-  { id: "gemini", label: "Gemini", icon: "◈", live: false },
-  { id: "cursor", label: "Cursor", icon: "▲", live: false },
-];
 
 export function DashboardView() {
   const { data, isLoading, isError } = useQuery({
@@ -132,38 +122,29 @@ export function DashboardView() {
         <section className="dashboard-section dashboard-column">
           <h2 className="dashboard-section-title">Spend by agent</h2>
           <div className="dashboard-agent-grid">
-            {KNOWN_AGENTS.map((agent) => {
-              const usage = usageByAgent.get(agent.id);
+            {KNOWN_AGENT_IDS.map((agentId) => {
+              const meta = agentMeta(agentId);
+              const usage = usageByAgent.get(agentId);
               return (
-                <div
-                  className={`dashboard-card dashboard-agent-card${agent.live ? "" : " dashboard-agent-card-soon"}`}
-                  key={agent.id}
-                >
+                <div className="dashboard-card dashboard-agent-card" key={agentId}>
                   <div className="dashboard-agent-header">
-                    <span className="dashboard-agent-icon">{agent.icon}</span>
-                    <span className="dashboard-agent-label">{agent.label}</span>
-                    {!agent.live && <span className="dashboard-agent-badge">Coming soon</span>}
+                    <span className="dashboard-agent-icon">{meta.icon}</span>
+                    <span className="dashboard-agent-label">{meta.label}</span>
                   </div>
-                  {agent.live ? (
-                    <div className="dashboard-agent-stats">
-                      <div className="dashboard-agent-stat">
-                        <span className="dashboard-agent-stat-value">
-                          ${(usage?.total_cost_usd ?? 0).toFixed(2)}
-                        </span>
-                        <span className="dashboard-agent-stat-label">spend</span>
-                      </div>
-                      <div className="dashboard-agent-stat">
-                        <span className="dashboard-agent-stat-value">
-                          {usage?.session_count ?? 0}
-                        </span>
-                        <span className="dashboard-agent-stat-label">sessions</span>
-                      </div>
+                  <div className="dashboard-agent-stats">
+                    <div className="dashboard-agent-stat">
+                      <span className="dashboard-agent-stat-value">
+                        ${(usage?.total_cost_usd ?? 0).toFixed(2)}
+                      </span>
+                      <span className="dashboard-agent-stat-label">spend</span>
                     </div>
-                  ) : (
-                    <p className="dashboard-agent-soon-text">
-                      Tracking for {agent.label} isn't wired up yet.
-                    </p>
-                  )}
+                    <div className="dashboard-agent-stat">
+                      <span className="dashboard-agent-stat-value">
+                        {usage?.session_count ?? 0}
+                      </span>
+                      <span className="dashboard-agent-stat-label">sessions</span>
+                    </div>
+                  </div>
                 </div>
               );
             })}

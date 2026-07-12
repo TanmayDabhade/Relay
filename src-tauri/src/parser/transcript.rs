@@ -5,6 +5,7 @@
 //! byte-offset tailing machinery here.
 
 use super::claude_jsonl::parse_line;
+use super::record::ToolUse;
 
 pub struct TranscriptExcerpts {
     pub first_user_text: Option<String>,
@@ -52,6 +53,59 @@ pub fn extract_excerpts(raw_log_path: &str) -> anyhow::Result<TranscriptExcerpts
         first_user_text,
         last_assistant_text,
     })
+}
+
+/// Renders `raw_log_path` as a human-readable Markdown chat log: one `### You` / `### Assistant`
+/// heading per turn, in file order, with the turn's text (or an italic placeholder for a
+/// tool-only assistant turn) followed by a bullet per tool call the turn made. `system` and
+/// `ai-title` records carry no conversational content (see `ParsedRecord::text`'s doc comment)
+/// and are skipped rather than rendered as empty turns.
+pub fn render_markdown(raw_log_path: &str) -> anyhow::Result<String> {
+    let contents = std::fs::read_to_string(raw_log_path)?;
+    let mut out = String::new();
+
+    for line in contents.lines() {
+        let Some(record) = parse_line(line) else {
+            continue;
+        };
+
+        let heading = match record.record_type.as_str() {
+            "user" => "### You",
+            "assistant" => "### Assistant",
+            _ => continue,
+        };
+
+        out.push_str(heading);
+        out.push_str("\n\n");
+        match &record.text {
+            Some(text) => {
+                out.push_str(text);
+                out.push('\n');
+            }
+            None => out.push_str("_[no text]_\n"),
+        }
+
+        for tool_use in &record.tool_uses {
+            out.push_str("- ");
+            out.push_str(&describe_tool_use(tool_use));
+            out.push('\n');
+        }
+
+        out.push('\n');
+    }
+
+    Ok(out)
+}
+
+fn describe_tool_use(tool_use: &ToolUse) -> String {
+    match tool_use {
+        ToolUse::Write { file_path, .. } => format!("Wrote `{file_path}`"),
+        ToolUse::Edit { file_path, .. } => format!("Edited `{file_path}`"),
+        ToolUse::MultiEdit { file_path, edits } => {
+            format!("Multi-edited `{file_path}` ({} edits)", edits.len())
+        }
+        ToolUse::NotebookEdit { file_path, .. } => format!("Notebook-edited `{file_path}`"),
+    }
 }
 
 #[cfg(test)]
@@ -113,6 +167,38 @@ mod tests {
     #[test]
     fn unreadable_file_returns_err_not_panic() {
         let result = extract_excerpts("/nonexistent/path/does-not-exist.jsonl");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn render_markdown_renders_one_heading_per_turn_with_tool_call_bullets() {
+        let file = TempFile::new("render");
+        file.write(SESSION_BASIC_FIXTURE);
+
+        let markdown = render_markdown(&file.path().to_string_lossy()).unwrap();
+
+        // user turn: heading + its text, no bullets.
+        assert!(markdown.contains(
+            "### You\n\nAdd a hello world main function and fix the greeting in foo().\n"
+        ));
+        // first assistant turn: text plus its Write tool call.
+        assert!(markdown.contains(
+            "### Assistant\n\nI'll create the main function.\n- Wrote `src/main.rs`\n"
+        ));
+        // remaining assistant turns are tool-only: no text block, so the placeholder plus
+        // their respective tool call bullet.
+        assert!(markdown.contains("_[no text]_\n- Edited `src/main.rs`\n"));
+        assert!(markdown.contains("_[no text]_\n- Multi-edited `src/lib.rs` (2 edits)\n"));
+        assert!(markdown.contains("_[no text]_\n- Notebook-edited `notebook.ipynb`\n"));
+        // the system and ai-title records carry no conversational content and must not
+        // produce their own heading.
+        assert!(!markdown.contains("### System"));
+        assert_eq!(markdown.matches("### ").count(), 5, "expected exactly 5 rendered turns");
+    }
+
+    #[test]
+    fn render_markdown_unreadable_file_returns_err_not_panic() {
+        let result = render_markdown("/nonexistent/path/does-not-exist.jsonl");
         assert!(result.is_err());
     }
 

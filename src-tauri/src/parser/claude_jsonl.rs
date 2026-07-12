@@ -6,6 +6,7 @@
 //! malformed line is skipped and logged, never treated as fatal. Verified against real log
 //! files on this machine (not just illustrative examples) as of Claude Code ~2.1.x.
 
+use super::record::{ParsedRecord, ToolUse, Usage};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
@@ -19,61 +20,6 @@ const INERT_TYPES: &[&str] = &[
     "file-history-snapshot",
     "queue-operation",
 ];
-
-#[derive(Debug, Clone, Default)]
-pub struct Usage {
-    pub input_tokens: i64,
-    pub output_tokens: i64,
-    pub cache_read_input_tokens: i64,
-    pub cache_creation_input_tokens: i64,
-}
-
-#[derive(Debug, Clone)]
-pub enum ToolUse {
-    Write {
-        file_path: String,
-        content: String,
-    },
-    Edit {
-        file_path: String,
-        old_string: String,
-        new_string: String,
-    },
-    MultiEdit {
-        file_path: String,
-        edits: Vec<(String, String)>,
-    },
-    NotebookEdit {
-        file_path: String,
-        old_string: Option<String>,
-        new_string: String,
-    },
-}
-
-#[derive(Debug, Clone)]
-pub struct ParsedRecord {
-    pub record_type: String,
-    pub cwd: Option<String>,
-    #[allow(dead_code)] // not yet surfaced in the UI; parsed for future stack/lang detection
-    pub git_branch: Option<String>,
-    pub session_id: Option<String>,
-    pub timestamp: Option<i64>, // unix seconds
-    pub model: Option<String>,
-    pub usage: Option<Usage>,
-    pub tool_uses: Vec<ToolUse>,
-    /// Prompt/response text content, if any. For `user` records: the plain-string
-    /// `message.content`, when present in that shape (an array `content` — e.g. a
-    /// multi-part/attachment message — is left as `None`, out of scope; see this module's
-    /// doc comment). For `assistant` records: every `content[]` item with `"type": "text"`
-    /// concatenated with `"\n"` between blocks (`"thinking"`/`"tool_use"` blocks skipped),
-    /// or `None` if there were no text blocks (e.g. a tool-only turn). For `system` records:
-    /// always `None` — system records never carry prompt/response text.
-    pub text: Option<String>,
-    /// Only set on an `"ai-title"` record: Claude Code's own auto-generated title for this
-    /// session (the `aiTitle` field) — the same text shown as "Session name" in `claude`
-    /// CLI's `/status` and the `--resume` picker. `None` for every other record type.
-    pub ai_title: Option<String>,
-}
 
 /// Parses a single complete JSONL line. Returns `None` for malformed JSON, records with no
 /// `type` field, or record types that carry nothing worth persisting — never errors out, since
@@ -159,6 +105,7 @@ pub fn parse_line(line: &str) -> Option<ParsedRecord> {
 
     Some(ParsedRecord {
         record_type,
+        agent: "claude",
         cwd,
         git_branch,
         session_id,

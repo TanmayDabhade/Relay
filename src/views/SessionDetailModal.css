@@ -20,6 +20,35 @@
   color: var(--text-muted);
 }
 
+.session-detail-export-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.session-detail-export-status {
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.session-detail-export-error {
+  color: var(--tone-red, #b0473f);
+}
+
+.session-detail-export-reveal {
+  font: inherit;
+  font-size: var(--text-xs);
+  color: var(--accent);
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  text-decoration: underline;
+}
+
 .session-detail-stats {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(8.75rem, 1fr)); /* 140px */

@@ -54,6 +54,12 @@ export function revealInFinder(path: string): Promise<void> {
   return invoke("reveal_in_finder", { path });
 }
 
+/** Writes the session's transcript as Markdown to the user's Downloads folder and resolves
+ * to the absolute path it was saved at, for a "Reveal in Finder" follow-up action. */
+export function exportTranscript(sessionId: string): Promise<string> {
+  return invoke("export_transcript", { sessionId });
+}
+
 export function getFileDiffForSessionFile(sessionId: string, filePath: string): Promise<FileDiff | null> {
   return invoke("get_file_diff_for_session_file", { sessionId, filePath });
 }

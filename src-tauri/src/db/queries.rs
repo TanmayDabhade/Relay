@@ -14,6 +14,11 @@ pub struct ProjectSummary {
     pub last_active: i64,
     pub session_count: i64,
     pub total_cost_usd: f64,
+    /// Every distinct agent (`claude`/`codex`/`gemini`/`cursor`) that has at least one session
+    /// in this project — order is whatever SQLite's `GROUP_CONCAT(DISTINCT ...)` returns, not
+    /// meaningful. Lets the UI show one badge per agent instead of assuming every project is
+    /// Claude-only.
+    pub agents: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -70,8 +75,8 @@ pub struct IngestState {
 
 /// Per-agent rollup for the Dashboard's "by agent" breakdown. Only agents actually present
 /// in `sessions` show up here — the frontend merges this against a fixed known-agent list
-/// (claude/codex/gemini/cursor) and renders "coming soon" for whichever ones this query
-/// didn't return, since ingestion only exists for Claude Code today.
+/// (claude/codex/gemini/cursor) so every known agent gets a tile even before it has any
+/// sessions ingested.
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentUsage {
     pub agent: String,
@@ -144,6 +149,7 @@ pub fn upsert_session(
     conn: &Connection,
     session_id: &str,
     project_id: &str,
+    agent: &str,
     model: Option<&str>,
     timestamp: i64,
     raw_log_path: &str,
@@ -164,7 +170,7 @@ pub fn upsert_session(
             prompt_tokens, completion_tokens, cache_read_tokens, cache_creation_tokens,
             raw_log_path
          )
-         VALUES (?1, ?2, 'claude', ?3, ?4, ?4, 'active', ?5, ?6, ?7, ?8, ?9)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?5, 'active', ?6, ?7, ?8, ?9, ?10)
          ON CONFLICT(id) DO UPDATE SET
             model = COALESCE(excluded.model, model),
             started_at = MIN(started_at, excluded.started_at),
@@ -177,6 +183,7 @@ pub fn upsert_session(
         params![
             session_id,
             project_id,
+            agent,
             model,
             timestamp,
             delta.prompt_tokens,
@@ -272,7 +279,8 @@ pub fn list_projects(conn: &Connection) -> rusqlite::Result<Vec<ProjectSummary>>
     let mut stmt = conn.prepare(
         "SELECT p.id, p.name, p.path, p.lang, p.stack, p.created_at, p.last_active,
                 COUNT(s.id) as session_count,
-                COALESCE(SUM(s.cost_usd), 0.0) as total_cost_usd
+                COALESCE(SUM(s.cost_usd), 0.0) as total_cost_usd,
+                GROUP_CONCAT(DISTINCT s.agent) as agents
          FROM projects p
          LEFT JOIN sessions s ON s.project_id = p.id
          GROUP BY p.id
@@ -280,6 +288,7 @@ pub fn list_projects(conn: &Connection) -> rusqlite::Result<Vec<ProjectSummary>>
          ORDER BY p.last_active DESC",
     )?;
     let rows = stmt.query_map([], |row| {
+        let agents: Option<String> = row.get(9)?;
         Ok(ProjectSummary {
             id: row.get(0)?,
             name: row.get(1)?,
@@ -290,6 +299,9 @@ pub fn list_projects(conn: &Connection) -> rusqlite::Result<Vec<ProjectSummary>>
             last_active: row.get(6)?,
             session_count: row.get(7)?,
             total_cost_usd: row.get(8)?,
+            agents: agents
+                .map(|s| s.split(',').map(String::from).collect())
+                .unwrap_or_default(),
         })
     })?;
     rows.collect()
@@ -334,6 +346,14 @@ pub fn get_session_detail(
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
     Ok(Some((session, files)))
+}
+
+/// Just the session row, no `files_changed` join — for callers (e.g. transcript export) that
+/// only need session metadata and would otherwise pay for an unused query.
+pub fn get_session(conn: &Connection, session_id: &str) -> rusqlite::Result<Option<Session>> {
+    let sql = format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE id = ?1");
+    conn.query_row(&sql, params![session_id], row_to_session)
+        .optional()
 }
 
 /// Before/after text spanning every `files_changed` row for one file within one session,
@@ -528,10 +548,10 @@ pub fn all_session_token_totals(conn: &Connection) -> rusqlite::Result<Vec<Sessi
 
 // --- Dashboard (spend + activity summary) ---
 
-/// Cost and session-count totals grouped by `agent`. Every row currently ingested has
-/// `agent = 'claude'` (see `upsert_session`'s hardcoded literal), but the column and this
-/// query are already agent-generic so wiring up Codex/Gemini/Cursor ingestion later is just
-/// a new writer, not a schema or query change.
+/// Cost and session-count totals grouped by `agent`. Populated from whichever agents'
+/// watchers have actually ingested sessions — Claude Code, Codex, Gemini, and Cursor all write
+/// their own `agent` value via `upsert_session` (see `parser/{claude_jsonl,codex_jsonl,
+/// gemini_log,cursor_jsonl}.rs`).
 pub fn agent_usage(conn: &Connection) -> rusqlite::Result<Vec<AgentUsage>> {
     let mut stmt = conn.prepare(
         "SELECT agent, COUNT(*) as session_count, COALESCE(SUM(cost_usd), 0.0) as total_cost_usd

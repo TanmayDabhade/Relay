@@ -1,5 +1,6 @@
 use crate::activity;
 use crate::db::{queries, Db};
+use crate::parser;
 use crate::terminal;
 use chrono::{Duration, NaiveDate, Utc};
 use serde::Serialize;
@@ -413,6 +414,52 @@ pub fn reveal_in_finder(path: String) -> Result<(), String> {
         .spawn()
         .map(|_| ())
         .map_err(|e| format!("failed to reveal {path} in Finder: {e}"))
+}
+
+/// Renders `session_id`'s raw Claude Code log as a readable Markdown transcript and writes it
+/// to the user's Downloads directory, mirroring `export_report`'s save-and-return-path
+/// contract so the frontend can reuse the same `reveal_in_finder` follow-up action.
+#[tauri::command]
+pub fn export_transcript(db: State<'_, Db>, session_id: String) -> Result<String, String> {
+    let session = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        queries::get_session(&conn, &session_id).map_err(|e| e.to_string())?
+    };
+    let session = session.ok_or_else(|| format!("session {session_id} not found"))?;
+
+    let transcript = parser::render_markdown(&session.raw_log_path).map_err(|e| e.to_string())?;
+
+    let dir = dirs::download_dir()
+        .or_else(dirs::home_dir)
+        .ok_or_else(|| "could not resolve a directory to save the transcript into".to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+
+    let filename = format!(
+        "relay-transcript-{}-{}.md",
+        &session.id[..8],
+        Utc::now().format("%Y-%m-%d-%H%M%S")
+    );
+    let path = dir.join(filename);
+    std::fs::write(&path, format!("{}{transcript}", render_transcript_header(&session)))
+        .map_err(|e| e.to_string())?;
+
+    Ok(path.to_string_lossy().to_string())
+}
+
+fn render_transcript_header(session: &queries::Session) -> String {
+    let title = session
+        .title
+        .as_deref()
+        .or(session.summary.as_deref())
+        .unwrap_or("Untitled session");
+
+    format!(
+        "# {title}\n\n- Session: {}\n- Model: {}\n- Status: {}\n- Cost: ${:.2}\n\n---\n\n",
+        session.id,
+        session.model.as_deref().unwrap_or("unknown"),
+        session.status,
+        session.cost_usd,
+    )
 }
 
 // --- Kanban board ---

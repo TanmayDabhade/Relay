@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { Modal } from "../ui/Modal";
+import { agentMeta } from "../../lib/agents";
 import type { Card, Session } from "../../lib/types";
 import "./CardModal.css";
 
@@ -51,7 +52,8 @@ export function CardModal({
           <div className="card-modal-session">
             <span className="card-modal-session-label">Linked session</span>
             <span className="card-modal-session-value">
-              {linkedSession.model ?? linkedSession.agent} · {linkedSession.status}
+              {agentMeta(linkedSession.agent).icon}{" "}
+              {linkedSession.model ?? agentMeta(linkedSession.agent).label} · {linkedSession.status}
               {linkedSession.summary ? ` — ${linkedSession.summary}` : ""}
             </span>
           </div>
@@ -67,7 +69,8 @@ export function CardModal({
               </option>
               {linkableSessions.map((s) => (
                 <option key={s.id} value={s.id}>
-                  {s.model ?? s.agent} · {s.status} · {new Date((s.started_at ?? 0) * 1000).toLocaleString()}
+                  {agentMeta(s.agent).icon} {s.model ?? agentMeta(s.agent).label} · {s.status} ·{" "}
+                  {new Date((s.started_at ?? 0) * 1000).toLocaleString()}
                 </option>
               ))}
             </select>

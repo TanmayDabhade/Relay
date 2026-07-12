@@ -8,6 +8,8 @@ export interface ProjectSummary {
   last_active: number;
   session_count: number;
   total_cost_usd: number;
+  /** Every distinct agent with at least one session in this project. */
+  agents: string[];
 }
 
 export interface FileChanged {

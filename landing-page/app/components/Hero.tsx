@@ -1,3 +1,5 @@
+import Image from "next/image";
+import heroImage from "@/images/hero.png";
 import { TerminalWindow } from "./TerminalWindow";
 import { CliMarquee } from "./CliMarquee";
 
@@ -45,7 +47,7 @@ export function Hero() {
           </div>
         </div>
         <div className="space-y-4">
-          <TerminalWindow />
+        <Image src={heroImage} alt="Relay Dashboard" className="w-full rounded-lg" priority />
           <div className="grid grid-cols-3 divide-x divide-relay-border border border-relay-border bg-relay-surface text-center">
             {STATS.map((s) => (
               <div key={s.label} className="px-4 py-3">

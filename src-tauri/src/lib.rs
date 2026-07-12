@@ -66,6 +66,7 @@ pub fn run() {
       commands::dashboard_stats,
       commands::generate_report,
       commands::export_report,
+      commands::export_transcript,
       commands::reveal_in_finder,
       commands::get_file_diff_for_session_file,
       commands::get_board,

@@ -2,6 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import { ActivityBars } from "../components/ui/ActivityBars";
 import { Pill } from "../components/ui/Pill";
 import { ProjectDot } from "../components/ui/ProjectDot";
+import { agentMeta } from "../lib/agents";
 import { formatRelativeTime } from "../lib/format";
 import { getProjectActivity } from "../lib/tauri";
 import type { ProjectSummary } from "../lib/types";
@@ -32,9 +33,16 @@ export function ProjectCard({ project, onClick }: ProjectCardProps) {
           <ProjectDot projectId={project.id} />
           {project.name}
         </span>
-        <Pill variant="agent" tone="accent">
-          claude
-        </Pill>
+        <span className="project-card-agents">
+          {project.agents.map((agentId) => {
+            const meta = agentMeta(agentId);
+            return (
+              <Pill variant="agent" tone="accent" key={agentId}>
+                {meta.icon} {meta.label}
+              </Pill>
+            );
+          })}
+        </span>
       </div>
       <div className="project-card-path">{project.path}</div>
       <div className="project-card-stats">

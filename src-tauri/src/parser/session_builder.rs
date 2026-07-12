@@ -1,4 +1,4 @@
-use super::claude_jsonl::{ParsedRecord, ToolUse};
+use super::record::{ParsedRecord, ToolUse};
 use crate::cost::pricing;
 use crate::db::queries::{self, TokenDelta};
 use rusqlite::Connection;
@@ -75,6 +75,7 @@ pub fn ingest_record(
         conn,
         &session_id,
         &project_id,
+        record.agent,
         record.model.as_deref(),
         timestamp,
         raw_log_path,
@@ -477,5 +478,23 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM projects", [], |r| r.get(0))
             .unwrap();
         assert_eq!(project_count, 0);
+    }
+
+    #[test]
+    fn ingesting_a_cursor_record_stamps_agent_cursor_not_claude() {
+        // Confirms `ingest_record` forwards whatever `record.agent` a non-Claude parser set,
+        // rather than assuming Claude — the whole point of the `agent` field existing on
+        // `ParsedRecord`. Cursor's parser is used here since it's the simplest (stateless).
+        let conn = in_memory_db();
+        let line = r#"{"type":"user","sessionId":"cur-session-1","cwd":"/tmp/cursor-project","timestamp":"2026-01-01T10:00:00Z","text":"hello"}"#;
+        let record = crate::parser::cursor_jsonl::parse_line(line).expect("cursor line should parse");
+
+        let outcome = ingest_record(&conn, "/Users/testuser/.cursor/logs/cur-session-1.jsonl", record).unwrap();
+        assert_eq!(outcome.session_created.as_deref(), Some("cur-session-1"));
+
+        let agent: String = conn
+            .query_row("SELECT agent FROM sessions WHERE id = 'cur-session-1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(agent, "cursor");
     }
 }

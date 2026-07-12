@@ -1,3 +1,4 @@
+import { agentMeta } from "../../lib/agents";
 import type { Card, Session } from "../../lib/types";
 import "./CardTile.css";
 
@@ -25,7 +26,7 @@ export function CardTile({ card, linkedSession, onClick, onDragStart }: CardTile
       {linkedSession ? (
         <div className="card-tile-session">
           <span className={`card-tile-session-dot card-tile-session-dot-${linkedSession.status}`} />
-          {linkedSession.model ?? linkedSession.agent}
+          {agentMeta(linkedSession.agent).icon} {linkedSession.model ?? agentMeta(linkedSession.agent).label}
           {linkedSession.cost_usd > 0 ? ` · $${linkedSession.cost_usd.toFixed(2)}` : ""}
         </div>
       ) : null}

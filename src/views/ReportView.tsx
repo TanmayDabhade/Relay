@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Button } from "../components/ui/Button";
 import { StatTile } from "../components/ui/StatTile";
+import { agentMeta } from "../lib/agents";
 import { exportReport, generateReport, revealInFinder } from "../lib/tauri";
 import "./ReportView.css";
 
@@ -176,7 +177,9 @@ export function ReportView() {
                   <tbody>
                     {data.by_agent.map((row) => (
                       <tr key={row.agent}>
-                        <td>{row.agent}</td>
+                        <td>
+                          {agentMeta(row.agent).icon} {agentMeta(row.agent).label}
+                        </td>
                         <td className="report-table-num">{row.session_count}</td>
                         <td className="report-table-num">${row.total_cost_usd.toFixed(2)}</td>
                       </tr>

@@ -4,8 +4,9 @@ import { Button } from "../components/ui/Button";
 import { Modal } from "../components/ui/Modal";
 import { Pill } from "../components/ui/Pill";
 import { StatTile } from "../components/ui/StatTile";
+import { agentMeta } from "../lib/agents";
 import { sessionDisplayName } from "../lib/format";
-import { getSessionDetail, openInEditor } from "../lib/tauri";
+import { exportTranscript, getSessionDetail, openInEditor, revealInFinder } from "../lib/tauri";
 import type { FileChanged } from "../lib/types";
 import { DiffModal } from "./DiffModal";
 import "./SessionDetailModal.css";
@@ -112,7 +113,21 @@ function SessionDetailContent({
   const tags = parseTags(session.tags);
   const groupedFiles = groupFilesChanged(files_changed);
   const [diffPath, setDiffPath] = useState<string | null>(null);
-  const sessionLabel = `${session.model ?? session.agent} · ${session.id.slice(0, 8)}`;
+  const [exportState, setExportState] = useState<
+    { status: "idle" } | { status: "saving" } | { status: "saved"; path: string } | { status: "error"; message: string }
+  >({ status: "idle" });
+  const agent = agentMeta(session.agent);
+  const sessionLabel = `${agent.icon} ${session.model ?? agent.label} · ${session.id.slice(0, 8)}`;
+
+  async function handleExportTranscript() {
+    setExportState({ status: "saving" });
+    try {
+      const path = await exportTranscript(session.id);
+      setExportState({ status: "saved", path });
+    } catch (e) {
+      setExportState({ status: "error", message: String(e) });
+    }
+  }
 
   const durationDisplay =
     session.status === "ended" && session.duration_seconds !== null
@@ -125,7 +140,36 @@ function SessionDetailContent({
         <Pill variant="status" tone={session.status === "active" ? "green" : "gray"}>
           {session.status}
         </Pill>
+        <Pill variant="agent" tone="accent">
+          {agent.icon} {agent.label}
+        </Pill>
         <span className="session-detail-model">{session.model ?? "unknown model"}</span>
+      </div>
+
+      <div className="session-detail-export-row">
+        <Button
+          variant="secondary"
+          onClick={handleExportTranscript}
+          disabled={exportState.status === "saving"}
+        >
+          {exportState.status === "saving" ? "Exporting…" : "Export transcript"}
+        </Button>
+        {exportState.status === "saved" && (
+          <span className="session-detail-export-status">
+            Saved to {exportState.path}
+            <button
+              className="session-detail-export-reveal"
+              onClick={() => revealInFinder(exportState.path)}
+            >
+              Reveal in Finder
+            </button>
+          </span>
+        )}
+        {exportState.status === "error" && (
+          <span className="session-detail-export-status session-detail-export-error">
+            {exportState.message}
+          </span>
+        )}
       </div>
 
       <div className="session-detail-stats">

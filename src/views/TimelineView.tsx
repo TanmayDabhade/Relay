@@ -1,25 +1,14 @@
 import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { listProjects, listSessions } from "../lib/tauri";
-import { formatRelativeTime } from "../lib/format";
+import { formatRelativeTime, sessionDisplayName } from "../lib/format";
+import { colorForProject } from "../lib/projectColor";
 import { Button } from "../components/ui/Button";
 import { Pill } from "../components/ui/Pill";
 import { Select } from "../components/ui/Select";
 import { SessionDetailModal } from "./SessionDetailModal";
 import type { ProjectSummary, Session } from "../lib/types";
 import "./TimelineView.css";
-
-/** Single color for now — `agent` is always `"claude"` today (per PLAN.md's explicit
- * scope). Structured as a lookup so a future multi-agent phase can extend the map
- * rather than restructuring the render logic. */
-const AGENT_COLORS: Record<string, string> = {
-  claude: "var(--accent)",
-};
-const DEFAULT_AGENT_COLOR = "var(--gray)";
-
-function colorForAgent(agent: string): string {
-  return AGENT_COLORS[agent] ?? DEFAULT_AGENT_COLOR;
-}
 
 /** `tags` is stored as a JSON array string (e.g. `["bugfix","refactor"]`); fall back to
  * treating the raw string as a single tag if it doesn't parse, rather than hiding it.
@@ -77,7 +66,7 @@ function TimelineEntry({ session, projectName, onClick }: TimelineEntryProps) {
     <button className="timeline-entry" onClick={onClick}>
       <span
         className="timeline-entry-dot"
-        style={{ backgroundColor: colorForAgent(session.agent) }}
+        style={{ backgroundColor: colorForProject(session.project_id) }}
         aria-hidden="true"
       />
       <div className="timeline-entry-main">
@@ -96,7 +85,7 @@ function TimelineEntry({ session, projectName, onClick }: TimelineEntryProps) {
           </span>
         </div>
         <div className="timeline-entry-summary">
-          {session.summary ?? "No summary yet"}
+          {sessionDisplayName(session.title, session.summary)}
         </div>
       </div>
     </button>

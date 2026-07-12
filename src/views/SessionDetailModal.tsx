@@ -1,10 +1,50 @@
+import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Button } from "../components/ui/Button";
 import { Modal } from "../components/ui/Modal";
 import { Pill } from "../components/ui/Pill";
 import { StatTile } from "../components/ui/StatTile";
+import { sessionDisplayName } from "../lib/format";
 import { getSessionDetail, openInEditor } from "../lib/tauri";
+import type { FileChanged } from "../lib/types";
+import { DiffModal } from "./DiffModal";
 import "./SessionDetailModal.css";
+
+interface GroupedFileChange {
+  file_path: string;
+  lines_added: number;
+  lines_removed: number;
+  edit_count: number;
+}
+
+/** Collapses one row per tool-call edit into one row per file — a file touched by several
+ * edits in the same session (a common pattern: write, then a couple of follow-up edits)
+ * otherwise shows up as several identical-looking rows. Lines are summed across every edit;
+ * "View diff" then shows the cumulative before/after span (see `DiffModal`). Order is
+ * first-touched-first, matching `files_changed`'s existing `occurred_at ASC` ordering. */
+function groupFilesChanged(files: FileChanged[]): GroupedFileChange[] {
+  const order: string[] = [];
+  const byPath = new Map<string, GroupedFileChange>();
+
+  for (const file of files) {
+    const existing = byPath.get(file.file_path);
+    if (existing) {
+      existing.lines_added += file.lines_added;
+      existing.lines_removed += file.lines_removed;
+      existing.edit_count += 1;
+    } else {
+      byPath.set(file.file_path, {
+        file_path: file.file_path,
+        lines_added: file.lines_added,
+        lines_removed: file.lines_removed,
+        edit_count: 1,
+      });
+      order.push(file.file_path);
+    }
+  }
+
+  return order.map((path) => byPath.get(path)!);
+}
 
 interface SessionDetailModalProps {
   sessionId: string | null;
@@ -43,8 +83,12 @@ export function SessionDetailModal({ sessionId, onClose }: SessionDetailModalPro
     return null;
   }
 
+  const title = data
+    ? sessionDisplayName(data.session.title, data.session.summary)
+    : "Session detail";
+
   return (
-    <Modal isOpen={sessionId !== null} onClose={onClose} title="Session detail">
+    <Modal isOpen={sessionId !== null} onClose={onClose} title={title}>
       {isLoading && <p className="session-detail-status">Loading session…</p>}
       {isError && (
         <p className="session-detail-status">Couldn't load this session.</p>
@@ -66,6 +110,9 @@ function SessionDetailContent({
 }) {
   const { session, files_changed } = detail;
   const tags = parseTags(session.tags);
+  const groupedFiles = groupFilesChanged(files_changed);
+  const [diffPath, setDiffPath] = useState<string | null>(null);
+  const sessionLabel = `${session.model ?? session.agent} · ${session.id.slice(0, 8)}`;
 
   const durationDisplay =
     session.status === "ended" && session.duration_seconds !== null
@@ -108,32 +155,49 @@ function SessionDetailContent({
 
       <div className="session-detail-files">
         <h3 className="session-detail-files-title">
-          Files changed ({files_changed.length})
+          Files changed ({groupedFiles.length})
         </h3>
-        {files_changed.length === 0 ? (
+        {groupedFiles.length === 0 ? (
           <p className="session-detail-status">No file changes recorded.</p>
         ) : (
           <ul className="session-detail-file-list">
-            {files_changed.map((file) => (
-              <li key={file.id} className="session-detail-file-row">
+            {groupedFiles.map((file) => (
+              <li key={file.file_path} className="session-detail-file-row">
                 <div className="session-detail-file-info">
                   <span className="session-detail-file-path">{file.file_path}</span>
                   <span className="session-detail-file-meta">
-                    {file.change_type} · +{file.lines_added} / -{file.lines_removed}
+                    {file.edit_count > 1 ? `${file.edit_count} edits` : "1 edit"} · +
+                    {file.lines_added} / -{file.lines_removed}
                   </span>
                 </div>
-                <Button
-                  variant="secondary"
-                  className="session-detail-file-open"
-                  onClick={() => handleOpenInEditor(file.file_path)}
-                >
-                  Open
-                </Button>
+                <div className="session-detail-file-actions">
+                  <Button
+                    variant="secondary"
+                    className="session-detail-file-open"
+                    onClick={() => setDiffPath(file.file_path)}
+                  >
+                    View diff
+                  </Button>
+                  <Button
+                    variant="secondary"
+                    className="session-detail-file-open"
+                    onClick={() => handleOpenInEditor(file.file_path)}
+                  >
+                    Open
+                  </Button>
+                </div>
               </li>
             ))}
           </ul>
         )}
       </div>
+
+      <DiffModal
+        sessionId={session.id}
+        sessionLabel={sessionLabel}
+        filePath={diffPath}
+        onClose={() => setDiffPath(null)}
+      />
     </div>
   );
 }

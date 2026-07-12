@@ -1,16 +1,20 @@
 import "./Sidebar.css";
 
 export type View =
+  | "dashboard"
   | "projects"
   | "sessions"
   | "timeline"
+  | "report"
   | "connections"
   | "agent-manager";
 
 const NAV_ITEMS: { id: View; label: string; icon: string; disabled?: boolean }[] = [
+  { id: "dashboard", label: "Dashboard", icon: "▦" },
   { id: "projects", label: "Projects", icon: "⊞" },
   { id: "sessions", label: "Sessions", icon: "◷" },
   { id: "timeline", label: "Timeline", icon: "⋮" },
+  { id: "report", label: "Reports", icon: "▥" },
   { id: "connections", label: "Connections", icon: "⟳", disabled: true },
   { id: "agent-manager", label: "Agent Manager", icon: "▶", disabled: true },
 ];

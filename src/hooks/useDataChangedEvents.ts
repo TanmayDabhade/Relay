@@ -16,6 +16,10 @@ export function useDataChangedEvents() {
     const unlisten = listen("data-changed", () => {
       queryClient.invalidateQueries({ queryKey: ["projects"] });
       queryClient.invalidateQueries({ queryKey: ["sessions"] });
+      queryClient.invalidateQueries({ queryKey: ["dashboard"] });
+      // Prefix match: invalidates every ["board", projectId] entry, so an open board picks
+      // up auto-created cards and auto-sync column moves as sessions start/end.
+      queryClient.invalidateQueries({ queryKey: ["board"] });
       // Prefix match: invalidates every ["session-detail", id] entry regardless of which
       // session it's for, so an open SessionDetailModal picks up a just-finished summary,
       // tags, or finalized cost without the user having to close and reopen it.

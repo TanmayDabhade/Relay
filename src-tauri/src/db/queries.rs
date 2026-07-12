@@ -1,5 +1,7 @@
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::Serialize;
+use std::collections::HashMap;
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ProjectSummary {
@@ -26,6 +28,10 @@ pub struct Session {
     pub status: String,
     pub duration_seconds: Option<i64>,
     pub summary: Option<String>,
+    /// Claude Code's own auto-generated session title (from the raw log's "ai-title"
+    /// record) — nullable until Claude has generated one, and always `None` for sessions
+    /// ingested before this column existed. See `update_session_title`.
+    pub title: Option<String>,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
     pub cache_read_tokens: i64,
@@ -62,6 +68,17 @@ pub struct IngestState {
     pub partial_line: String,
 }
 
+/// Per-agent rollup for the Dashboard's "by agent" breakdown. Only agents actually present
+/// in `sessions` show up here — the frontend merges this against a fixed known-agent list
+/// (claude/codex/gemini/cursor) and renders "coming soon" for whichever ones this query
+/// didn't return, since ingestion only exists for Claude Code today.
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentUsage {
+    pub agent: String,
+    pub session_count: i64,
+    pub total_cost_usd: f64,
+}
+
 /// For recomputing cost_usd against the current pricing table without re-parsing logs.
 pub struct SessionTokenTotals {
     pub id: String,
@@ -93,12 +110,13 @@ fn row_to_session(row: &Row) -> rusqlite::Result<Session> {
         lines_removed: row.get(16)?,
         tags: row.get(17)?,
         raw_log_path: row.get(18)?,
+        title: row.get(19)?,
     })
 }
 
 const SESSION_COLUMNS: &str = "id, project_id, agent, model, started_at, ended_at, last_activity_at, status,
      duration_seconds, summary, prompt_tokens, completion_tokens, cache_read_tokens,
-     cache_creation_tokens, cost_usd, lines_added, lines_removed, tags, raw_log_path";
+     cache_creation_tokens, cost_usd, lines_added, lines_removed, tags, raw_log_path, title";
 
 // --- Ingest (parser/watcher) side ---
 
@@ -180,11 +198,22 @@ pub fn insert_file_changed(
     lines_added: i64,
     lines_removed: i64,
     occurred_at: i64,
+    old_content: Option<&str>,
+    new_content: Option<&str>,
 ) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO files_changed (session_id, file_path, change_type, lines_added, lines_removed, occurred_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![session_id, file_path, change_type, lines_added, lines_removed, occurred_at],
+        "INSERT INTO files_changed (session_id, file_path, change_type, lines_added, lines_removed, occurred_at, old_content, new_content)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            session_id,
+            file_path,
+            change_type,
+            lines_added,
+            lines_removed,
+            occurred_at,
+            old_content,
+            new_content,
+        ],
     )?;
     conn.execute(
         "UPDATE sessions SET lines_added = lines_added + ?2, lines_removed = lines_removed + ?3 WHERE id = ?1",
@@ -236,6 +265,10 @@ pub fn set_ingest_state(
 // --- Read side (frontend commands) ---
 
 pub fn list_projects(conn: &Connection) -> rusqlite::Result<Vec<ProjectSummary>> {
+    // A project row can exist for a directory Relay noticed but that never actually ran a
+    // session (e.g. a bare `.claude` dir with no activity yet) — HAVING excludes those, since
+    // a directory with 0 sessions and $0 spent isn't something the user should see listed as
+    // a project anywhere in the app.
     let mut stmt = conn.prepare(
         "SELECT p.id, p.name, p.path, p.lang, p.stack, p.created_at, p.last_active,
                 COUNT(s.id) as session_count,
@@ -243,6 +276,7 @@ pub fn list_projects(conn: &Connection) -> rusqlite::Result<Vec<ProjectSummary>>
          FROM projects p
          LEFT JOIN sessions s ON s.project_id = p.id
          GROUP BY p.id
+         HAVING COUNT(s.id) > 0
          ORDER BY p.last_active DESC",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -302,6 +336,48 @@ pub fn get_session_detail(
     Ok(Some((session, files)))
 }
 
+/// Before/after text spanning every `files_changed` row for one file within one session,
+/// folded into a single before→after pair: `old_content` from the earliest edit,
+/// `new_content` from the most recent. Backs the "view diff" command's per-file (not
+/// per-edit) view — a file touched by several tool calls in one session shows one cumulative
+/// diff of everything that session did to it, rather than one diff per tool call.
+pub struct FileDiffSpan {
+    pub old_content: Option<String>,
+    pub new_content: Option<String>,
+    /// When the most recent edit in this span occurred — shown in the diff view so a
+    /// multi-edit file's diff is still attributable to a point in time.
+    pub latest_occurred_at: i64,
+    pub edit_count: i64,
+}
+
+pub fn file_diff_span(
+    conn: &Connection,
+    session_id: &str,
+    file_path: &str,
+) -> rusqlite::Result<Option<FileDiffSpan>> {
+    let mut stmt = conn.prepare(
+        "SELECT old_content, new_content, occurred_at FROM files_changed
+         WHERE session_id = ?1 AND file_path = ?2 ORDER BY occurred_at ASC",
+    )?;
+    let rows: Vec<(Option<String>, Option<String>, i64)> = stmt
+        .query_map(params![session_id, file_path], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+
+    let Some(first) = rows.first() else {
+        return Ok(None);
+    };
+    let last = rows.last().expect("non-empty per the check above");
+
+    Ok(Some(FileDiffSpan {
+        old_content: first.0.clone(),
+        new_content: last.1.clone(),
+        latest_occurred_at: last.2,
+        edit_count: rows.len() as i64,
+    }))
+}
+
 // --- Idle-session sweep / summarization / tagging (Phase 2) ---
 
 pub fn sessions_to_finalize(
@@ -341,6 +417,28 @@ pub fn update_summary(conn: &Connection, session_id: &str, summary: &str) -> rus
     conn.execute(
         "UPDATE sessions SET summary = ?2 WHERE id = ?1",
         params![session_id, summary],
+    )?;
+    Ok(())
+}
+
+/// Sets `title` from a session's "ai-title" record. Also renames that session's linked
+/// board card away from its "New session" placeholder (see `auto_create_card_for_session`)
+/// if it's still sitting on that placeholder — this arrives well before the idle-sweep's
+/// tag/summary passes would otherwise be the first thing to give the card a real name, and
+/// a no-op `UPDATE ... WHERE title = 'New session'` is harmless if the user already renamed
+/// it themselves.
+pub fn update_session_title(
+    conn: &Connection,
+    session_id: &str,
+    title: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE sessions SET title = ?2 WHERE id = ?1",
+        params![session_id, title],
+    )?;
+    conn.execute(
+        "UPDATE cards SET title = ?2, updated_at = ?3 WHERE session_id = ?1 AND title = 'New session'",
+        params![session_id, title, chrono::Utc::now().timestamp()],
     )?;
     Ok(())
 }
@@ -426,4 +524,1024 @@ pub fn all_session_token_totals(conn: &Connection) -> rusqlite::Result<Vec<Sessi
         })
     })?;
     rows.collect()
+}
+
+// --- Dashboard (spend + activity summary) ---
+
+/// Cost and session-count totals grouped by `agent`. Every row currently ingested has
+/// `agent = 'claude'` (see `upsert_session`'s hardcoded literal), but the column and this
+/// query are already agent-generic so wiring up Codex/Gemini/Cursor ingestion later is just
+/// a new writer, not a schema or query change.
+pub fn agent_usage(conn: &Connection) -> rusqlite::Result<Vec<AgentUsage>> {
+    let mut stmt = conn.prepare(
+        "SELECT agent, COUNT(*) as session_count, COALESCE(SUM(cost_usd), 0.0) as total_cost_usd
+         FROM sessions
+         GROUP BY agent
+         ORDER BY total_cost_usd DESC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(AgentUsage {
+            agent: row.get(0)?,
+            session_count: row.get(1)?,
+            total_cost_usd: row.get(2)?,
+        })
+    })?;
+    rows.collect()
+}
+
+// --- Spend report (Reports view) ---
+//
+// All three queries below window on `last_activity_at` rather than `started_at`: every
+// session row has a non-null `last_activity_at` (see `Session`'s field docs), while
+// `started_at` is nullable, so windowing on it would silently drop sessions that never got a
+// `started_at` recorded. "Report window" therefore means "sessions with activity in this
+// window," not "sessions started in this window."
+
+/// Headline totals for the report window: overall spend, session count, and raw token
+/// totals across every ingested agent. `avg_cost_per_session` is left for the caller to
+/// derive (`total_cost_usd / session_count`) rather than computed here, since the caller
+/// already has to guard the zero-session case for display anyway.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ReportTotals {
+    pub total_cost_usd: f64,
+    pub session_count: i64,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_creation_tokens: i64,
+}
+
+pub fn report_totals(conn: &Connection, since_epoch: i64) -> rusqlite::Result<ReportTotals> {
+    conn.query_row(
+        "SELECT COALESCE(SUM(cost_usd), 0.0), COUNT(*),
+                COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0),
+                COALESCE(SUM(cache_read_tokens), 0), COALESCE(SUM(cache_creation_tokens), 0)
+         FROM sessions
+         WHERE last_activity_at >= ?1",
+        params![since_epoch],
+        |row| {
+            Ok(ReportTotals {
+                total_cost_usd: row.get(0)?,
+                session_count: row.get(1)?,
+                prompt_tokens: row.get(2)?,
+                completion_tokens: row.get(3)?,
+                cache_read_tokens: row.get(4)?,
+                cache_creation_tokens: row.get(5)?,
+            })
+        },
+    )
+}
+
+/// One row per project with any activity in the window, highest spend first — the report's
+/// "where did the money go" breakdown. Unlike `list_projects`, this only returns projects
+/// with at least one session inside the window (inner join), since a project untouched in
+/// the reporting period isn't part of the report.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReportProjectRow {
+    pub project_id: String,
+    pub project_name: String,
+    pub session_count: i64,
+    pub total_cost_usd: f64,
+}
+
+pub fn report_by_project(
+    conn: &Connection,
+    since_epoch: i64,
+) -> rusqlite::Result<Vec<ReportProjectRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT p.id, p.name, COUNT(s.id), COALESCE(SUM(s.cost_usd), 0.0)
+         FROM sessions s JOIN projects p ON p.id = s.project_id
+         WHERE s.last_activity_at >= ?1
+         GROUP BY p.id
+         ORDER BY 4 DESC",
+    )?;
+    let rows = stmt.query_map(params![since_epoch], |row| {
+        Ok(ReportProjectRow {
+            project_id: row.get(0)?,
+            project_name: row.get(1)?,
+            session_count: row.get(2)?,
+            total_cost_usd: row.get(3)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// Same shape as `agent_usage` but windowed to the report period — kept as a separate query
+/// rather than adding a `since` parameter to `agent_usage` itself, since the Dashboard's
+/// all-time call site has no window to pass.
+pub fn agent_usage_since(conn: &Connection, since_epoch: i64) -> rusqlite::Result<Vec<AgentUsage>> {
+    let mut stmt = conn.prepare(
+        "SELECT agent, COUNT(*) as session_count, COALESCE(SUM(cost_usd), 0.0) as total_cost_usd
+         FROM sessions
+         WHERE last_activity_at >= ?1
+         GROUP BY agent
+         ORDER BY total_cost_usd DESC",
+    )?;
+    let rows = stmt.query_map(params![since_epoch], |row| {
+        Ok(AgentUsage {
+            agent: row.get(0)?,
+            session_count: row.get(1)?,
+            total_cost_usd: row.get(2)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// Spend broken down by tag, highest spend first. `tags` is stored as a JSON array string
+/// (see `tags::classify`); a session tagged with more than one tag contributes its full cost
+/// to each of its tags, so per-tag totals across the whole table can sum to more than
+/// `report_totals`'s grand total — that's expected for a multi-label breakdown, not a bug.
+/// Unpacked in Rust rather than via SQLite's `json_each` so a malformed `tags` cell (there
+/// shouldn't be one, but nothing enforces it at the schema level) is skipped instead of
+/// failing the whole query.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReportTagRow {
+    pub tag: String,
+    pub session_count: i64,
+    pub total_cost_usd: f64,
+}
+
+pub fn report_by_tag(conn: &Connection, since_epoch: i64) -> rusqlite::Result<Vec<ReportTagRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT tags, cost_usd FROM sessions WHERE last_activity_at >= ?1 AND tags IS NOT NULL",
+    )?;
+    let rows = stmt.query_map(params![since_epoch], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+    })?;
+
+    let mut by_tag: HashMap<String, (i64, f64)> = HashMap::new();
+    for row in rows {
+        let (tags_json, cost_usd) = row?;
+        let Ok(tags) = serde_json::from_str::<Vec<String>>(&tags_json) else {
+            continue;
+        };
+        for tag in tags {
+            let entry = by_tag.entry(tag).or_insert((0, 0.0));
+            entry.0 += 1;
+            entry.1 += cost_usd;
+        }
+    }
+
+    let mut out: Vec<ReportTagRow> = by_tag
+        .into_iter()
+        .map(|(tag, (session_count, total_cost_usd))| ReportTagRow {
+            tag,
+            session_count,
+            total_cost_usd,
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        b.total_cost_usd
+            .partial_cmp(&a.total_cost_usd)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Ok(out)
+}
+
+/// The Dashboard's "active now" widget: which project + session (if any) is currently
+/// `status = 'active'`, most-recently-active first when several sessions are active at
+/// once (e.g. Claude Code running in more than one repo simultaneously).
+#[derive(Debug, Clone, Serialize)]
+pub struct ActiveSessionSummary {
+    pub session_id: String,
+    /// Falls back to `summary`, then to a fixed placeholder, on the frontend — this stays
+    /// the raw nullable column so the frontend's fallback chain is in one place.
+    pub session_title: Option<String>,
+    pub session_summary: Option<String>,
+    pub project_id: String,
+    pub project_name: String,
+}
+
+pub fn most_recent_active_session(
+    conn: &Connection,
+) -> rusqlite::Result<Option<ActiveSessionSummary>> {
+    conn.query_row(
+        "SELECT s.id, s.title, s.summary, s.project_id, p.name
+         FROM sessions s
+         JOIN projects p ON p.id = s.project_id
+         WHERE s.status = 'active'
+         ORDER BY s.last_activity_at DESC
+         LIMIT 1",
+        [],
+        |row| {
+            Ok(ActiveSessionSummary {
+                session_id: row.get(0)?,
+                session_title: row.get(1)?,
+                session_summary: row.get(2)?,
+                project_id: row.get(3)?,
+                project_name: row.get(4)?,
+            })
+        },
+    )
+    .optional()
+}
+
+/// Project-scoped variant of `most_recent_active_session`, returning just the session id —
+/// used by `commands::launch_or_attach_session` to decide whether to resume an existing
+/// session for a project or start a fresh one.
+pub fn most_recent_active_session_id_for_project(
+    conn: &Connection,
+    project_id: &str,
+) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT id FROM sessions WHERE project_id = ?1 AND status = 'active'
+         ORDER BY last_activity_at DESC LIMIT 1",
+        params![project_id],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+/// Daily activity counts since `since_epoch` (unix seconds), keyed by `YYYY-MM-DD` (local
+/// SQLite `date()` output, which is UTC since these timestamps are UTC). A day's count is
+/// "sessions started that day" plus "file edits made that day" — two different event kinds
+/// summed together, since either is evidence of a day worked on, matching what a GitHub
+/// commit-style heatmap is meant to convey. Returned as a sparse map (only days with any
+/// activity) — the caller fills in zero-activity days when building a fixed-length window,
+/// since walking 365 dense days here would mean serializing hundreds of zero rows out of SQL
+/// for no reason.
+pub fn daily_activity_counts(
+    conn: &Connection,
+    since_epoch: i64,
+) -> rusqlite::Result<HashMap<String, i64>> {
+    let mut stmt = conn.prepare(
+        "SELECT d, SUM(c) FROM (
+            SELECT date(started_at, 'unixepoch') AS d, COUNT(*) AS c
+            FROM sessions
+            WHERE started_at IS NOT NULL AND started_at >= ?1
+            GROUP BY d
+            UNION ALL
+            SELECT date(occurred_at, 'unixepoch') AS d, COUNT(*) AS c
+            FROM files_changed
+            WHERE occurred_at >= ?1
+            GROUP BY d
+         )
+         GROUP BY d",
+    )?;
+    let rows = stmt.query_map(params![since_epoch], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    rows.collect()
+}
+
+// --- Kanban board ---
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Board {
+    pub id: String,
+    pub project_id: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Column {
+    pub id: String,
+    pub board_id: String,
+    pub name: String,
+    pub role: Option<String>,
+    pub position: i64,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Card {
+    pub id: String,
+    pub board_id: String,
+    pub column_id: String,
+    pub session_id: Option<String>,
+    pub title: String,
+    pub description: Option<String>,
+    pub position: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// The four columns every new board is seeded with, in display order. Roles are fixed at
+/// creation time and never reassigned in v1 — auto-sync (`sync_card_for_session`) depends on
+/// exactly one column per board carrying each role.
+const SEEDED_COLUMNS: [(&str, &str); 4] = [
+    ("Todo", "todo"),
+    ("In Progress", "in_progress"),
+    ("Review", "review"),
+    ("Done", "done"),
+];
+
+/// Returns the board id for `project_id`, creating the board and its four role-tagged
+/// columns if this is the first time this project has been seen. Idempotent and safe to call
+/// on every project touch — relies on the caller already holding the single shared DB lock
+/// (see `db::Db`), so the existence check and insert below can't race with another writer.
+pub fn ensure_board_for_project(conn: &Connection, project_id: &str) -> rusqlite::Result<String> {
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT id FROM boards WHERE project_id = ?1",
+            params![project_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(board_id) = existing {
+        return Ok(board_id);
+    }
+
+    let board_id = Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().timestamp();
+    conn.execute(
+        "INSERT INTO boards (id, project_id, created_at) VALUES (?1, ?2, ?3)",
+        params![board_id, project_id, now],
+    )?;
+
+    for (position, (name, role)) in SEEDED_COLUMNS.iter().enumerate() {
+        conn.execute(
+            "INSERT INTO columns (id, board_id, name, role, position, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![Uuid::new_v4().to_string(), board_id, name, role, position as i64, now],
+        )?;
+    }
+
+    Ok(board_id)
+}
+
+/// Full board state for the board view: the board row, its columns in display order, and
+/// every card on it. Calls `ensure_board_for_project` first so a project with sessions but no
+/// prior board access still renders a real (empty) board rather than the frontend having to
+/// handle a "no board yet" state.
+pub fn get_board(
+    conn: &Connection,
+    project_id: &str,
+) -> rusqlite::Result<(Board, Vec<Column>, Vec<Card>)> {
+    let board_id = ensure_board_for_project(conn, project_id)?;
+
+    let board = conn.query_row(
+        "SELECT id, project_id, created_at FROM boards WHERE id = ?1",
+        params![board_id],
+        |row| {
+            Ok(Board {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                created_at: row.get(2)?,
+            })
+        },
+    )?;
+
+    let mut col_stmt = conn.prepare(
+        "SELECT id, board_id, name, role, position, created_at FROM columns
+         WHERE board_id = ?1 ORDER BY position ASC",
+    )?;
+    let columns = col_stmt
+        .query_map(params![board_id], |row| {
+            Ok(Column {
+                id: row.get(0)?,
+                board_id: row.get(1)?,
+                name: row.get(2)?,
+                role: row.get(3)?,
+                position: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut card_stmt = conn.prepare(
+        "SELECT id, board_id, column_id, session_id, title, description, position, created_at, updated_at
+         FROM cards WHERE board_id = ?1 ORDER BY position ASC",
+    )?;
+    let cards = card_stmt
+        .query_map(params![board_id], |row| {
+            Ok(Card {
+                id: row.get(0)?,
+                board_id: row.get(1)?,
+                column_id: row.get(2)?,
+                session_id: row.get(3)?,
+                title: row.get(4)?,
+                description: row.get(5)?,
+                position: row.get(6)?,
+                created_at: row.get(7)?,
+                updated_at: row.get(8)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    Ok((board, columns, cards))
+}
+
+fn next_position_in_column(conn: &Connection, column_id: &str) -> rusqlite::Result<i64> {
+    conn.query_row(
+        "SELECT COALESCE(MAX(position), -1) + 1 FROM cards WHERE column_id = ?1",
+        params![column_id],
+        |row| row.get(0),
+    )
+}
+
+/// Manual card creation — used both for the "+ Add card" affordance on unlinked columns and,
+/// with `session_id = None`, for pre-session planning cards a user later attaches to a real
+/// session via `link_session_to_card`.
+pub fn create_card(
+    conn: &Connection,
+    board_id: &str,
+    column_id: &str,
+    title: &str,
+    description: Option<&str>,
+) -> rusqlite::Result<Card> {
+    let id = Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().timestamp();
+    let position = next_position_in_column(conn, column_id)?;
+
+    conn.execute(
+        "INSERT INTO cards (id, board_id, column_id, session_id, title, description, position, created_at, updated_at)
+         VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?7)",
+        params![id, board_id, column_id, title, description, position, now],
+    )?;
+
+    Ok(Card {
+        id,
+        board_id: board_id.to_string(),
+        column_id: column_id.to_string(),
+        session_id: None,
+        title: title.to_string(),
+        description: description.map(str::to_string),
+        position,
+        created_at: now,
+        updated_at: now,
+    })
+}
+
+/// A card whose `session_id` matches an ingested session, created the moment that session
+/// starts (see `session_builder::ingest_record`). No-ops if a card is already linked to this
+/// session (replay-safe, same spirit as `upsert_session`'s idempotent accumulation) or if the
+/// board's `in_progress` column can't be found (shouldn't happen in v1 — role columns aren't
+/// deletable — but degrading silently beats panicking the ingest path over a UI-layer row).
+pub fn auto_create_card_for_session(
+    conn: &Connection,
+    board_id: &str,
+    session_id: &str,
+    title: &str,
+) -> rusqlite::Result<()> {
+    let already_linked: bool = conn
+        .query_row(
+            "SELECT 1 FROM cards WHERE session_id = ?1",
+            params![session_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if already_linked {
+        return Ok(());
+    }
+
+    let column_id: Option<String> = conn
+        .query_row(
+            "SELECT id FROM columns WHERE board_id = ?1 AND role = 'in_progress'",
+            params![board_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(column_id) = column_id else {
+        return Ok(());
+    };
+
+    let id = Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().timestamp();
+    let position = next_position_in_column(conn, &column_id)?;
+
+    conn.execute(
+        "INSERT INTO cards (id, board_id, column_id, session_id, title, description, position, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?7)",
+        params![id, board_id, column_id, session_id, title, position, now],
+    )?;
+
+    Ok(())
+}
+
+/// Moves whichever card is linked to `session_id` to its board's column with the given
+/// `role`, appending it to the end of that column. Called on every session status
+/// transition (start → 'in_progress', idle-sweep finalize → 'review') — always wins over
+/// wherever the user last dragged the card, per the design's "auto-sync always wins on
+/// transition" rule. No-ops if no card is linked to this session, or if the target role
+/// column doesn't exist on the card's board.
+pub fn sync_card_for_session(conn: &Connection, session_id: &str, role: &str) -> rusqlite::Result<()> {
+    let linked: Option<(String, String)> = conn
+        .query_row(
+            "SELECT id, board_id FROM cards WHERE session_id = ?1",
+            params![session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((card_id, board_id)) = linked else {
+        return Ok(());
+    };
+
+    let column_id: Option<String> = conn
+        .query_row(
+            "SELECT id FROM columns WHERE board_id = ?1 AND role = ?2",
+            params![board_id, role],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(column_id) = column_id else {
+        return Ok(());
+    };
+
+    let now = chrono::Utc::now().timestamp();
+    let position = next_position_in_column(conn, &column_id)?;
+    conn.execute(
+        "UPDATE cards SET column_id = ?2, position = ?3, updated_at = ?4 WHERE id = ?1",
+        params![card_id, column_id, position, now],
+    )?;
+
+    Ok(())
+}
+
+pub fn move_card(conn: &Connection, card_id: &str, column_id: &str, position: i64) -> rusqlite::Result<()> {
+    let now = chrono::Utc::now().timestamp();
+    conn.execute(
+        "UPDATE cards SET column_id = ?2, position = ?3, updated_at = ?4 WHERE id = ?1",
+        params![card_id, column_id, position, now],
+    )?;
+    Ok(())
+}
+
+/// Everything `commands::launch_or_attach_session` needs about one card in a single query:
+/// its own title/description/session_id, its column's role (to check it landed on the
+/// seeded "in_progress" column), and its project's id + filesystem path (to know where to
+/// launch/attach a terminal session).
+#[derive(Debug, Clone)]
+pub struct CardLaunchContext {
+    pub title: String,
+    pub description: Option<String>,
+    pub session_id: Option<String>,
+    pub column_role: Option<String>,
+    pub project_id: String,
+    pub project_path: String,
+}
+
+pub fn card_launch_context(
+    conn: &Connection,
+    card_id: &str,
+) -> rusqlite::Result<Option<CardLaunchContext>> {
+    conn.query_row(
+        "SELECT c.title, c.description, c.session_id, col.role, p.id, p.path
+         FROM cards c
+         JOIN columns col ON col.id = c.column_id
+         JOIN boards b ON b.id = c.board_id
+         JOIN projects p ON p.id = b.project_id
+         WHERE c.id = ?1",
+        params![card_id],
+        |row| {
+            Ok(CardLaunchContext {
+                title: row.get(0)?,
+                description: row.get(1)?,
+                session_id: row.get(2)?,
+                column_role: row.get(3)?,
+                project_id: row.get(4)?,
+                project_path: row.get(5)?,
+            })
+        },
+    )
+    .optional()
+}
+
+pub fn update_card(
+    conn: &Connection,
+    card_id: &str,
+    title: &str,
+    description: Option<&str>,
+) -> rusqlite::Result<()> {
+    let now = chrono::Utc::now().timestamp();
+    conn.execute(
+        "UPDATE cards SET title = ?2, description = ?3, updated_at = ?4 WHERE id = ?1",
+        params![card_id, title, description, now],
+    )?;
+    Ok(())
+}
+
+pub fn delete_card(conn: &Connection, card_id: &str) -> rusqlite::Result<()> {
+    conn.execute("DELETE FROM cards WHERE id = ?1", params![card_id])?;
+    Ok(())
+}
+
+/// Attaches an existing session to a manually-created planning card — the escape hatch from
+/// the design's "user can link a pre-existing Todo card instead of getting a duplicate
+/// auto-created one" rule. If `session_id` already backs a different (auto-created) card,
+/// that duplicate is deleted first, since `cards.session_id` is UNIQUE. Immediately syncs the
+/// card to whichever column matches the session's *current* status, so linking a card to an
+/// already-active or already-ended session doesn't leave it stranded wherever it was created.
+pub fn link_session_to_card(conn: &Connection, card_id: &str, session_id: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "DELETE FROM cards WHERE session_id = ?1 AND id != ?2",
+        params![session_id, card_id],
+    )?;
+
+    let now = chrono::Utc::now().timestamp();
+    conn.execute(
+        "UPDATE cards SET session_id = ?2, updated_at = ?3 WHERE id = ?1",
+        params![card_id, session_id, now],
+    )?;
+
+    let status: Option<String> = conn
+        .query_row(
+            "SELECT status FROM sessions WHERE id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let role = match status.as_deref() {
+        Some("ended") => "review",
+        _ => "in_progress",
+    };
+    sync_card_for_session(conn, session_id, role)
+}
+
+pub fn create_column(conn: &Connection, board_id: &str, name: &str) -> rusqlite::Result<Column> {
+    let id = Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().timestamp();
+    let position: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(position), -1) + 1 FROM columns WHERE board_id = ?1",
+        params![board_id],
+        |row| row.get(0),
+    )?;
+
+    conn.execute(
+        "INSERT INTO columns (id, board_id, name, role, position, created_at)
+         VALUES (?1, ?2, ?3, NULL, ?4, ?5)",
+        params![id, board_id, name, position, now],
+    )?;
+
+    Ok(Column {
+        id,
+        board_id: board_id.to_string(),
+        name: name.to_string(),
+        role: None,
+        position,
+        created_at: now,
+    })
+}
+
+pub fn rename_column(conn: &Connection, column_id: &str, name: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE columns SET name = ?2 WHERE id = ?1",
+        params![column_id, name],
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod file_diff_span_tests {
+    use super::*;
+
+    fn in_memory_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!("../../migrations/0001_init.sql")).unwrap();
+        conn.execute_batch(include_str!("../../migrations/0002_file_diff_content.sql")).unwrap();
+        conn.execute_batch(include_str!("../../migrations/0003_kanban.sql")).unwrap();
+        conn.execute_batch(include_str!("../../migrations/0004_session_title.sql")).unwrap();
+        conn
+    }
+
+    fn seed_session(conn: &Connection, session_id: &str) {
+        upsert_project(conn, "p1", "fixture", "/fixture", 1000).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, project_id, agent, started_at, last_activity_at, status, raw_log_path)
+             VALUES (?1, 'p1', 'claude', 1000, 1000, 'active', '')",
+            params![session_id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn folds_multiple_edits_to_the_same_file_into_one_before_after_span() {
+        let conn = in_memory_db();
+        seed_session(&conn, "s1");
+
+        insert_file_changed(&conn, "s1", "src/main.rs", "write", 3, 0, 100, None, Some("fn main() {}")).unwrap();
+        insert_file_changed(&conn, "s1", "src/main.rs", "edit", 1, 0, 200, Some("fn main() {}"), Some("fn main() { a(); }")).unwrap();
+        insert_file_changed(&conn, "s1", "src/main.rs", "edit", 1, 0, 300, Some("fn main() { a(); }"), Some("fn main() { a(); b(); }")).unwrap();
+
+        let span = file_diff_span(&conn, "s1", "src/main.rs").unwrap().unwrap();
+
+        assert_eq!(span.old_content.as_deref(), None, "before-text is from the earliest edit (a Write, so None)");
+        assert_eq!(span.new_content.as_deref(), Some("fn main() { a(); b(); }"), "after-text is from the most recent edit");
+        assert_eq!(span.latest_occurred_at, 300);
+        assert_eq!(span.edit_count, 3);
+    }
+
+    #[test]
+    fn returns_none_when_the_session_never_touched_that_file() {
+        let conn = in_memory_db();
+        seed_session(&conn, "s1");
+        insert_file_changed(&conn, "s1", "src/main.rs", "write", 1, 0, 100, None, Some("x")).unwrap();
+
+        assert!(file_diff_span(&conn, "s1", "src/other.rs").unwrap().is_none());
+    }
+
+    #[test]
+    fn does_not_mix_edits_from_a_different_session_to_the_same_path() {
+        let conn = in_memory_db();
+        seed_session(&conn, "s1");
+        seed_session(&conn, "s2");
+        insert_file_changed(&conn, "s1", "src/main.rs", "write", 1, 0, 100, None, Some("from s1")).unwrap();
+        insert_file_changed(&conn, "s2", "src/main.rs", "write", 1, 0, 200, None, Some("from s2")).unwrap();
+
+        let span = file_diff_span(&conn, "s1", "src/main.rs").unwrap().unwrap();
+        assert_eq!(span.new_content.as_deref(), Some("from s1"));
+        assert_eq!(span.edit_count, 1);
+    }
+}
+
+#[cfg(test)]
+mod report_tests {
+    use super::*;
+
+    fn in_memory_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!("../../migrations/0001_init.sql")).unwrap();
+        conn.execute_batch(include_str!("../../migrations/0002_file_diff_content.sql")).unwrap();
+        conn.execute_batch(include_str!("../../migrations/0003_kanban.sql")).unwrap();
+        conn.execute_batch(include_str!("../../migrations/0004_session_title.sql")).unwrap();
+        conn
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn seed_session(
+        conn: &Connection,
+        session_id: &str,
+        project_id: &str,
+        agent: &str,
+        last_activity_at: i64,
+        cost_usd: f64,
+        tags: Option<&str>,
+    ) {
+        conn.execute(
+            "INSERT INTO sessions (id, project_id, agent, started_at, last_activity_at, status, cost_usd, tags, raw_log_path)
+             VALUES (?1, ?2, ?3, ?4, ?4, 'ended', ?5, ?6, '')",
+            params![session_id, project_id, agent, last_activity_at, cost_usd, tags],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn report_totals_sums_only_sessions_inside_the_window() {
+        let conn = in_memory_db();
+        upsert_project(&conn, "p1", "fixture", "/fixture", 1000).unwrap();
+        seed_session(&conn, "s1", "p1", "claude", 2000, 1.50, None);
+        seed_session(&conn, "s2", "p1", "claude", 500, 9.00, None); // before the window
+
+        let totals = report_totals(&conn, 1000).unwrap();
+        assert_eq!(totals.session_count, 1);
+        assert_eq!(totals.total_cost_usd, 1.50);
+    }
+
+    #[test]
+    fn report_by_project_orders_highest_spend_first_and_excludes_untouched_projects() {
+        let conn = in_memory_db();
+        upsert_project(&conn, "p1", "quiet", "/quiet", 1000).unwrap();
+        upsert_project(&conn, "p2", "busy", "/busy", 1000).unwrap();
+        seed_session(&conn, "s1", "p2", "claude", 2000, 5.0, None);
+        seed_session(&conn, "s2", "p2", "claude", 2100, 5.0, None);
+        // p1 has no sessions at all inside (or outside) the window.
+
+        let rows = report_by_project(&conn, 1000).unwrap();
+        assert_eq!(rows.len(), 1, "a project with zero sessions in the window must not appear");
+        assert_eq!(rows[0].project_name, "busy");
+        assert_eq!(rows[0].session_count, 2);
+        assert_eq!(rows[0].total_cost_usd, 10.0);
+    }
+
+    #[test]
+    fn report_by_tag_credits_full_cost_to_every_tag_on_a_multi_tagged_session() {
+        let conn = in_memory_db();
+        upsert_project(&conn, "p1", "fixture", "/fixture", 1000).unwrap();
+        seed_session(&conn, "s1", "p1", "claude", 2000, 4.0, Some(r#"["feature","bugfix"]"#));
+        seed_session(&conn, "s2", "p1", "claude", 2000, 2.0, Some(r#"["feature"]"#));
+        seed_session(&conn, "s3", "p1", "claude", 2000, 100.0, None); // untagged, must be skipped
+
+        let rows = report_by_tag(&conn, 1000).unwrap();
+        let feature = rows.iter().find(|r| r.tag == "feature").unwrap();
+        let bugfix = rows.iter().find(|r| r.tag == "bugfix").unwrap();
+        assert_eq!(feature.session_count, 2);
+        assert_eq!(feature.total_cost_usd, 6.0);
+        assert_eq!(bugfix.session_count, 1);
+        assert_eq!(bugfix.total_cost_usd, 4.0);
+    }
+
+    #[test]
+    fn report_by_tag_skips_malformed_json_instead_of_failing_the_whole_query() {
+        let conn = in_memory_db();
+        upsert_project(&conn, "p1", "fixture", "/fixture", 1000).unwrap();
+        seed_session(&conn, "s1", "p1", "claude", 2000, 3.0, Some("not valid json"));
+        seed_session(&conn, "s2", "p1", "claude", 2000, 1.0, Some(r#"["docs"]"#));
+
+        let rows = report_by_tag(&conn, 1000).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tag, "docs");
+    }
+
+    #[test]
+    fn agent_usage_since_only_counts_sessions_inside_the_window() {
+        let conn = in_memory_db();
+        upsert_project(&conn, "p1", "fixture", "/fixture", 1000).unwrap();
+        seed_session(&conn, "s1", "p1", "claude", 2000, 3.0, None);
+        seed_session(&conn, "s2", "p1", "codex", 500, 7.0, None); // before the window
+
+        let rows = agent_usage_since(&conn, 1000).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].agent, "claude");
+        assert_eq!(rows[0].total_cost_usd, 3.0);
+    }
+}
+
+#[cfg(test)]
+mod kanban_tests {
+    use super::*;
+
+    fn in_memory_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!("../../migrations/0001_init.sql")).unwrap();
+        conn.execute_batch(include_str!("../../migrations/0002_file_diff_content.sql")).unwrap();
+        conn.execute_batch(include_str!("../../migrations/0003_kanban.sql")).unwrap();
+        conn.execute_batch(include_str!("../../migrations/0004_session_title.sql")).unwrap();
+        conn
+    }
+
+    fn seed_project_and_session(conn: &Connection, project_id: &str, session_id: &str) {
+        upsert_project(conn, project_id, "fixture", "/fixture", 1000).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, project_id, agent, started_at, last_activity_at, status, raw_log_path)
+             VALUES (?1, ?2, 'claude', 1000, 1000, 'active', '')",
+            params![session_id, project_id],
+        )
+        .unwrap();
+    }
+
+    fn column_role_for_card(conn: &Connection, card_id: &str) -> Option<String> {
+        conn.query_row(
+            "SELECT col.role FROM cards c JOIN columns col ON col.id = c.column_id WHERE c.id = ?1",
+            params![card_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn ensure_board_for_project_is_idempotent_and_seeds_four_role_columns() {
+        let conn = in_memory_db();
+        upsert_project(&conn, "p1", "fixture", "/fixture", 1000).unwrap();
+
+        let board_id_1 = ensure_board_for_project(&conn, "p1").unwrap();
+        let board_id_2 = ensure_board_for_project(&conn, "p1").unwrap();
+        assert_eq!(board_id_1, board_id_2, "second call must not create a second board");
+
+        let column_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM columns WHERE board_id = ?1", params![board_id_1], |r| r.get(0))
+            .unwrap();
+        assert_eq!(column_count, 4);
+
+        let roles: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT role FROM columns WHERE board_id = ?1 ORDER BY position ASC")
+                .unwrap();
+            stmt.query_map(params![board_id_1], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        assert_eq!(roles, vec!["todo", "in_progress", "review", "done"]);
+    }
+
+    #[test]
+    fn sync_card_for_session_moves_linked_card_to_the_target_role_column() {
+        let conn = in_memory_db();
+        seed_project_and_session(&conn, "p1", "s1");
+        let board_id = ensure_board_for_project(&conn, "p1").unwrap();
+        auto_create_card_for_session(&conn, &board_id, "s1", "New session").unwrap();
+
+        let card_id: String = conn.query_row("SELECT id FROM cards", [], |r| r.get(0)).unwrap();
+        assert_eq!(column_role_for_card(&conn, &card_id).as_deref(), Some("in_progress"));
+
+        sync_card_for_session(&conn, "s1", "review").unwrap();
+        assert_eq!(column_role_for_card(&conn, &card_id).as_deref(), Some("review"));
+    }
+
+    #[test]
+    fn sync_card_for_session_is_a_noop_when_no_card_is_linked() {
+        let conn = in_memory_db();
+        seed_project_and_session(&conn, "p1", "s1");
+        ensure_board_for_project(&conn, "p1").unwrap();
+
+        // No card was ever created for "s1" — must not error.
+        sync_card_for_session(&conn, "s1", "review").unwrap();
+
+        let card_count: i64 = conn.query_row("SELECT COUNT(*) FROM cards", [], |r| r.get(0)).unwrap();
+        assert_eq!(card_count, 0);
+    }
+
+    #[test]
+    fn link_session_to_card_replaces_any_prior_auto_created_card_for_that_session() {
+        let conn = in_memory_db();
+        seed_project_and_session(&conn, "p1", "s1");
+        let board_id = ensure_board_for_project(&conn, "p1").unwrap();
+
+        // Simulates the session starting first (auto-creates a card)...
+        auto_create_card_for_session(&conn, &board_id, "s1", "New session").unwrap();
+        let auto_card_id: String = conn.query_row("SELECT id FROM cards", [], |r| r.get(0)).unwrap();
+
+        // ...then the user retroactively linking it to a manual planning card instead.
+        let todo_column_id: String = conn
+            .query_row("SELECT id FROM columns WHERE board_id = ?1 AND role = 'todo'", params![board_id], |r| r.get(0))
+            .unwrap();
+        let manual_card = create_card(&conn, &board_id, &todo_column_id, "Plan the thing", None).unwrap();
+
+        link_session_to_card(&conn, &manual_card.id, "s1").unwrap();
+
+        let card_count: i64 = conn.query_row("SELECT COUNT(*) FROM cards", [], |r| r.get(0)).unwrap();
+        assert_eq!(card_count, 1, "the duplicate auto-created card must be gone");
+
+        let remaining_id: String = conn.query_row("SELECT id FROM cards", [], |r| r.get(0)).unwrap();
+        assert_eq!(remaining_id, manual_card.id);
+        assert_ne!(remaining_id, auto_card_id);
+
+        // Session "s1" is still 'active', so linking must place the card in 'in_progress'.
+        assert_eq!(column_role_for_card(&conn, &manual_card.id).as_deref(), Some("in_progress"));
+    }
+
+    #[test]
+    fn link_session_to_card_places_card_in_review_for_an_already_ended_session() {
+        let conn = in_memory_db();
+        seed_project_and_session(&conn, "p1", "s1");
+        conn.execute("UPDATE sessions SET status = 'ended' WHERE id = 's1'", []).unwrap();
+        let board_id = ensure_board_for_project(&conn, "p1").unwrap();
+
+        let todo_column_id: String = conn
+            .query_row("SELECT id FROM columns WHERE board_id = ?1 AND role = 'todo'", params![board_id], |r| r.get(0))
+            .unwrap();
+        let manual_card = create_card(&conn, &board_id, &todo_column_id, "Plan the thing", None).unwrap();
+
+        link_session_to_card(&conn, &manual_card.id, "s1").unwrap();
+
+        assert_eq!(column_role_for_card(&conn, &manual_card.id).as_deref(), Some("review"));
+    }
+
+    #[test]
+    fn card_launch_context_reports_project_path_and_column_role_for_an_unlinked_card() {
+        let conn = in_memory_db();
+        upsert_project(&conn, "p1", "fixture", "/Users/testuser/fixture", 1000).unwrap();
+        let board_id = ensure_board_for_project(&conn, "p1").unwrap();
+        let in_progress_column_id: String = conn
+            .query_row(
+                "SELECT id FROM columns WHERE board_id = ?1 AND role = 'in_progress'",
+                params![board_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let card = create_card(
+            &conn,
+            &board_id,
+            &in_progress_column_id,
+            "Fix the login bug",
+            Some("Repros on SSO cookie expiry"),
+        )
+        .unwrap();
+
+        let context = card_launch_context(&conn, &card.id).unwrap().unwrap();
+        assert_eq!(context.title, "Fix the login bug");
+        assert_eq!(context.description.as_deref(), Some("Repros on SSO cookie expiry"));
+        assert_eq!(context.session_id, None);
+        assert_eq!(context.column_role.as_deref(), Some("in_progress"));
+        assert_eq!(context.project_id, "p1");
+        assert_eq!(context.project_path, "/Users/testuser/fixture");
+    }
+
+    #[test]
+    fn card_launch_context_returns_none_for_an_unknown_card_id() {
+        let conn = in_memory_db();
+        assert!(card_launch_context(&conn, "does-not-exist").unwrap().is_none());
+    }
+
+    #[test]
+    fn most_recent_active_session_id_for_project_picks_the_active_one_and_ignores_other_projects() {
+        let conn = in_memory_db();
+        seed_project_and_session(&conn, "p1", "s1");
+        // An ended session for the same project must not be picked...
+        conn.execute(
+            "INSERT INTO sessions (id, project_id, agent, started_at, last_activity_at, status, raw_log_path)
+             VALUES ('s0', 'p1', 'claude', 900, 900, 'ended', '')",
+            [],
+        )
+        .unwrap();
+        // ...nor an active session belonging to a different project.
+        upsert_project(&conn, "p2", "fixture2", "/fixture2", 1000).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, project_id, agent, started_at, last_activity_at, status, raw_log_path)
+             VALUES ('s2', 'p2', 'claude', 1000, 1000, 'active', '')",
+            [],
+        )
+        .unwrap();
+
+        let result = most_recent_active_session_id_for_project(&conn, "p1").unwrap();
+        assert_eq!(result.as_deref(), Some("s1"));
+    }
+
+    #[test]
+    fn most_recent_active_session_id_for_project_returns_none_when_nothing_is_active() {
+        let conn = in_memory_db();
+        upsert_project(&conn, "p1", "fixture", "/fixture", 1000).unwrap();
+        assert_eq!(most_recent_active_session_id_for_project(&conn, "p1").unwrap(), None);
+    }
 }

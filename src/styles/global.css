@@ -4,6 +4,18 @@
   box-sizing: border-box;
 }
 
+html {
+  /* Fluid base font-size: every var(--space-*)/var(--text-*) token is rem, so the whole UI
+     scales together as the window grows — 16px at a typical laptop window width (matches
+     the old fixed-px values exactly, so nothing changes at that size), growing gently up to
+     21px on a maximized window on a large external display, instead of staying pinned at a
+     small fixed size while only the layout stretches to fill the extra width. */
+  font-size: clamp(16px, 0.55vw + 9.5px, 21px);
+  /* Lets native form controls (select, scrollbars, etc.) render in the matching OS theme
+     instead of defaulting to light chrome inside a dark-themed page. */
+  color-scheme: light dark;
+}
+
 html,
 body,
 #root {
@@ -38,7 +50,9 @@ button {
 
 .app-main {
   flex: 1;
+  min-width: 0;
   overflow-y: auto;
+  overflow-x: hidden;
   padding: var(--space-6);
 }
 

@@ -22,7 +22,7 @@
 
 .session-detail-stats {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(8.75rem, 1fr)); /* 140px */
   gap: var(--space-3);
 }
 
@@ -67,7 +67,7 @@
 .session-detail-file-info {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 0.125rem; /* 2px */
   min-width: 0;
 }
 
@@ -83,6 +83,12 @@
 .session-detail-file-meta {
   font-size: var(--text-xs);
   color: var(--text-muted);
+}
+
+.session-detail-file-actions {
+  display: flex;
+  gap: var(--space-2);
+  flex-shrink: 0;
 }
 
 .session-detail-file-open {

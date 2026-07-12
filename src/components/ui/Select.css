@@ -5,7 +5,7 @@
   background: var(--surface-card);
   border: 1px solid var(--border-strong);
   border-radius: 7px;
-  padding: 7px;
+  padding: 0.4375rem; /* 7px */
 }
 
 .select-input:focus {

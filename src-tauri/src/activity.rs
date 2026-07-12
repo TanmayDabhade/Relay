@@ -8,6 +8,7 @@
 //! `commands::open_in_editor`, which correctly *does* return `Result` because a failed
 //! editor-open is a real, user-actionable failure.
 
+use serde::Serialize;
 use std::collections::HashMap;
 use std::process::Command;
 use std::sync::Mutex;
@@ -78,13 +79,15 @@ fn bucket_daily_counts(timestamps: &[i64], now: i64) -> Vec<i64> {
     buckets
 }
 
-/// Shells out to `git log --since="14.days" --format=%ct` in `project_path`, returning one
-/// raw Unix timestamp per commit line. Every failure mode — `git` not on `PATH`, the process
-/// failing to spawn, a non-zero exit (not a git repo, path doesn't exist, etc.), or
-/// unparseable output — resolves to an empty `Vec`, never a panic or propagated error.
-fn git_log_timestamps(project_path: &str) -> Vec<i64> {
+/// Shells out to `git log --since="{since_days}.days" --format=%ct` in `project_path`,
+/// returning one raw Unix timestamp per commit line. Every failure mode — `git` not on
+/// `PATH`, the process failing to spawn, a non-zero exit (not a git repo, path doesn't
+/// exist, etc.), or unparseable output — resolves to an empty `Vec`, never a panic or
+/// propagated error. `pub` so `commands::project_git_insights` can reuse it with a wider
+/// window than the 14-day sparkline below.
+pub fn git_log_timestamps(project_path: &str, since_days: i64) -> Vec<i64> {
     let output = match Command::new("git")
-        .args(["log", "--since=14.days", "--format=%ct"])
+        .args(["log", &format!("--since={since_days}.days"), "--format=%ct"])
         .current_dir(project_path)
         .output()
     {
@@ -138,7 +141,7 @@ pub fn project_activity(project_path: &str, cache: &ActivityCache) -> Vec<i64> {
         }
     }
 
-    let timestamps = git_log_timestamps(project_path);
+    let timestamps = git_log_timestamps(project_path, WINDOW_DAYS);
     let now = chrono::Utc::now().timestamp();
     let result = bucket_daily_counts(&timestamps, now);
 
@@ -147,6 +150,67 @@ pub fn project_activity(project_path: &str, cache: &ActivityCache) -> Vec<i64> {
     }
 
     result
+}
+
+/// One commit as shown in the Overview tab's "Recent commits" list.
+#[derive(Debug, Clone, Serialize)]
+pub struct CommitInfo {
+    /// Abbreviated hash (`git log`'s `%h`).
+    pub hash: String,
+    /// Subject line only (`%s`) — not the full body, to keep each row a single line.
+    pub message: String,
+    pub author: String,
+    pub timestamp: i64,
+}
+
+/// Unit separator (`\x1f`) rather than a printable delimiter like `|` or `,` between
+/// `git log --format` fields, since a commit subject can freely contain either.
+const GIT_LOG_FIELD_SEP: &str = "\x1f";
+
+/// Shells out to `git log -n{limit} --format=...` in `project_path` for the most recent
+/// commits, newest first. Same "degrade to empty on any failure" contract as
+/// `git_log_timestamps` — not a git repo, no `git` on `PATH`, or unparseable output all
+/// resolve to an empty `Vec` rather than an error the frontend would need to handle.
+pub fn git_recent_commits(project_path: &str, limit: usize) -> Vec<CommitInfo> {
+    let format_arg = format!("--format=%h{GIT_LOG_FIELD_SEP}%s{GIT_LOG_FIELD_SEP}%an{GIT_LOG_FIELD_SEP}%ct");
+    let output = match Command::new("git")
+        .args(["log", &format!("-n{limit}"), &format_arg])
+        .current_dir(project_path)
+        .output()
+    {
+        Ok(output) => output,
+        Err(e) => {
+            log::debug!("git_recent_commits: failed to spawn `git` for {project_path}: {e}");
+            return Vec::new();
+        }
+    };
+
+    if !output.status.success() {
+        log::debug!(
+            "git_recent_commits: `git log` exited non-zero in {project_path} (likely not a git repo)"
+        );
+        return Vec::new();
+    }
+
+    let stdout = match String::from_utf8(output.stdout) {
+        Ok(stdout) => stdout,
+        Err(e) => {
+            log::warn!("git_recent_commits: `git log` stdout for {project_path} wasn't valid UTF-8: {e}");
+            return Vec::new();
+        }
+    };
+
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(4, GIT_LOG_FIELD_SEP);
+            let hash = parts.next()?.to_string();
+            let message = parts.next()?.to_string();
+            let author = parts.next()?.to_string();
+            let timestamp = parts.next()?.trim().parse::<i64>().ok()?;
+            Some(CommitInfo { hash, message, author, timestamp })
+        })
+        .collect()
 }
 
 #[cfg(test)]

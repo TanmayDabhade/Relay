@@ -34,27 +34,28 @@ export function ProjectsView() {
     );
   }
 
-  // Auto-select the first project once data has loaded, rather than showing an extra
-  // empty "select a project" state on first render — a reasonable default per the brief,
-  // since there's always at least one project by this point.
-  const selectedProject =
-    data.find((project) => project.id === selectedProjectId) ?? data[0];
+  const selectedProject = data.find((project) => project.id === selectedProjectId) ?? null;
 
-  return (
-    <div className="projects-view">
-      <div className="projects-view-list">
-        {data.map((project) => (
-          <ProjectCard
-            key={project.id}
-            project={project}
-            selected={project.id === selectedProject.id}
-            onClick={() => setSelectedProjectId(project.id)}
-          />
-        ))}
-      </div>
-      <div className="projects-view-detail">
+  if (selectedProject) {
+    return (
+      <div className="projects-view-detail-page">
+        <button className="projects-view-back" onClick={() => setSelectedProjectId(null)}>
+          ← Back to projects
+        </button>
         <ProjectDetail project={selectedProject} />
       </div>
+    );
+  }
+
+  return (
+    <div className="projects-view-grid">
+      {data.map((project) => (
+        <ProjectCard
+          key={project.id}
+          project={project}
+          onClick={() => setSelectedProjectId(project.id)}
+        />
+      ))}
     </div>
   );
 }

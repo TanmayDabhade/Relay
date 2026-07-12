@@ -13,10 +13,13 @@
     "windows": [
       {
         "title": "Relay",
-        "width": 800,
-        "height": 600,
+        "width": 1200,
+        "height": 800,
+        "minWidth": 1040,
+        "minHeight": 660,
         "resizable": true,
-        "fullscreen": false
+        "fullscreen": false,
+        "dragDropEnabled": false
       }
     ],
     "security": {

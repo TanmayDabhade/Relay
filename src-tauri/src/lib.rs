@@ -5,6 +5,7 @@ mod db;
 mod parser;
 mod summarize;
 mod tags;
+mod terminal;
 mod watcher;
 
 use std::sync::Mutex;
@@ -61,6 +62,21 @@ pub fn run() {
       commands::get_session_detail,
       commands::open_in_editor,
       commands::project_activity,
+      commands::project_git_insights,
+      commands::dashboard_stats,
+      commands::generate_report,
+      commands::export_report,
+      commands::reveal_in_finder,
+      commands::get_file_diff_for_session_file,
+      commands::get_board,
+      commands::create_card,
+      commands::move_card,
+      commands::update_card,
+      commands::delete_card,
+      commands::link_session_to_card,
+      commands::create_column,
+      commands::rename_column,
+      commands::launch_or_attach_session,
     ])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
@@ -130,7 +146,16 @@ fn spawn_idle_sweep(app_handle: tauri::AppHandle) {
         let mut any_finalized = false;
         for id in &ids {
           match db::queries::finalize_session(&conn, id) {
-            Ok(()) => any_finalized = true,
+            Ok(()) => {
+              any_finalized = true;
+              // Moves this session's linked card (if any) to its board's 'review' column —
+              // see `sync_card_for_session`'s doc comment for why this always wins over a
+              // manual drag. A failure here is a kanban-layer concern only; it must not stop
+              // the rest of this tick (tag/summary generation still need to run for `id`).
+              if let Err(e) = db::queries::sync_card_for_session(&conn, id, "review") {
+                log::warn!("idle sweep: failed to sync card for finalized session {id}: {e:#}");
+              }
+            }
             Err(e) => log::warn!("idle sweep: failed to finalize session {id}: {e:#}"),
           }
         }

@@ -17,11 +17,6 @@
   border-color: var(--border-strong);
 }
 
-.project-card-selected {
-  border-color: var(--border-selected);
-  background: var(--accent-subtle);
-}
-
 .project-card-header {
   display: flex;
   align-items: center;
@@ -30,6 +25,9 @@
 }
 
 .project-card-name {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
   font-weight: 600;
   color: var(--text-primary);
 }

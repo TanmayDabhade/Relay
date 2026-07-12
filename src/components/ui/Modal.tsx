@@ -5,6 +5,8 @@ interface ModalProps {
   isOpen: boolean;
   onClose: () => void;
   title?: string;
+  /** Wider panel for content that doesn't fit the default 540px (e.g. a code diff). */
+  wide?: boolean;
   children: React.ReactNode;
 }
 
@@ -12,7 +14,7 @@ interface ModalProps {
  * Minimal, reusable modal: backdrop + centered panel. Clicking the backdrop or pressing
  * Escape closes it. Not hard-coded to any particular content — callers own what goes inside.
  */
-export function Modal({ isOpen, onClose, title, children }: ModalProps) {
+export function Modal({ isOpen, onClose, title, wide, children }: ModalProps) {
   useEffect(() => {
     if (!isOpen) return;
 
@@ -32,9 +34,18 @@ export function Modal({ isOpen, onClose, title, children }: ModalProps) {
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
-      <div className="modal-panel" onClick={(event) => event.stopPropagation()}>
+      <div
+        className={`modal-panel${wide ? " modal-panel-wide" : ""}`}
+        onClick={(event) => event.stopPropagation()}
+      >
         <div className="modal-header">
-          {title ? <h2 className="modal-title">{title}</h2> : <span />}
+          {title ? (
+            <h2 className="modal-title" title={title}>
+              {title}
+            </h2>
+          ) : (
+            <span />
+          )}
           <button className="modal-close" onClick={onClose} aria-label="Close">
             ×
           </button>

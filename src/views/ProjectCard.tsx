@@ -1,6 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { ActivityBars } from "../components/ui/ActivityBars";
 import { Pill } from "../components/ui/Pill";
+import { ProjectDot } from "../components/ui/ProjectDot";
 import { formatRelativeTime } from "../lib/format";
 import { getProjectActivity } from "../lib/tauri";
 import type { ProjectSummary } from "../lib/types";
@@ -8,9 +9,6 @@ import "./ProjectCard.css";
 
 interface ProjectCardProps {
   project: ProjectSummary;
-  /** Whether this card represents the currently-selected project in a master-detail layout
-   * (e.g. `ProjectsView`). Purely a visual affordance — omit for standalone usage. */
-  selected?: boolean;
   onClick?: () => void;
 }
 
@@ -18,7 +16,7 @@ interface ProjectCardProps {
  * e.g. outside a real Tauri context) — never blocks the rest of the card's render. */
 const EMPTY_ACTIVITY = new Array(14).fill(0);
 
-export function ProjectCard({ project, selected = false, onClick }: ProjectCardProps) {
+export function ProjectCard({ project, onClick }: ProjectCardProps) {
   const { data: activity } = useQuery({
     queryKey: ["project-activity", project.path],
     queryFn: () => getProjectActivity(project.path),
@@ -27,12 +25,13 @@ export function ProjectCard({ project, selected = false, onClick }: ProjectCardP
     retry: false,
   });
 
-  const classes = "project-card" + (selected ? " project-card-selected" : "");
-
   return (
-    <button className={classes} onClick={onClick}>
+    <button className="project-card" onClick={onClick}>
       <div className="project-card-header">
-        <span className="project-card-name">{project.name}</span>
+        <span className="project-card-name">
+          <ProjectDot projectId={project.id} />
+          {project.name}
+        </span>
         <Pill variant="agent" tone="accent">
           claude
         </Pill>

@@ -17,7 +17,6 @@ const INERT_TYPES: &[&str] = &[
     "permission-mode",
     "attachment",
     "file-history-snapshot",
-    "ai-title",
     "queue-operation",
 ];
 
@@ -70,6 +69,10 @@ pub struct ParsedRecord {
     /// or `None` if there were no text blocks (e.g. a tool-only turn). For `system` records:
     /// always `None` — system records never carry prompt/response text.
     pub text: Option<String>,
+    /// Only set on an `"ai-title"` record: Claude Code's own auto-generated title for this
+    /// session (the `aiTitle` field) — the same text shown as "Session name" in `claude`
+    /// CLI's `/status` and the `--resume` picker. `None` for every other record type.
+    pub ai_title: Option<String>,
 }
 
 /// Parses a single complete JSONL line. Returns `None` for malformed JSON, records with no
@@ -95,7 +98,7 @@ pub fn parse_line(line: &str) -> Option<ParsedRecord> {
     let record_type = value.get("type").and_then(Value::as_str)?.to_string();
 
     match record_type.as_str() {
-        "user" | "assistant" | "system" => {}
+        "user" | "assistant" | "system" | "ai-title" => {}
         t if INERT_TYPES.contains(&t) => return None,
         other => {
             log_unknown_type_once(other);
@@ -148,6 +151,11 @@ pub fn parse_line(line: &str) -> Option<ParsedRecord> {
         .unwrap_or_default();
 
     let text = extract_text(&record_type, content);
+    let ai_title = if record_type == "ai-title" {
+        value.get("aiTitle").and_then(Value::as_str).map(String::from)
+    } else {
+        None
+    };
 
     Some(ParsedRecord {
         record_type,
@@ -159,6 +167,7 @@ pub fn parse_line(line: &str) -> Option<ParsedRecord> {
         usage,
         tool_uses,
         text,
+        ai_title,
     })
 }
 
@@ -286,10 +295,30 @@ mod tests {
         // file-history-snapshot (all inert, several with no cwd/timestamp at all) - none of
         // them should turn into a ParsedRecord, and parsing must not panic on any of them.
         let records = parsed_fixture_lines();
-        // 14 total lines: 5 inert header lines + 1 user + 1 ai-title (inert) + 4 assistant +
+        // 14 total lines: 5 inert header lines + 1 user + 1 ai-title + 4 assistant +
         // 1 system + 1 unknown-future-type (inert-by-ignoring) + 1 queue-operation (inert) =
-        // only user + 4 assistant + system = 6 real records survive.
-        assert_eq!(records.len(), 6, "expected exactly 6 real records, got: {records:#?}");
+        // user + ai-title + 4 assistant + system = 7 real records survive.
+        assert_eq!(records.len(), 7, "expected exactly 7 real records, got: {records:#?}");
+    }
+
+    #[test]
+    fn ai_title_record_yields_its_title_and_no_other_type_does() {
+        let records = parsed_fixture_lines();
+        let ai_title_record = records
+            .iter()
+            .find(|r| r.record_type == "ai-title")
+            .expect("fixture has an ai-title record");
+        assert_eq!(
+            ai_title_record.ai_title.as_deref(),
+            Some("Add hello world and fix greeting")
+        );
+        assert!(
+            records
+                .iter()
+                .filter(|r| r.record_type != "ai-title")
+                .all(|r| r.ai_title.is_none()),
+            "only the ai-title record should carry ai_title"
+        );
     }
 
     #[test]

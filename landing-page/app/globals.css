@@ -1,0 +1,87 @@
+@import "tailwindcss";
+
+/* Mirrors the Relay desktop app's own token system (src/styles/tokens.css):
+   a warm paper/graphite monochrome that inverts lightness for dark mode,
+   with the OS `prefers-color-scheme` as the only switch — no in-app toggle. */
+:root {
+  --surface-bg: #f5f5f2;
+  --surface-raised: #fefefe;
+  --surface-muted: #f6f6f4;
+
+  --text-primary: #2a2a28;
+  --text-muted: #9a9a92;
+
+  --border-default: #e8e7e2;
+  --border-strong: #d0cfc9;
+
+  --accent: #2f3237;
+  --accent-contrast: #ffffff;
+
+  --signal-green: #2d7d5a;
+  --signal-red: #c04040;
+  --signal-amber: #a06020;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --surface-bg: #1c1c1a;
+    --surface-raised: #242422;
+    --surface-muted: #232320;
+
+    --text-primary: #f0efe9;
+    --text-muted: #8a887f;
+
+    --border-default: #38372f;
+    --border-strong: #4a4842;
+
+    --accent: #e8e9eb;
+    --accent-contrast: #1c1c1a;
+
+    --signal-green: #5ec293;
+    --signal-red: #e07575;
+    --signal-amber: #d9a352;
+  }
+}
+
+@theme inline {
+  --color-relay-bg: var(--surface-bg);
+  --color-relay-surface: var(--surface-raised);
+  --color-relay-surface-muted: var(--surface-muted);
+  --color-relay-border: var(--border-default);
+  --color-relay-border-strong: var(--border-strong);
+  --color-relay-text: var(--text-primary);
+  --color-relay-muted: var(--text-muted);
+  --color-relay-primary: var(--accent);
+  --color-relay-primary-contrast: var(--accent-contrast);
+  --color-relay-green: var(--signal-green);
+  --color-relay-red: var(--signal-red);
+  --color-relay-gold: var(--signal-amber);
+
+  --font-display: var(--font-unbounded), sans-serif;
+  --font-mono: var(--font-jetbrains-mono), ui-monospace, monospace;
+
+  --animate-marquee: marquee 28s linear infinite;
+}
+
+@keyframes marquee {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(-50%);
+  }
+}
+
+html {
+  color-scheme: light dark;
+}
+
+body {
+  background-color: var(--color-relay-bg);
+  color: var(--color-relay-text);
+}
+
+::selection {
+  background-color: var(--color-relay-primary);
+  color: var(--color-relay-primary-contrast);
+}

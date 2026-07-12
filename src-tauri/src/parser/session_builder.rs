@@ -21,6 +21,20 @@ pub fn ingest_record(
 ) -> anyhow::Result<IngestOutcome> {
     let mut outcome = IngestOutcome::default();
 
+    // "ai-title" records carry neither `cwd` nor a `timestamp` (see claude_jsonl's doc
+    // comment) — they're Claude Code's own auto-generated session title, always emitted
+    // after the session row already exists (its first `user` record creates it), so this
+    // is handled as its own early branch rather than falling into the cwd/timestamp checks
+    // below, which it would never pass.
+    if record.record_type == "ai-title" {
+        if let (Some(session_id), Some(title)) = (record.session_id.clone(), record.ai_title.clone())
+        {
+            queries::update_session_title(conn, &session_id, &title)?;
+            outcome.session_updated = Some(session_id);
+        }
+        return Ok(outcome);
+    }
+
     // No cwd means we have no idea which project this belongs to — nothing to persist.
     let Some(cwd) = record.cwd.clone() else {
         return Ok(outcome);
@@ -69,6 +83,14 @@ pub fn ingest_record(
 
     if created {
         outcome.session_created = Some(session_id.clone());
+
+        // Board/columns are ensured (not just looked up) here since this may be the very
+        // first session ever seen for this project. Card title is a placeholder — no
+        // first-user-text is available yet at this point in ingestion (that's only extracted
+        // later, from the raw log, by the idle-sweep's tag/summary passes) — the user can
+        // rename it once they open the card.
+        let board_id = queries::ensure_board_for_project(conn, &project_id)?;
+        queries::auto_create_card_for_session(conn, &board_id, &session_id, "New session")?;
     } else {
         outcome.session_updated = Some(session_id.clone());
     }
@@ -104,9 +126,12 @@ fn ingest_tool_use(
         ToolUse::Write { file_path, content } => {
             // No pre-write file state is available from the log alone, so lines_removed is
             // always 0 here — true before/after diffing is the git-diff fallback (Phase 3).
+            // `old_content` stays `None` for the same reason; the diff view renders that as
+            // "every line is new," which is exactly what a Write is.
             let lines_added = content.lines().count() as i64;
             queries::insert_file_changed(
-                conn, session_id, file_path, "write", lines_added, 0, occurred_at,
+                conn, session_id, file_path, "write", lines_added, 0, occurred_at, None,
+                Some(content),
             )?;
         }
         ToolUse::Edit {
@@ -116,7 +141,15 @@ fn ingest_tool_use(
         } => {
             let (added, removed) = diff_counts(old_string, new_string);
             queries::insert_file_changed(
-                conn, session_id, file_path, "edit", added, removed, occurred_at,
+                conn,
+                session_id,
+                file_path,
+                "edit",
+                added,
+                removed,
+                occurred_at,
+                Some(old_string),
+                Some(new_string),
             )?;
         }
         ToolUse::MultiEdit { file_path, edits } => {
@@ -130,6 +163,8 @@ fn ingest_tool_use(
                     added,
                     removed,
                     occurred_at,
+                    Some(old),
+                    Some(new),
                 )?;
             }
         }
@@ -147,6 +182,8 @@ fn ingest_tool_use(
                 added,
                 removed,
                 occurred_at,
+                old_string.as_deref(),
+                Some(new_string),
             )?;
         }
     }
@@ -187,6 +224,12 @@ mod tests {
     fn in_memory_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(include_str!("../../migrations/0001_init.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../../migrations/0002_file_diff_content.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../../migrations/0003_kanban.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../../migrations/0004_session_title.sql"))
             .unwrap();
         conn
     }
@@ -360,6 +403,59 @@ mod tests {
             (cost_usd - expected).abs() < 1e-9,
             "expected {expected}, got {cost_usd}"
         );
+    }
+
+    #[test]
+    fn ingesting_a_new_session_auto_creates_a_card_in_the_in_progress_column() {
+        let conn = in_memory_db();
+        ingest_fixture(&conn);
+
+        let session_id: String = conn
+            .query_row("SELECT id FROM sessions", [], |r| r.get(0))
+            .unwrap();
+
+        let (card_session_id, column_role): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT c.session_id, col.role FROM cards c
+                 JOIN columns col ON col.id = c.column_id",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(card_session_id, Some(session_id));
+        assert_eq!(column_role.as_deref(), Some("in_progress"));
+    }
+
+    #[test]
+    fn replaying_the_same_fixture_twice_does_not_create_a_duplicate_card() {
+        let conn = in_memory_db();
+        ingest_fixture(&conn);
+        ingest_fixture(&conn);
+
+        let card_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM cards", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(card_count, 1);
+    }
+
+    #[test]
+    fn ingesting_fixture_sets_session_title_from_ai_title_record() {
+        let conn = in_memory_db();
+        ingest_fixture(&conn);
+
+        let title: Option<String> = conn
+            .query_row("SELECT title FROM sessions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(title.as_deref(), Some("Add hello world and fix greeting"));
+
+        // The auto-created card's placeholder "New session" title is replaced by the real
+        // ai-title too, since it arrives well before the idle-sweep's own tag/summary passes
+        // would otherwise be the first thing to rename it.
+        let card_title: String = conn
+            .query_row("SELECT title FROM cards", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(card_title, "Add hello world and fix greeting");
     }
 
     #[test]

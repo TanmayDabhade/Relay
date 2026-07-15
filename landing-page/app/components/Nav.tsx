@@ -23,12 +23,20 @@ export function Nav() {
             </a>
           ))}
         </nav>
-        <a
-          href="#waitlist"
-          className="border border-relay-primary px-4 py-2 text-sm font-medium text-relay-primary transition-colors hover:bg-relay-primary hover:text-relay-primary-contrast"
-        >
-          Join Waitlist →
-        </a>
+        <div className="flex items-center gap-4">
+          <a
+            href="/login"
+            className="hidden text-sm text-relay-muted transition-colors hover:text-relay-text sm:inline"
+          >
+            Sign in
+          </a>
+          <a
+            href="#waitlist"
+            className="border border-relay-primary px-4 py-2 text-sm font-medium text-relay-primary transition-colors hover:bg-relay-primary hover:text-relay-primary-contrast"
+          >
+            Join Waitlist →
+          </a>
+        </div>
       </div>
     </header>
   );

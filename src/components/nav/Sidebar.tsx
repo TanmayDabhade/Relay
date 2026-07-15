@@ -7,7 +7,8 @@ export type View =
   | "timeline"
   | "report"
   | "connections"
-  | "agent-manager";
+  | "agent-manager"
+  | "profile";
 
 const NAV_ITEMS: { id: View; label: string; icon: string; disabled?: boolean }[] = [
   { id: "dashboard", label: "Dashboard", icon: "▦" },
@@ -17,6 +18,7 @@ const NAV_ITEMS: { id: View; label: string; icon: string; disabled?: boolean }[]
   { id: "report", label: "Reports", icon: "▥" },
   { id: "connections", label: "Connections", icon: "⟳", disabled: true },
   { id: "agent-manager", label: "Agent Manager", icon: "▶", disabled: true },
+  { id: "profile", label: "Profile", icon: "◔" },
 ];
 
 interface SidebarProps {

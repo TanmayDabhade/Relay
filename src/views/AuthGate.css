@@ -1,0 +1,85 @@
+.auth-gate {
+  height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--surface-page);
+}
+
+.auth-gate-card {
+  width: 22rem;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.auth-gate-brand {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  font-size: var(--text-lg);
+  color: var(--text-primary);
+  text-align: center;
+}
+
+.auth-gate-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.profile-mode-toggle {
+  display: inline-flex;
+  align-self: flex-start;
+  border: 1px solid var(--border-default);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.profile-mode-option {
+  font: inherit;
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  background: var(--surface-card);
+  border: none;
+  padding: var(--space-2) var(--space-3);
+  cursor: pointer;
+}
+
+.profile-mode-option + .profile-mode-option {
+  border-left: 1px solid var(--border-default);
+}
+
+.profile-mode-option.active {
+  background: var(--accent);
+  color: var(--accent-contrast);
+}
+
+.profile-signin-error {
+  color: var(--red);
+  font-size: var(--text-sm);
+  margin: 0;
+}
+
+.profile-link-sent {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.profile-link-sent p {
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  margin: 0;
+}
+
+.profile-link-back {
+  font: inherit;
+  font-size: var(--text-xs);
+  color: var(--accent);
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  text-decoration: underline;
+  align-self: flex-start;
+}

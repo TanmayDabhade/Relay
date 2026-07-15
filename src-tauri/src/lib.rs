@@ -1,4 +1,5 @@
 mod activity;
+mod auth;
 mod commands;
 mod cost;
 mod db;
@@ -10,6 +11,7 @@ mod watcher;
 
 use std::sync::Mutex;
 use tauri::{Emitter, Manager};
+use tauri_plugin_deep_link::DeepLinkExt;
 
 /// Idle-session sweep: a session with no new activity for this long is considered ended.
 /// Constant, not yet user-configurable (per the plan).
@@ -35,7 +37,12 @@ pub fn run() {
       // Backfill cost_usd once at startup for sessions ingested before cost calculation
       // existed (their cost_usd is stuck at 0 in the DB otherwise).
       backfill_session_costs(&conn);
+      // Loaded once here so the watcher (started below, on its own thread) has a plan to
+      // enforce against from its very first tick — see `auth::PlanState`'s doc comment for
+      // why this is cached rather than fetched fresh from Supabase on every check.
+      let plan_snapshot = auth::load_plan_state(&conn);
       app.manage(db::Db(Mutex::new(conn)));
+      app.manage(auth::PlanState(Mutex::new(plan_snapshot)));
 
       // Resolved once at startup (env var, then app_data_dir/config.json), never re-read —
       // see `summarize::resolve_api_key`'s doc comment for the exact order and why this is
@@ -51,6 +58,21 @@ pub fn run() {
       app.manage(summarize::HttpClient(reqwest::Client::new()));
       app.manage(activity::ActivityCache::new());
 
+      // Sign-in (see src/hooks/useAuth.ts) sends the magic-link email with
+      // emailRedirectTo: "relay://auth/callback" — the scheme is registered via
+      // tauri.conf.json's `plugins.deep-link.desktop.schemes`, which on macOS becomes a
+      // CFBundleURLTypes entry at bundle time, so clicking the link hands the URL straight
+      // to this app. Forwarded to the frontend as a plain event rather than handled here in
+      // Rust, since only the frontend's Supabase JS client holds the auth session needed to
+      // call exchangeCodeForSession — Rust never sees the magic-link code or session token.
+      app.handle().plugin(tauri_plugin_deep_link::init())?;
+      let deep_link_handle = app.handle().clone();
+      app.deep_link().on_open_url(move |event| {
+        for url in event.urls() {
+          let _ = deep_link_handle.emit("deep-link", url.to_string());
+        }
+      });
+
       watcher::start(app.handle().clone());
       spawn_idle_sweep(app.handle().clone());
 
@@ -64,6 +86,7 @@ pub fn run() {
       commands::project_activity,
       commands::project_git_insights,
       commands::dashboard_stats,
+      commands::plan_gating_status,
       commands::generate_report,
       commands::export_report,
       commands::export_transcript,
@@ -78,6 +101,9 @@ pub fn run() {
       commands::create_column,
       commands::rename_column,
       commands::launch_or_attach_session,
+      commands::open_url,
+      auth::get_current_plan,
+      auth::set_current_plan,
     ])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
@@ -284,6 +310,12 @@ fn compute_tags_json(session_id: &str, raw_log_path: &str) -> String {
 /// connection hostage, blocking every other DB access (including this same sweep's next tick,
 /// and any UI command) for as long as it takes.
 fn spawn_summary_tasks(app_handle: &tauri::AppHandle, conn: &rusqlite::Connection) {
+  // AI summaries are a paid-plan feature (each one is an Anthropic API call on Relay's
+  // dime) — skip the whole pass on a free plan rather than gating per-session below.
+  if !auth::is_paid(&app_handle.state::<auth::PlanState>()) {
+    return;
+  }
+
   let api_key = app_handle.state::<summarize::ApiKeyState>().0.clone();
   let Some(api_key) = api_key else {
     // Already logged once at startup (see `setup()`) — nothing further to log here, and

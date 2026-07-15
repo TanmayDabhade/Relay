@@ -11,6 +11,7 @@ import '@fontsource/ibm-plex-mono/600.css'
 import './styles/tokens.css'
 import './styles/global.css'
 import App from './App.tsx'
+import { AuthProvider } from './hooks/useAuth.tsx'
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -23,7 +24,9 @@ const queryClient = new QueryClient({
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
     <QueryClientProvider client={queryClient}>
-      <App />
+      <AuthProvider>
+        <App />
+      </AuthProvider>
     </QueryClientProvider>
   </StrictMode>,
 )

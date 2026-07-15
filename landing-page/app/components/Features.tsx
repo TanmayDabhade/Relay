@@ -1,33 +1,33 @@
 const FEATURES = [
   {
     n: "01",
-    tag: "$0.36 avg / session",
-    title: "Spend Tracking",
-    body: "Every token metered locally. Per-agent, per-repo, per-day. Set caps and get shell alerts before the bill spikes.",
+    tag: "drag = ship",
+    title: "Kanban Deploy",
+    body: "Plan the work, then run it. Drag a card → Relay opens a new terminal and launches your CLI agent with the task prompt already seeded. Backlog, in-flight, and done, all on your machine.",
   },
   {
     n: "02",
-    tag: "unlimited history",
-    title: "Session Replay",
-    body: "Rewind any agent run. Diff prompts, tool calls, and file writes. Fork from any step to try a different path.",
-  },
-  {
-    n: "03",
-    tag: "drag = ship",
-    title: "Kanban Deploy",
-    body: "Drag a card → Relay opens a new terminal and launches your CLI agent with the task prompt already seeded. Backlog, in-flight, and done, all on your machine.",
-  },
-  {
-    n: "04",
     tag: "zsh · fish · nu",
     title: "Native Terminals",
     body: "No custom runtime, no sandboxed shell. Relay spawns a real session in your own terminal, running the same `claude` / `codex` / `cursor-agent` command you'd type by hand.",
   },
   {
-    n: "05",
+    n: "03",
     tag: "4 CLIs · 0 setup",
-    title: "Auto-Detect",
-    body: "Point Relay at ~/ and it discovers every .claude, .codex, .cursor, .gemini config on disk. No manual wiring.",
+    title: "Every Agent, One Board",
+    body: "Point Relay at ~/ and it discovers every .claude, .codex, .cursor, .gemini session on disk. No SDK, no instrumentation, no manual wiring — even for agents you never set up to be watched.",
+  },
+  {
+    n: "04",
+    tag: "unlimited history",
+    title: "Session Replay",
+    body: "Rewind any agent run. Diff prompts, tool calls, and file writes. Fork from any step to try a different path.",
+  },
+  {
+    n: "05",
+    tag: "$0.36 avg / session",
+    title: "Spend Tracking",
+    body: "Every token metered locally. Per-agent, per-repo, per-day. Set caps and get shell alerts before the bill spikes.",
   },
   {
     n: "06",
@@ -46,8 +46,9 @@ export function Features() {
           A control room for your <span className="text-relay-primary">/agents.</span>
         </h2>
         <p className="mt-4 max-w-2xl text-relay-muted">
-          Six primitives, one binary. Everything you need to observe,
-          orchestrate, and pay less for the agents you already run.
+          Six primitives, one binary. Everything you need to plan, launch, and
+          drive the agents you already run — observability is just the part
+          that comes for free.
         </p>
         <div className="mt-12 grid gap-px overflow-hidden border border-relay-border bg-relay-border sm:grid-cols-2 lg:grid-cols-3">
           {FEATURES.map((f) => (

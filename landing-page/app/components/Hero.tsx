@@ -1,15 +1,8 @@
 import Image from "next/image";
 import heroImage from "@/images/hero.png";
-import { TerminalWindow } from "./TerminalWindow";
 import { CliMarquee } from "./CliMarquee";
 
-const STATS = [
-  { label: "Agents", value: "4" },
-  { label: "Sessions", value: "127" },
-  { label: "Spend", value: "$18.42" },
-];
-
-const TAGS = ["Local-first", "No cloud tax", "Zero telemetry"];
+const TAGS = ["Local-first", "Every agent", "Zero telemetry"];
 
 export function Hero() {
   return (
@@ -20,17 +13,20 @@ export function Hero() {
             v0.1 · PRIVATE BETA
           </span>
           <h1 className="mt-6 font-display text-4xl leading-[1.05] font-black tracking-tight uppercase sm:text-5xl lg:text-6xl">
-            Run your agents <span className="text-relay-primary">locally.</span>
+            The control plane for your{" "}
+            <span className="text-relay-primary">coding agents.</span>
           </h1>
           <p className="mt-6 max-w-xl text-base leading-relaxed text-relay-muted">
-            Relay is the native-first project management &amp; observability
-            layer for AI coding agents on your machine. Auto-detects{" "}
+            Relay isn&apos;t another dashboard — it&apos;s where you{" "}
+            <span className="text-relay-text">run</span> the work. Plan tasks on
+            a Kanban, launch real terminal sessions straight from a card, and
+            drive every agent —{" "}
             <code className="text-relay-text">.claude</code>,{" "}
             <code className="text-relay-text">.codex</code>,{" "}
-            <code className="text-relay-text">.cursor</code>, and{" "}
-            <code className="text-relay-text">.gemini</code> — track spend,
-            replay sessions, and deploy tasks straight from a Kanban that
-            spawns real terminals.
+            <code className="text-relay-text">.cursor</code>,{" "}
+            <code className="text-relay-text">.gemini</code> — from one board.
+            Cost and session tracking come standard. All on your machine, zero
+            setup.
           </p>
           <div className="mt-8 flex flex-wrap items-center gap-6">
             <a
@@ -46,20 +42,8 @@ export function Hero() {
             </ul>
           </div>
         </div>
-        <div className="space-y-4">
+        <div className="space-y-2">
         <Image src={heroImage} alt="Relay Dashboard" className="w-full rounded-lg" priority />
-          <div className="grid grid-cols-3 divide-x divide-relay-border border border-relay-border bg-relay-surface text-center">
-            {STATS.map((s) => (
-              <div key={s.label} className="px-4 py-3">
-                <p className="font-display text-xl font-bold text-relay-primary">
-                  {s.value}
-                </p>
-                <p className="text-xs tracking-widest text-relay-muted uppercase">
-                  {s.label}
-                </p>
-              </div>
-            ))}
-          </div>
         </div>
       </div>
       <div className="mt-16">

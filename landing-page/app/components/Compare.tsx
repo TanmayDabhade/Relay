@@ -1,16 +1,16 @@
-const ROWS: { label: string; relay: boolean; cloud: boolean; ide: boolean }[] = [
-  { label: "Runs entirely on your machine", relay: true, cloud: false, ide: true },
+const ROWS: { label: string; relay: boolean; cloud: boolean; obs: boolean }[] = [
+  { label: "Kanban → real terminal spawn", relay: true, cloud: false, obs: false },
   {
     label: "Multi-CLI support (claude/codex/cursor/gemini)",
     relay: true,
     cloud: false,
-    ide: false,
+    obs: false,
   },
-  { label: "Session replay & fork", relay: true, cloud: true, ide: false },
-  { label: "Kanban → real terminal spawn", relay: true, cloud: false, ide: false },
-  { label: "Per-agent spend tracking", relay: true, cloud: true, ide: false },
-  { label: "Zero telemetry, zero cloud", relay: true, cloud: false, ide: false },
-  { label: "Uses your existing CLI auth", relay: true, cloud: false, ide: true },
+  { label: "Runs entirely on your machine", relay: true, cloud: false, obs: false },
+  { label: "Uses your existing CLI auth", relay: true, cloud: false, obs: false },
+  { label: "Zero telemetry, zero cloud", relay: true, cloud: false, obs: false },
+  { label: "Per-agent spend & session tracking", relay: true, cloud: true, obs: true },
+  { label: "Live prompt & tool-call observability", relay: true, cloud: true, obs: true },
 ];
 
 function Mark({ ok }: { ok: boolean }) {
@@ -30,8 +30,9 @@ export function Compare() {
           The receipts.
         </h2>
         <p className="mt-4 max-w-2xl text-relay-muted">
-          Feature-for-feature against cloud agent platforms and IDE plugins.
-          No asterisks, no fine print.
+          Everyone tracks tokens now. The last two rows are table stakes — the
+          rest is the part only Relay does. Feature-for-feature against cloud
+          agent platforms and LLM observability tools.
         </p>
         <div className="mt-12 overflow-x-auto border border-relay-border">
           <table className="w-full min-w-[640px] border-collapse text-sm">
@@ -49,8 +50,8 @@ export function Compare() {
                   <span className="block text-xs font-normal">devin · replit</span>
                 </th>
                 <th className="p-4 font-medium text-relay-muted">
-                  IDE Plugins
-                  <span className="block text-xs font-normal">vscode ext.</span>
+                  LLM Observability
+                  <span className="block text-xs font-normal">langfuse · helicone</span>
                 </th>
               </tr>
             </thead>
@@ -65,7 +66,7 @@ export function Compare() {
                     <Mark ok={r.cloud} />
                   </td>
                   <td className="p-4">
-                    <Mark ok={r.ide} />
+                    <Mark ok={r.obs} />
                   </td>
                 </tr>
               ))}

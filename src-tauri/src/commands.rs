@@ -10,16 +10,36 @@ use tauri::{Emitter, State};
 /// Width of the Dashboard's GitHub-style activity heatmap, in days.
 const HEATMAP_DAYS: i64 = 365;
 
-#[tauri::command]
-pub fn list_projects(db: State<'_, Db>) -> Result<Vec<queries::ProjectSummary>, String> {
-    let conn = db.0.lock().map_err(|e| e.to_string())?;
-    queries::list_projects(&conn).map_err(|e| e.to_string())
+/// Resolves the plan into the `(project_limit, session_limit)` pair that `list_projects` /
+/// `list_sessions` / `dashboard_stats` / `plan_gating_status` all feed into `VISIBLE_SET_CTE`.
+/// Free reuses the ingest-time caps as view-time limits; paid gets `-1` ("no limit" in SQLite),
+/// so the same queries run ungated. Centralized so every read surface agrees on the visible set.
+fn plan_limits(plan_state: &State<'_, crate::auth::PlanState>) -> (i64, i64) {
+    if crate::auth::is_paid(plan_state) {
+        (-1, -1)
+    } else {
+        (crate::auth::FREE_PROJECT_LIMIT, crate::auth::FREE_SESSION_LIMIT)
+    }
 }
 
 #[tauri::command]
-pub fn list_sessions(db: State<'_, Db>) -> Result<Vec<queries::Session>, String> {
+pub fn list_projects(
+    db: State<'_, Db>,
+    plan_state: State<'_, crate::auth::PlanState>,
+) -> Result<Vec<queries::ProjectSummary>, String> {
+    let (project_limit, session_limit) = plan_limits(&plan_state);
     let conn = db.0.lock().map_err(|e| e.to_string())?;
-    queries::list_sessions(&conn).map_err(|e| e.to_string())
+    queries::list_projects(&conn, project_limit, session_limit).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn list_sessions(
+    db: State<'_, Db>,
+    plan_state: State<'_, crate::auth::PlanState>,
+) -> Result<Vec<queries::Session>, String> {
+    let (project_limit, session_limit) = plan_limits(&plan_state);
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    queries::list_sessions(&conn, project_limit, session_limit).map_err(|e| e.to_string())
 }
 
 /// Return shape for `get_session_detail` — wraps the session row together with its file
@@ -231,10 +251,19 @@ pub struct DashboardStats {
 const TOP_PROJECTS_LIMIT: usize = 5;
 
 #[tauri::command]
-pub fn dashboard_stats(db: State<'_, Db>) -> Result<DashboardStats, String> {
+pub fn dashboard_stats(
+    db: State<'_, Db>,
+    plan_state: State<'_, crate::auth::PlanState>,
+) -> Result<DashboardStats, String> {
+    let (project_limit, session_limit) = plan_limits(&plan_state);
     let conn = db.0.lock().map_err(|e| e.to_string())?;
 
-    let mut projects = queries::list_projects(&conn).map_err(|e| e.to_string())?;
+    // Headline numbers (total_cost_usd/total_sessions/total_projects/top_projects) all derive
+    // from this one list, so gating it here makes the whole Dashboard summary reflect only the
+    // free-plan visible set. (The heatmap/agent breakdown/"active now" widget below still span
+    // all local activity — see design notes: they're activity visualizations, not browse lists.)
+    let mut projects =
+        queries::list_projects(&conn, project_limit, session_limit).map_err(|e| e.to_string())?;
     let total_cost_usd: f64 = projects.iter().map(|p| p.total_cost_usd).sum();
     let total_sessions: i64 = projects.iter().map(|p| p.session_count).sum();
     let total_projects = projects.len() as i64;
@@ -294,6 +323,36 @@ fn dense_daily_activity(
     out
 }
 
+/// What the free-plan visibility caps are withholding, for the "N hidden — upgrade" banners on
+/// the Projects and Sessions views. On a paid plan everything is unhidden (`hidden_* == 0`).
+#[derive(Debug, Clone, Serialize)]
+pub struct PlanGating {
+    pub is_paid: bool,
+    pub visible_projects: i64,
+    pub hidden_projects: i64,
+    pub visible_sessions: i64,
+    pub hidden_sessions: i64,
+}
+
+#[tauri::command]
+pub fn plan_gating_status(
+    db: State<'_, Db>,
+    plan_state: State<'_, crate::auth::PlanState>,
+) -> Result<PlanGating, String> {
+    let is_paid = crate::auth::is_paid(&plan_state);
+    let (project_limit, session_limit) = plan_limits(&plan_state);
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let counts = queries::plan_visibility_counts(&conn, project_limit, session_limit)
+        .map_err(|e| e.to_string())?;
+    Ok(PlanGating {
+        is_paid,
+        visible_projects: counts.visible_projects,
+        hidden_projects: (counts.total_projects - counts.visible_projects).max(0),
+        visible_sessions: counts.visible_sessions,
+        hidden_sessions: (counts.total_sessions - counts.visible_sessions).max(0),
+    })
+}
+
 // --- Reports ---
 
 /// Aggregated report payload for the Reports view: headline totals plus three breakdowns
@@ -324,9 +383,24 @@ fn build_report(conn: &rusqlite::Connection, range_days: i64) -> Result<ReportDa
 }
 
 #[tauri::command]
-pub fn generate_report(db: State<'_, Db>, range_days: i64) -> Result<ReportData, String> {
+pub fn generate_report(
+    db: State<'_, Db>,
+    plan_state: State<'_, crate::auth::PlanState>,
+    range_days: i64,
+) -> Result<ReportData, String> {
+    require_paid_plan(&plan_state)?;
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     build_report(&conn, range_days)
+}
+
+/// Reports/export are a paid-plan feature — see `auth::PlanState`'s doc comment for where
+/// the plan cache comes from and why it's checked here rather than only in the frontend.
+fn require_paid_plan(plan_state: &State<'_, crate::auth::PlanState>) -> Result<(), String> {
+    if crate::auth::is_paid(plan_state) {
+        Ok(())
+    } else {
+        Err("Reports require a paid plan — upgrade to unlock them.".to_string())
+    }
 }
 
 /// Renders the same data `generate_report` returns as a standalone Markdown document, writes
@@ -336,7 +410,12 @@ pub fn generate_report(db: State<'_, Db>, range_days: i64) -> Result<ReportData,
 /// locked-down sandbox) rather than the app-data directory, since the whole point is for the
 /// user to find this file and hand it to someone else.
 #[tauri::command]
-pub fn export_report(db: State<'_, Db>, range_days: i64) -> Result<String, String> {
+pub fn export_report(
+    db: State<'_, Db>,
+    plan_state: State<'_, crate::auth::PlanState>,
+    range_days: i64,
+) -> Result<String, String> {
+    require_paid_plan(&plan_state)?;
     let report = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
         build_report(&conn, range_days)?
@@ -403,6 +482,18 @@ fn render_report_markdown(report: &ReportData) -> String {
     out
 }
 
+/// Opens `url` in the user's default browser — macOS only, matching Relay's current
+/// platform scope. Used by the profile page's "Upgrade" link, since checkout happens on the
+/// landing site rather than in-app (see `auth.rs`'s doc comments for why).
+#[tauri::command]
+pub fn open_url(url: String) -> Result<(), String> {
+    Command::new("open")
+        .arg(&url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("failed to open {url}: {e}"))
+}
+
 /// Reveals `path` in Finder — macOS only, matching Relay's current platform scope (see the
 /// README's "Requirements"). Used by the Reports view's "Reveal in Finder" button right after
 /// `export_report` writes a file, so the user doesn't have to hunt through Downloads for it.
@@ -420,7 +511,12 @@ pub fn reveal_in_finder(path: String) -> Result<(), String> {
 /// to the user's Downloads directory, mirroring `export_report`'s save-and-return-path
 /// contract so the frontend can reuse the same `reveal_in_finder` follow-up action.
 #[tauri::command]
-pub fn export_transcript(db: State<'_, Db>, session_id: String) -> Result<String, String> {
+pub fn export_transcript(
+    db: State<'_, Db>,
+    plan_state: State<'_, crate::auth::PlanState>,
+    session_id: String,
+) -> Result<String, String> {
+    require_paid_plan(&plan_state)?;
     let session = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
         queries::get_session(&conn, &session_id).map_err(|e| e.to_string())?

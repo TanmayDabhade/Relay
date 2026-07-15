@@ -1,4 +1,5 @@
 use super::record::{ParsedRecord, ToolUse};
+use crate::auth::{FREE_PROJECT_LIMIT, FREE_SESSION_LIMIT};
 use crate::cost::pricing;
 use crate::db::queries::{self, TokenDelta};
 use rusqlite::Connection;
@@ -14,10 +15,16 @@ pub struct IngestOutcome {
     pub session_updated: Option<String>,
 }
 
+/// `is_paid` gates two free-tier ceilings (`auth::FREE_PROJECT_LIMIT`/`FREE_SESSION_LIMIT`):
+/// once hit, ingestion stops creating *new* projects/sessions but keeps updating ones that
+/// already exist — a project or session that was already being tracked never loses data,
+/// existing local history is never deleted. See `auth::PlanState`'s doc comment for where
+/// `is_paid` comes from.
 pub fn ingest_record(
     conn: &Connection,
     raw_log_path: &str,
     record: ParsedRecord,
+    is_paid: bool,
 ) -> anyhow::Result<IngestOutcome> {
     let mut outcome = IngestOutcome::default();
 
@@ -46,6 +53,16 @@ pub fn ingest_record(
     };
 
     let project_id = project_id_for_path(&cwd);
+
+    // Free-tier project cap: only blocks *new* projects. A project already in the DB (one
+    // of the first `FREE_PROJECT_LIMIT`) keeps receiving updates regardless of plan.
+    if !is_paid
+        && !queries::project_exists(conn, &project_id)?
+        && queries::count_projects(conn)? >= FREE_PROJECT_LIMIT
+    {
+        return Ok(outcome);
+    }
+
     let project_name = std::path::Path::new(&cwd)
         .file_name()
         .and_then(|n| n.to_str())
@@ -59,6 +76,15 @@ pub fn ingest_record(
     let Some(session_id) = record.session_id.clone() else {
         return Ok(outcome);
     };
+
+    // Free-tier session cap: same "block new, keep updating existing" rule as the project
+    // cap above.
+    if !is_paid
+        && !queries::session_exists(conn, &session_id)?
+        && queries::count_sessions(conn)? >= FREE_SESSION_LIMIT
+    {
+        return Ok(outcome);
+    }
 
     let delta = record
         .usage
@@ -238,7 +264,7 @@ mod tests {
     fn ingest_fixture(conn: &Connection) {
         for line in SESSION_BASIC_FIXTURE.lines() {
             if let Some(record) = parse_line(line) {
-                ingest_record(conn, RAW_LOG_PATH, record).unwrap();
+                ingest_record(conn, RAW_LOG_PATH, record, false).unwrap();
             }
         }
     }
@@ -469,7 +495,7 @@ mod tests {
         // This line has no "cwd" key, so parse_line still returns Some (cwd is optional in
         // ParsedRecord), but ingest_record must no-op rather than fail.
         if let Some(record) = no_cwd {
-            let outcome = ingest_record(&conn, RAW_LOG_PATH, record).unwrap();
+            let outcome = ingest_record(&conn, RAW_LOG_PATH, record, false).unwrap();
             assert!(outcome.project_touched.is_none());
             assert!(outcome.session_created.is_none());
         }
@@ -489,12 +515,87 @@ mod tests {
         let line = r#"{"type":"user","sessionId":"cur-session-1","cwd":"/tmp/cursor-project","timestamp":"2026-01-01T10:00:00Z","text":"hello"}"#;
         let record = crate::parser::cursor_jsonl::parse_line(line).expect("cursor line should parse");
 
-        let outcome = ingest_record(&conn, "/Users/testuser/.cursor/logs/cur-session-1.jsonl", record).unwrap();
+        let outcome = ingest_record(&conn, "/Users/testuser/.cursor/logs/cur-session-1.jsonl", record, false).unwrap();
         assert_eq!(outcome.session_created.as_deref(), Some("cur-session-1"));
 
         let agent: String = conn
             .query_row("SELECT agent FROM sessions WHERE id = 'cur-session-1'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(agent, "cursor");
+    }
+
+    fn synthetic_record(cwd: &str, session_id: &str, timestamp: i64) -> ParsedRecord {
+        ParsedRecord {
+            record_type: "user".to_string(),
+            agent: "claude",
+            cwd: Some(cwd.to_string()),
+            git_branch: None,
+            session_id: Some(session_id.to_string()),
+            timestamp: Some(timestamp),
+            model: None,
+            usage: None,
+            tool_uses: Vec::new(),
+            text: Some("hello".to_string()),
+            ai_title: None,
+        }
+    }
+
+    #[test]
+    fn free_plan_blocks_new_projects_past_the_cap_but_keeps_updating_existing_ones() {
+        let conn = in_memory_db();
+
+        // Fill the free-tier project cap with FREE_PROJECT_LIMIT distinct projects.
+        for i in 0..FREE_PROJECT_LIMIT {
+            let record = synthetic_record(&format!("/tmp/project-{i}"), &format!("s{i}"), 1_700_000_000 + i);
+            let outcome = ingest_record(&conn, RAW_LOG_PATH, record, false).unwrap();
+            assert!(outcome.project_touched.is_some(), "project {i} should be created under the cap");
+        }
+        let project_count: i64 = conn.query_row("SELECT COUNT(*) FROM projects", [], |r| r.get(0)).unwrap();
+        assert_eq!(project_count, FREE_PROJECT_LIMIT);
+
+        // A brand new project past the cap is silently dropped.
+        let over_cap = synthetic_record("/tmp/project-over-cap", "s-over", 1_700_001_000);
+        let outcome = ingest_record(&conn, RAW_LOG_PATH, over_cap, false).unwrap();
+        assert!(outcome.project_touched.is_none());
+        let project_count: i64 = conn.query_row("SELECT COUNT(*) FROM projects", [], |r| r.get(0)).unwrap();
+        assert_eq!(project_count, FREE_PROJECT_LIMIT, "no new project should have been created past the cap");
+
+        // But a second record for an already-tracked project still updates normally.
+        let more_activity = synthetic_record("/tmp/project-0", "s0", 1_700_002_000);
+        let outcome = ingest_record(&conn, RAW_LOG_PATH, more_activity, false).unwrap();
+        assert!(outcome.project_touched.is_some(), "existing project should keep receiving updates past the cap");
+
+        // A paid plan is never capped.
+        let paid = synthetic_record("/tmp/project-paid", "s-paid", 1_700_003_000);
+        let outcome = ingest_record(&conn, RAW_LOG_PATH, paid, true).unwrap();
+        assert!(outcome.project_touched.is_some(), "paid plan should not be capped");
+    }
+
+    #[test]
+    fn free_plan_blocks_new_sessions_past_the_cap_but_keeps_updating_existing_ones() {
+        let conn = in_memory_db();
+
+        // All sessions share one already-created project so only the session cap is exercised.
+        for i in 0..FREE_SESSION_LIMIT {
+            let record = synthetic_record("/tmp/one-project", &format!("s{i}"), 1_700_000_000 + i);
+            let outcome = ingest_record(&conn, RAW_LOG_PATH, record, false).unwrap();
+            assert!(outcome.session_created.is_some(), "session {i} should be created under the cap");
+        }
+        let session_count: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0)).unwrap();
+        assert_eq!(session_count, FREE_SESSION_LIMIT);
+
+        // A brand new session past the cap is silently dropped, though the project it belongs
+        // to (already tracked) still gets its last_active bumped.
+        let over_cap = synthetic_record("/tmp/one-project", "s-over-cap", 1_700_001_000);
+        let outcome = ingest_record(&conn, RAW_LOG_PATH, over_cap, false).unwrap();
+        assert!(outcome.project_touched.is_some());
+        assert!(outcome.session_created.is_none());
+        let session_count: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0)).unwrap();
+        assert_eq!(session_count, FREE_SESSION_LIMIT, "no new session should have been created past the cap");
+
+        // But a second record for an already-tracked session still updates normally.
+        let more_activity = synthetic_record("/tmp/one-project", "s0", 1_700_002_000);
+        let outcome = ingest_record(&conn, RAW_LOG_PATH, more_activity, false).unwrap();
+        assert!(outcome.session_updated.is_some(), "existing session should keep receiving updates past the cap");
     }
 }

@@ -1,0 +1,49 @@
+.profile-view {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+  min-width: 0;
+}
+
+.profile-card {
+  max-width: 26rem;
+}
+
+.profile-signed-in {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.profile-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.profile-row-label {
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+
+.profile-row-value {
+  color: var(--text-primary);
+  font-size: var(--text-base);
+}
+
+.profile-free-note {
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  margin: 0;
+  padding: var(--space-3);
+  background: var(--surface-muted);
+  border-radius: 8px;
+}
+
+.profile-actions {
+  display: flex;
+  gap: var(--space-3);
+}

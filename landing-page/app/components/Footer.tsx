@@ -39,8 +39,8 @@ export function Footer() {
           ))}
         </div>
         <div className="mt-16 flex flex-col gap-2 border-t border-relay-border pt-6 text-xs text-relay-muted sm:flex-row sm:items-center sm:justify-between">
-          <p>RELAY. © 2026 Relay Systems · Made for local machines</p>
-          <p>v0.1 · dec 2025</p>
+          <p>RELAY. © 2026 Relay</p>
+          <p>v0.1 · dec 2026</p>
         </div>
       </div>
     </footer>

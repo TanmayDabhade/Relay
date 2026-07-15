@@ -24,6 +24,12 @@ export function useDataChangedEvents() {
       // session it's for, so an open SessionDetailModal picks up a just-finished summary,
       // tags, or finalized cost without the user having to close and reopen it.
       queryClient.invalidateQueries({ queryKey: ["session-detail"] });
+      // set_current_plan (see auth.rs) emits this same event on every plan change, so a
+      // Reports view that previously errored on a free plan retries right after upgrading.
+      queryClient.invalidateQueries({ queryKey: ["report"] });
+      // Same plan-change event drives the "N hidden — upgrade" banners: after an upgrade the
+      // hidden counts drop to 0 and the banners disappear without a manual refresh.
+      queryClient.invalidateQueries({ queryKey: ["plan-gating"] });
     });
 
     return () => {

@@ -23,6 +23,7 @@ pub fn open(db_path: &Path) -> anyhow::Result<Connection> {
         M::up(include_str!("../../migrations/0002_file_diff_content.sql")),
         M::up(include_str!("../../migrations/0003_kanban.sql")),
         M::up(include_str!("../../migrations/0004_session_title.sql")),
+        M::up(include_str!("../../migrations/0005_plan.sql")),
     ]);
     migrations.to_latest(&mut conn)?;
 

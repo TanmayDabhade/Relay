@@ -1,3 +1,18 @@
+export interface PlanSnapshot {
+  email: string | null;
+  plan: "free" | "paid";
+}
+
+/** What the free-plan visibility caps are withholding, for the "N hidden — upgrade" banners.
+ * On a paid plan everything is unhidden (`is_paid: true`, `hidden_* === 0`). */
+export interface PlanGating {
+  is_paid: boolean;
+  visible_projects: number;
+  hidden_projects: number;
+  visible_sessions: number;
+  hidden_sessions: number;
+}
+
 export interface ProjectSummary {
   id: string;
   name: string;

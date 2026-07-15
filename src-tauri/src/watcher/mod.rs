@@ -179,6 +179,8 @@ fn source_for_path<'a>(
 }
 
 fn process_file(app_handle: &AppHandle, path: &Path, source: &AgentSource) {
+    let is_paid = crate::auth::is_paid(&app_handle.state::<crate::auth::PlanState>());
+
     let db = app_handle.state::<Db>();
     let conn = db.0.lock().unwrap();
 
@@ -202,7 +204,7 @@ fn process_file(app_handle: &AppHandle, path: &Path, source: &AgentSource) {
         let Some(record) = (source.parse_line)(&line, path) else {
             continue;
         };
-        match parser::ingest_record(&conn, &raw_log_path, record) {
+        match parser::ingest_record(&conn, &raw_log_path, record, is_paid) {
             Ok(outcome) => {
                 if outcome.project_touched.is_some()
                     || outcome.session_created.is_some()

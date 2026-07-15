@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { listProjects, listSessions } from "../lib/tauri";
+import { getPlanGating, listProjects, listSessions } from "../lib/tauri";
+import { UpgradeBanner } from "../components/UpgradeBanner";
 import { SessionDetailModal } from "./SessionDetailModal";
 import { SessionRow } from "./SessionRow";
 import type { ProjectSummary } from "../lib/types";
@@ -21,11 +22,20 @@ export function SessionsView() {
 
   const { data: projects } = useQuery({ queryKey: ["projects"], queryFn: listProjects });
 
+  const { data: gating } = useQuery({ queryKey: ["plan-gating"], queryFn: getPlanGating });
+  const hiddenSessions = gating && !gating.is_paid ? gating.hidden_sessions : 0;
+
   return (
     <div className="sessions-view">
       <div className="view-topbar">
         <h1 className="view-topbar-title">Sessions</h1>
       </div>
+
+      {hiddenSessions > 0 && (
+        <UpgradeBanner
+          message={`${hiddenSessions} ${hiddenSessions === 1 ? "session" : "sessions"} hidden on the free plan — upgrade to see ${hiddenSessions === 1 ? "it" : "them"}.`}
+        />
+      )}
 
       {isLoading && <p className="sessions-view-status">Loading sessions…</p>}
 

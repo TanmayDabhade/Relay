@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { listProjects } from "../lib/tauri";
+import { getPlanGating, listProjects } from "../lib/tauri";
+import { UpgradeBanner } from "../components/UpgradeBanner";
 import { ProjectCard } from "./ProjectCard";
 import { ProjectDetail } from "./ProjectDetail";
 import "./ProjectsView.css";
@@ -12,6 +13,8 @@ export function ProjectsView() {
     queryKey: ["projects"],
     queryFn: listProjects,
   });
+
+  const { data: gating } = useQuery({ queryKey: ["plan-gating"], queryFn: getPlanGating });
 
   if (isLoading) {
     return <p className="projects-view-status">Loading projects…</p>;
@@ -47,15 +50,24 @@ export function ProjectsView() {
     );
   }
 
+  const hiddenProjects = gating && !gating.is_paid ? gating.hidden_projects : 0;
+
   return (
-    <div className="projects-view-grid">
-      {data.map((project) => (
-        <ProjectCard
-          key={project.id}
-          project={project}
-          onClick={() => setSelectedProjectId(project.id)}
+    <>
+      {hiddenProjects > 0 && (
+        <UpgradeBanner
+          message={`${hiddenProjects} ${hiddenProjects === 1 ? "project" : "projects"} hidden on the free plan — upgrade to see ${hiddenProjects === 1 ? "it" : "them"}.`}
         />
-      ))}
-    </div>
+      )}
+      <div className="projects-view-grid">
+        {data.map((project) => (
+          <ProjectCard
+            key={project.id}
+            project={project}
+            onClick={() => setSelectedProjectId(project.id)}
+          />
+        ))}
+      </div>
+    </>
   );
 }

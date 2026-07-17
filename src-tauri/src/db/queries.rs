@@ -123,36 +123,6 @@ const SESSION_COLUMNS: &str = "id, project_id, agent, model, started_at, ended_a
      duration_seconds, summary, prompt_tokens, completion_tokens, cache_read_tokens,
      cache_creation_tokens, cost_usd, lines_added, lines_removed, tags, raw_log_path, title";
 
-/// The free-plan "visible set", as a reusable CTE prefix. `vp` = the first `?1` projects by
-/// creation order (among projects that actually have sessions); `vs` = the first `?2`
-/// sessions by ingest order (`rowid`) belonging to those projects — so every visible session
-/// always belongs to a visible project. This mirrors the ingest-time caps in
-/// `session_builder::ingest_record` ("keep the first N, block the rest") but applies them at
-/// read time so a user who accumulated data while paid, then downgraded, sees only what a
-/// free account would have tracked.
-///
-/// Callers pass `-1` for either limit to mean "no limit" (SQLite's `LIMIT -1`): that's how the
-/// paid plan reuses these exact same queries with zero gating — `vp`/`vs` then expand to every
-/// project/session, reproducing the pre-gating behavior byte-for-byte. `?1` = project limit,
-/// `?2` = session limit. See `commands::plan_limits`.
-const VISIBLE_SET_CTE: &str = "
-    WITH vp AS (
-        SELECT p.id
-        FROM projects p
-        JOIN sessions s ON s.project_id = p.id
-        GROUP BY p.id
-        HAVING COUNT(s.id) > 0
-        ORDER BY p.created_at ASC, p.rowid ASC
-        LIMIT ?1
-    ),
-    vs AS (
-        SELECT s.id
-        FROM sessions s
-        WHERE s.project_id IN (SELECT id FROM vp)
-        ORDER BY s.rowid ASC
-        LIMIT ?2
-    )";
-
 // --- Ingest (parser/watcher) side ---
 
 pub fn upsert_project(
@@ -170,19 +140,6 @@ pub fn upsert_project(
         params![id, name, path, timestamp],
     )?;
     Ok(())
-}
-
-/// Used by `session_builder::ingest_record` to check the free-tier project cap *before*
-/// upserting — an upsert alone can't distinguish "this would create a new project" from
-/// "this just refreshes an existing one."
-pub fn project_exists(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
-    conn.query_row("SELECT 1 FROM projects WHERE id = ?1", params![id], |_| Ok(()))
-        .optional()
-        .map(|r| r.is_some())
-}
-
-pub fn count_projects(conn: &Connection) -> rusqlite::Result<i64> {
-    conn.query_row("SELECT COUNT(*) FROM projects", [], |row| row.get(0))
 }
 
 /// Upserts a session with monotonic accumulation of token deltas — safe to
@@ -238,18 +195,6 @@ pub fn upsert_session(
     )?;
 
     Ok(!existed)
-}
-
-/// Used by `session_builder::ingest_record` to check the free-tier session cap before
-/// upserting — same rationale as `project_exists` above.
-pub fn session_exists(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
-    conn.query_row("SELECT 1 FROM sessions WHERE id = ?1", params![id], |_| Ok(()))
-        .optional()
-        .map(|r| r.is_some())
-}
-
-pub fn count_sessions(conn: &Connection) -> rusqlite::Result<i64> {
-    conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
 }
 
 pub fn insert_file_changed(
@@ -326,34 +271,22 @@ pub fn set_ingest_state(
 
 // --- Read side (frontend commands) ---
 
-/// Lists projects for display, restricted to the free-plan visible set (`VISIBLE_SET_CTE`).
-/// Pass `(-1, -1)` for the limits on a paid plan to list everything — see that const's doc.
-///
-/// A project row can exist for a directory Relay noticed but that never actually ran a session
-/// (e.g. a bare `.claude` dir with no activity yet); the `JOIN vp` excludes those, since `vp`
-/// only ever contains projects with at least one session — a directory with 0 sessions and $0
-/// spent isn't something the user should see listed. `session_count`/`total_cost_usd` sum over
-/// visible sessions only (the `AND s.id IN vs` on the join), so a free user's project cards and
-/// the Dashboard totals derived from them never count spend from hidden sessions.
-pub fn list_projects(
-    conn: &Connection,
-    project_limit: i64,
-    session_limit: i64,
-) -> rusqlite::Result<Vec<ProjectSummary>> {
-    let sql = format!(
-        "{VISIBLE_SET_CTE}
-         SELECT p.id, p.name, p.path, p.lang, p.stack, p.created_at, p.last_active,
+/// Lists projects for display. A project row can exist for a directory Relay noticed but that
+/// never actually ran a session (e.g. a bare `.claude` dir with no activity yet); the inner
+/// `JOIN sessions` excludes those — a directory with 0 sessions and $0 spent isn't something
+/// the user should see listed.
+pub fn list_projects(conn: &Connection) -> rusqlite::Result<Vec<ProjectSummary>> {
+    let sql = "SELECT p.id, p.name, p.path, p.lang, p.stack, p.created_at, p.last_active,
                 COUNT(s.id) as session_count,
                 COALESCE(SUM(s.cost_usd), 0.0) as total_cost_usd,
                 GROUP_CONCAT(DISTINCT s.agent) as agents
          FROM projects p
-         JOIN vp ON vp.id = p.id
-         LEFT JOIN sessions s ON s.project_id = p.id AND s.id IN (SELECT id FROM vs)
+         JOIN sessions s ON s.project_id = p.id
          GROUP BY p.id
-         ORDER BY p.last_active DESC"
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params![project_limit, session_limit], |row| {
+         HAVING COUNT(s.id) > 0
+         ORDER BY p.last_active DESC";
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map([], |row| {
         let agents: Option<String> = row.get(9)?;
         Ok(ProjectSummary {
             id: row.get(0)?,
@@ -373,60 +306,12 @@ pub fn list_projects(
     rows.collect()
 }
 
-/// Lists sessions for display, restricted to the free-plan visible set (`VISIBLE_SET_CTE`).
-/// Pass `(-1, -1)` for the limits on a paid plan to list everything.
-pub fn list_sessions(
-    conn: &Connection,
-    project_limit: i64,
-    session_limit: i64,
-) -> rusqlite::Result<Vec<Session>> {
-    let sql = format!(
-        "{VISIBLE_SET_CTE}
-         SELECT {SESSION_COLUMNS} FROM sessions
-         WHERE id IN (SELECT id FROM vs)
-         ORDER BY last_activity_at DESC"
-    );
+/// Lists every session for display, most-recently-active first.
+pub fn list_sessions(conn: &Connection) -> rusqlite::Result<Vec<Session>> {
+    let sql = format!("SELECT {SESSION_COLUMNS} FROM sessions ORDER BY last_activity_at DESC");
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params![project_limit, session_limit], row_to_session)?;
+    let rows = stmt.query_map([], row_to_session)?;
     rows.collect()
-}
-
-/// Visible-vs-total project/session counts backing the free-plan "N hidden — upgrade" banners.
-/// Uses the same `VISIBLE_SET_CTE` as the list queries, so `visible_*` is exactly what those
-/// return; `total_*` is the ungated universe (all displayable projects / all sessions), and the
-/// caller derives `hidden = total - visible`.
-pub struct PlanVisibilityCounts {
-    pub total_projects: i64,
-    pub visible_projects: i64,
-    pub total_sessions: i64,
-    pub visible_sessions: i64,
-}
-
-pub fn plan_visibility_counts(
-    conn: &Connection,
-    project_limit: i64,
-    session_limit: i64,
-) -> rusqlite::Result<PlanVisibilityCounts> {
-    let sql = format!(
-        "{VISIBLE_SET_CTE}
-         SELECT
-           (SELECT COUNT(*) FROM (
-               SELECT p.id FROM projects p
-               JOIN sessions s ON s.project_id = p.id
-               GROUP BY p.id HAVING COUNT(s.id) > 0
-           )) AS total_projects,
-           (SELECT COUNT(*) FROM vp) AS visible_projects,
-           (SELECT COUNT(*) FROM sessions) AS total_sessions,
-           (SELECT COUNT(*) FROM vs) AS visible_sessions"
-    );
-    conn.query_row(&sql, params![project_limit, session_limit], |row| {
-        Ok(PlanVisibilityCounts {
-            total_projects: row.get(0)?,
-            visible_projects: row.get(1)?,
-            total_sessions: row.get(2)?,
-            visible_sessions: row.get(3)?,
-        })
-    })
 }
 
 pub fn get_session_detail(
@@ -1804,9 +1689,8 @@ mod kanban_tests {
 }
 
 #[cfg(test)]
-mod plan_gating_tests {
+mod list_query_tests {
     use super::*;
-    use crate::auth::{FREE_PROJECT_LIMIT, FREE_SESSION_LIMIT};
     use std::collections::HashSet;
 
     fn in_memory_db() -> Connection {
@@ -1818,9 +1702,7 @@ mod plan_gating_tests {
         conn
     }
 
-    /// Insert a project (its `created_at` fixes its rank in the "earliest N" order) plus one
-    /// session per id in `session_ids`. Sessions are inserted in call order, so their `rowid`
-    /// — which `VISIBLE_SET_CTE` orders by — matches the order given across all `seed` calls.
+    /// Insert a project plus one session per id in `session_ids`.
     fn seed(conn: &Connection, project_id: &str, created_at: i64, session_ids: &[&str]) {
         upsert_project(conn, project_id, project_id, &format!("/{project_id}"), created_at).unwrap();
         for sid in session_ids {
@@ -1851,72 +1733,36 @@ mod plan_gating_tests {
     }
 
     #[test]
-    fn free_plan_shows_only_the_earliest_projects_and_their_sessions() {
+    fn lists_every_project_and_session() {
         let conn = in_memory_db();
         seed_five_projects(&conn);
 
-        let projects = list_projects(&conn, FREE_PROJECT_LIMIT, FREE_SESSION_LIMIT).unwrap();
+        let projects = list_projects(&conn).unwrap();
         assert_eq!(
             ids(&projects, |p| p.id.clone()),
-            set(&["p1", "p2", "p3"]),
-            "free plan shows the 3 earliest-created projects, not the newest"
+            set(&["p1", "p2", "p3", "p4", "p5"]),
         );
 
-        let sessions = list_sessions(&conn, FREE_PROJECT_LIMIT, FREE_SESSION_LIMIT).unwrap();
+        let sessions = list_sessions(&conn).unwrap();
         assert_eq!(
             ids(&sessions, |s| s.id.clone()),
-            set(&["s1", "s2", "s3", "s4", "s5", "s6"]),
-            "only sessions belonging to visible projects are shown (never an orphan)"
+            set(&["s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10"]),
         );
 
-        // Each visible project's card sums only its own visible sessions/cost.
+        // Each project's card sums its own sessions/cost.
         let p1 = projects.iter().find(|p| p.id == "p1").unwrap();
         assert_eq!(p1.session_count, 2);
         assert_eq!(p1.total_cost_usd, 2.0);
     }
 
     #[test]
-    fn paid_plan_sees_everything_reproducing_the_ungated_queries() {
+    fn a_project_with_no_sessions_is_not_listed() {
         let conn = in_memory_db();
-        seed_five_projects(&conn);
+        // A directory Relay noticed but that never ran a session.
+        upsert_project(&conn, "empty", "empty", "/empty", 1000).unwrap();
+        seed(&conn, "active", 2000, &["s1"]);
 
-        assert_eq!(list_projects(&conn, -1, -1).unwrap().len(), 5);
-        assert_eq!(list_sessions(&conn, -1, -1).unwrap().len(), 10);
-    }
-
-    #[test]
-    fn session_cap_keeps_the_earliest_ingested_sessions_of_visible_projects() {
-        let conn = in_memory_db();
-        seed_five_projects(&conn);
-
-        // 3 projects visible, but only the first 4 sessions (by ingest order) among them.
-        let sessions = list_sessions(&conn, 3, 4).unwrap();
-        assert_eq!(
-            ids(&sessions, |s| s.id.clone()),
-            set(&["s1", "s2", "s3", "s4"]),
-            "the session cap keeps the earliest-ingested sessions, dropping s5/s6"
-        );
-
-        // p3's sessions (s5,s6) fell outside the cap, so its card shows 0 visible sessions —
-        // the documented edge of an independent project cap vs. session cap.
-        let projects = list_projects(&conn, 3, 4).unwrap();
-        let p3 = projects.iter().find(|p| p.id == "p3").unwrap();
-        assert_eq!(p3.session_count, 0, "a visible project past the session cap shows 0 sessions");
-    }
-
-    #[test]
-    fn plan_visibility_counts_reports_totals_and_visible() {
-        let conn = in_memory_db();
-        seed_five_projects(&conn);
-
-        let free = plan_visibility_counts(&conn, FREE_PROJECT_LIMIT, FREE_SESSION_LIMIT).unwrap();
-        assert_eq!(free.total_projects, 5);
-        assert_eq!(free.visible_projects, 3);
-        assert_eq!(free.total_sessions, 10);
-        assert_eq!(free.visible_sessions, 6);
-
-        let paid = plan_visibility_counts(&conn, -1, -1).unwrap();
-        assert_eq!(paid.total_projects, paid.visible_projects);
-        assert_eq!(paid.total_sessions, paid.visible_sessions);
+        let projects = list_projects(&conn).unwrap();
+        assert_eq!(ids(&projects, |p| p.id.clone()), set(&["active"]));
     }
 }

@@ -40,11 +40,5 @@
       "debugApplicationIdSuffix": ".debug"
     }
   },
-  "plugins": {
-    "deep-link": {
-      "desktop": {
-        "schemes": ["relay"]
-      }
-    }
-  }
+  "plugins": {}
 }

@@ -6,34 +6,14 @@ import type {
   DashboardStats,
   FileDiff,
   GitInsights,
-  PlanGating,
-  PlanSnapshot,
   ProjectSummary,
   ReportData,
   Session,
   SessionDetail,
 } from "./types";
 
-/** Rust's cached copy of the signed-in user's plan — see `auth::PlanState`'s doc comment
- * for why the watcher/report commands check this instead of asking Supabase directly. */
-export function getCurrentPlan(): Promise<PlanSnapshot> {
-  return invoke("get_current_plan");
-}
-
-/** Pushes a freshly-fetched Supabase plan down to Rust: after sign-in, after sign-out
- * (email: null, plan: "free"), and whenever the frontend re-reads `profiles.plan`. */
-export function setCurrentPlan(email: string | null, plan: string): Promise<void> {
-  return invoke("set_current_plan", { email, plan });
-}
-
 export function listProjects(): Promise<ProjectSummary[]> {
   return invoke("list_projects");
-}
-
-/** How many projects/sessions the free-plan visibility caps are hiding — backs the
- * "N hidden — upgrade" banners on the Projects and Sessions views. */
-export function getPlanGating(): Promise<PlanGating> {
-  return invoke("plan_gating_status");
 }
 
 export function listSessions(): Promise<Session[]> {

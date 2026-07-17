@@ -1098,6 +1098,66 @@ pub fn create_card(
     })
 }
 
+/// How long a card stays eligible to adopt a freshly-spawned session after
+/// `commands::launch_or_attach_session` stamps it (see `adopt_pending_card_for_session`).
+/// Long enough to cover a cold `claude` boot writing its first log line, short enough that an
+/// unrelated session started minutes later in the same project won't get misattributed.
+const PENDING_LAUNCH_WINDOW_SECS: i64 = 120;
+
+/// Marks `card_id` as awaiting the session a just-launched terminal will create. The card's
+/// session id can't be known at launch time (Claude Code generates it), so the ingest path
+/// reconciles later via `adopt_pending_card_for_session`. Idempotent — re-stamping just
+/// refreshes the window.
+pub fn set_card_pending_launch(conn: &Connection, card_id: &str) -> rusqlite::Result<()> {
+    let now = chrono::Utc::now().timestamp();
+    conn.execute(
+        "UPDATE cards SET pending_launch_at = ?2 WHERE id = ?1",
+        params![card_id, now],
+    )?;
+    Ok(())
+}
+
+/// Reconciles a brand-new session against a card that spawned it. If `project_id` has an
+/// unlinked card stamped with a recent `pending_launch_at` (within `PENDING_LAUNCH_WINDOW_SECS`,
+/// most-recent stamp wins), links `session_id` into that card, clears the stamp, and syncs it
+/// to the `in_progress` column — then returns `true` so the caller skips auto-creating a
+/// duplicate. Returns `false` (leaving the normal `auto_create_card_for_session` path to run)
+/// when no eligible card exists. The card keeps its user-authored title; only the linkage
+/// changes. See `commands::launch_or_attach_session` for the launch-side stamp.
+pub fn adopt_pending_card_for_session(
+    conn: &Connection,
+    project_id: &str,
+    session_id: &str,
+) -> rusqlite::Result<bool> {
+    let cutoff = chrono::Utc::now().timestamp() - PENDING_LAUNCH_WINDOW_SECS;
+    let card_id: Option<String> = conn
+        .query_row(
+            "SELECT c.id
+             FROM cards c
+             JOIN boards b ON b.id = c.board_id
+             WHERE b.project_id = ?1
+               AND c.session_id IS NULL
+               AND c.pending_launch_at IS NOT NULL
+               AND c.pending_launch_at >= ?2
+             ORDER BY c.pending_launch_at DESC
+             LIMIT 1",
+            params![project_id, cutoff],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(card_id) = card_id else {
+        return Ok(false);
+    };
+
+    let now = chrono::Utc::now().timestamp();
+    conn.execute(
+        "UPDATE cards SET session_id = ?2, pending_launch_at = NULL, updated_at = ?3 WHERE id = ?1",
+        params![card_id, session_id, now],
+    )?;
+    sync_card_for_session(conn, session_id, "in_progress")?;
+    Ok(true)
+}
+
 /// A card whose `session_id` matches an ingested session, created the moment that session
 /// starts (see `session_builder::ingest_record`). No-ops if a card is already linked to this
 /// session (replay-safe, same spirit as `upsert_session`'s idempotent accumulation) or if the
@@ -1492,17 +1552,23 @@ mod kanban_tests {
         conn.execute_batch(include_str!("../../migrations/0002_file_diff_content.sql")).unwrap();
         conn.execute_batch(include_str!("../../migrations/0003_kanban.sql")).unwrap();
         conn.execute_batch(include_str!("../../migrations/0004_session_title.sql")).unwrap();
+        conn.execute_batch(include_str!("../../migrations/0005_plan.sql")).unwrap();
+        conn.execute_batch(include_str!("../../migrations/0006_card_pending_launch.sql")).unwrap();
         conn
     }
 
-    fn seed_project_and_session(conn: &Connection, project_id: &str, session_id: &str) {
-        upsert_project(conn, project_id, "fixture", "/fixture", 1000).unwrap();
+    fn seed_session_only(conn: &Connection, project_id: &str, session_id: &str) {
         conn.execute(
             "INSERT INTO sessions (id, project_id, agent, started_at, last_activity_at, status, raw_log_path)
              VALUES (?1, ?2, 'claude', 1000, 1000, 'active', '')",
             params![session_id, project_id],
         )
         .unwrap();
+    }
+
+    fn seed_project_and_session(conn: &Connection, project_id: &str, session_id: &str) {
+        upsert_project(conn, project_id, "fixture", "/fixture", 1000).unwrap();
+        seed_session_only(conn, project_id, session_id);
     }
 
     fn column_role_for_card(conn: &Connection, card_id: &str) -> Option<String> {
@@ -1611,6 +1677,62 @@ mod kanban_tests {
         link_session_to_card(&conn, &manual_card.id, "s1").unwrap();
 
         assert_eq!(column_role_for_card(&conn, &manual_card.id).as_deref(), Some("review"));
+    }
+
+    #[test]
+    fn adopt_pending_card_for_session_links_stamped_card_and_skips_auto_create() {
+        let conn = in_memory_db();
+        upsert_project(&conn, "p1", "fixture", "/fixture", 1000).unwrap();
+        let board_id = ensure_board_for_project(&conn, "p1").unwrap();
+        let in_progress_id: String = conn
+            .query_row("SELECT id FROM columns WHERE board_id = ?1 AND role = 'in_progress'", params![board_id], |r| r.get(0))
+            .unwrap();
+
+        // A user-authored planning card that was just used to spawn a terminal session.
+        let card = create_card(&conn, &board_id, &in_progress_id, "Fix the linkedin section", None).unwrap();
+        set_card_pending_launch(&conn, &card.id).unwrap();
+
+        // The session Claude Code creates then gets ingested.
+        seed_session_only(&conn, "p1", "s1");
+        let adopted = adopt_pending_card_for_session(&conn, "p1", "s1").unwrap();
+        assert!(adopted, "the stamped card should have adopted the new session");
+
+        // Exactly one card, still the user's card and title, now linked and with the stamp cleared.
+        let card_count: i64 = conn.query_row("SELECT COUNT(*) FROM cards", [], |r| r.get(0)).unwrap();
+        assert_eq!(card_count, 1, "no duplicate card should have been created");
+        let (title, session_id, pending): (String, Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT title, session_id, pending_launch_at FROM cards WHERE id = ?1",
+                params![card.id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(title, "Fix the linkedin section");
+        assert_eq!(session_id.as_deref(), Some("s1"));
+        assert_eq!(pending, None);
+    }
+
+    #[test]
+    fn adopt_pending_card_for_session_ignores_expired_stamp() {
+        let conn = in_memory_db();
+        upsert_project(&conn, "p1", "fixture", "/fixture", 1000).unwrap();
+        let board_id = ensure_board_for_project(&conn, "p1").unwrap();
+        let in_progress_id: String = conn
+            .query_row("SELECT id FROM columns WHERE board_id = ?1 AND role = 'in_progress'", params![board_id], |r| r.get(0))
+            .unwrap();
+        let card = create_card(&conn, &board_id, &in_progress_id, "Stale plan", None).unwrap();
+        // Stamp far outside the adoption window.
+        let stale = chrono::Utc::now().timestamp() - PENDING_LAUNCH_WINDOW_SECS - 60;
+        conn.execute("UPDATE cards SET pending_launch_at = ?2 WHERE id = ?1", params![card.id, stale]).unwrap();
+
+        seed_session_only(&conn, "p1", "s1");
+        let adopted = adopt_pending_card_for_session(&conn, "p1", "s1").unwrap();
+        assert!(!adopted, "an expired stamp must fall through to the auto-create path");
+        // Card is untouched (still unlinked) so the caller will auto-create as normal.
+        let session_id: Option<String> = conn
+            .query_row("SELECT session_id FROM cards WHERE id = ?1", params![card.id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(session_id, None);
     }
 
     #[test]

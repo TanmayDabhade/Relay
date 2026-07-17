@@ -1,5 +1,5 @@
 const COLUMNS = [
-  { title: "Product", links: ["Features", "Pricing", "Compare", "Security"] },
+  { title: "Product", links: ["Features", "Compare", "Security"] },
   { title: "CLIs", links: ["claude-code", "codex", "cursor-cli", "gemini-cli"] },
   { title: "Company", links: ["Manifesto", "Changelog", "Contact"] },
 ];

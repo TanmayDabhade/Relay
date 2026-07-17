@@ -716,6 +716,12 @@ pub fn launch_or_attach_session(db: State<'_, Db>, card_id: String) -> Result<St
             queries::most_recent_active_session_id_for_project(&conn, &context.project_id)
                 .map_err(|e| e.to_string())?;
 
+        // Stamp the card so the session Claude Code is about to create gets adopted into it by
+        // the ingest path (queries::adopt_pending_card_for_session), rather than spawning a
+        // duplicate auto-created card. Done here, before the lock is released and the terminal
+        // opens, so the stamp is durable well before the first log line lands.
+        queries::set_card_pending_launch(&conn, &card_id).map_err(|e| e.to_string())?;
+
         (context, resume_id)
     };
     let (context, resume_id) = prepared;

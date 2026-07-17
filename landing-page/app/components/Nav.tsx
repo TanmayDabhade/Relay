@@ -2,7 +2,6 @@ const LINKS = [
   { href: "#features", label: "Features" },
   { href: "#security", label: "Security" },
   { href: "#compare", label: "Compare" },
-  { href: "#pricing", label: "Pricing" },
 ];
 
 export function Nav() {

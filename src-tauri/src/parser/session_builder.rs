@@ -117,7 +117,12 @@ pub fn ingest_record(
         // later, from the raw log, by the idle-sweep's tag/summary passes) — the user can
         // rename it once they open the card.
         let board_id = queries::ensure_board_for_project(conn, &project_id)?;
-        queries::auto_create_card_for_session(conn, &board_id, &session_id, "New session")?;
+        // If the user spawned this session from a card (launch_or_attach_session stamped it),
+        // adopt it into that card instead of minting a duplicate. Falls back to auto-create
+        // when nothing is awaiting a launch in this project.
+        if !queries::adopt_pending_card_for_session(conn, &project_id, &session_id)? {
+            queries::auto_create_card_for_session(conn, &board_id, &session_id, "New session")?;
+        }
     } else {
         outcome.session_updated = Some(session_id.clone());
     }
@@ -257,6 +262,10 @@ mod tests {
         conn.execute_batch(include_str!("../../migrations/0003_kanban.sql"))
             .unwrap();
         conn.execute_batch(include_str!("../../migrations/0004_session_title.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../../migrations/0005_plan.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../../migrations/0006_card_pending_launch.sql"))
             .unwrap();
         conn
     }

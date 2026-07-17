@@ -1,14 +1,25 @@
--- Invoked as `osascript - <project_path> <resume_session_id_or_empty>` with this script
--- piped to stdin. Prompt text is expected to already be on the clipboard (see
--- terminal::attach_or_launch) — pasted with Cmd+V rather than typed character-by-character,
--- since Claude Code's interactive input submits on a bare Return, and `keystroke`ing a
--- multi-line prompt would submit it early at the first newline.
+-- Invoked as `osascript - <project_path> <resume_session_id_or_empty> <prompt_shell_arg>`
+-- with this script piped to stdin.
+--
+-- `prompt_shell_arg` is a ready-to-use shell token built by terminal::attach_or_launch
+-- (bash/zsh ANSI-C `$'...'` quoting, all newlines escaped to a literal `\n`), so it can be
+-- appended to the `claude` command on a single physical line — a bare newline in the text
+-- would otherwise be executed as a premature Return by `do script`. Empty means "no prompt".
+--
+-- Two delivery paths, because a prompt can only be passed as a CLI argument to a *fresh*
+-- `claude` process:
+--   * new / resumed window  -> `cd <path> && claude [--resume <id>] <prompt_arg>`, which
+--     seeds the interactive session with the prompt directly (no paste, no boot race).
+--   * already-running tab    -> the prompt is on the clipboard; pasted with Cmd+V, since we
+--     can't hand an argument to a process that's already up.
 --
 -- Returns one of: "attached_existing_tab" | "resumed_in_new_window" | "started_new_window".
 
 on run argv
 	set targetPath to item 1 of argv
 	set resumeId to item 2 of argv
+	set promptArg to ""
+	if (count of argv) ≥ 3 then set promptArg to item 3 of argv
 
 	set foundTab to my findClaudeTab(targetPath)
 	if foundTab is not missing value then
@@ -16,9 +27,7 @@ on run argv
 		return "attached_existing_tab"
 	end if
 
-	my openNewWindowAndRun(targetPath, resumeId)
-	delay 2
-	my pasteIntoFrontmost()
+	my openNewWindowAndRun(targetPath, resumeId, promptArg)
 
 	if resumeId is not "" then
 		return "resumed_in_new_window"
@@ -54,10 +63,13 @@ on findClaudeTab(targetPath)
 	return missing value
 end findClaudeTab
 
-on openNewWindowAndRun(targetPath, resumeId)
+on openNewWindowAndRun(targetPath, resumeId, promptArg)
 	set claudeCmd to "claude"
 	if resumeId is not "" then
 		set claudeCmd to "claude --resume " & quoted form of resumeId
+	end if
+	if promptArg is not "" then
+		set claudeCmd to claudeCmd & " " & promptArg
 	end if
 	set shellCmd to "cd " & quoted form of targetPath & " && " & claudeCmd
 

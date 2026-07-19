@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { Unbounded, JetBrains_Mono } from "next/font/google";
+import { Analytics } from "@vercel/analytics/next"
 import "./globals.css";
 
 const unbounded = Unbounded({
@@ -26,10 +27,12 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en" className={`${unbounded.variable} ${jetbrainsMono.variable}`}>
+        <html lang="en" className={`${unbounded.variable} ${jetbrainsMono.variable}`}>
       <body className="min-h-screen bg-relay-bg font-mono text-relay-text antialiased">
         {children}
+        <Analytics />
       </body>
     </html>
+    
   );
 }

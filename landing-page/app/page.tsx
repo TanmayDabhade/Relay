@@ -3,7 +3,6 @@ import { Hero } from "./components/Hero";
 import { Features } from "./components/Features";
 import { Manifesto } from "./components/Manifesto";
 import { Compare } from "./components/Compare";
-import { WaitlistCta } from "./components/WaitlistCta";
 import { Footer } from "./components/Footer";
 
 export default function Home() {
@@ -15,7 +14,6 @@ export default function Home() {
         <Features />
         <Manifesto />
         <Compare />
-        <WaitlistCta />
       </main>
       <Footer />
     </>

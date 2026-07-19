@@ -30,10 +30,10 @@ export function Hero() {
           </p>
           <div className="mt-8 flex flex-wrap items-center gap-6">
             <a
-              href="#waitlist"
+              href="https://github.com/TanmayDabhade/Relay/releases/download/Release/Relay_0.1.0_x64.dmg"
               className="border border-relay-primary bg-relay-primary px-6 py-3 text-sm font-bold text-relay-primary-contrast transition-opacity hover:opacity-90"
             >
-              $ Join Waitlist
+              ↓ Download for macOS
             </a>
             <ul className="flex flex-wrap gap-x-5 gap-y-2 text-xs text-relay-muted">
               {TAGS.map((t) => (

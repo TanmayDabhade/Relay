@@ -30,10 +30,10 @@ export function Nav() {
             Sign in
           </a>
           <a
-            href="#waitlist"
+            href="https://github.com/TanmayDabhade/Relay/releases/download/Release/Relay_0.1.0_x64.dmg"
             className="border border-relay-primary px-4 py-2 text-sm font-medium text-relay-primary transition-colors hover:bg-relay-primary hover:text-relay-primary-contrast"
           >
-            Join Waitlist →
+            Download for macOS →
           </a>
         </div>
       </div>

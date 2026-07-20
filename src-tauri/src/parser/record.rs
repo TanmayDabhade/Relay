@@ -7,7 +7,15 @@ pub struct Usage {
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cache_read_input_tokens: i64,
+    /// Total cache-creation tokens (the aggregate `cache_creation_input_tokens` field). Kept as
+    /// the total, not the 5-minute portion, so the sessions table's display column stays a sum.
     pub cache_creation_input_tokens: i64,
+    /// The 1-hour-TTL portion of `cache_creation_input_tokens`, from the usage object's nested
+    /// `cache_creation.ephemeral_1h_input_tokens` breakdown when the log provides it; `0`
+    /// otherwise (older logs, or agents whose format has no breakdown — then all cache creation
+    /// is billed at the 5-minute rate, which is what the aggregate-only path did before). The
+    /// 5-minute portion is derived as `cache_creation_input_tokens - cache_creation_1h_input_tokens`.
+    pub cache_creation_1h_input_tokens: i64,
 }
 
 #[derive(Debug, Clone)]

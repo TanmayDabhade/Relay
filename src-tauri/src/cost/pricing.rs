@@ -21,6 +21,7 @@ const FALLBACK_DEFAULT_RATES: Rates = Rates {
     input: 3.0,
     output: 15.0,
     cache_write: 3.75,
+    cache_write_1h: 6.0,
     cache_read: 0.3,
 };
 
@@ -28,6 +29,7 @@ const ZERO_RATES: Rates = Rates {
     input: 0.0,
     output: 0.0,
     cache_write: 0.0,
+    cache_write_1h: 0.0,
     cache_read: 0.0,
 };
 
@@ -35,7 +37,17 @@ const ZERO_RATES: Rates = Rates {
 struct Rates {
     input: f64,
     output: f64,
+    /// 5-minute (default) cache-write rate. Anthropic bills cache creation at 1.25x input
+    /// for the 5m TTL and 2x input for the 1h TTL — the two are separate token buckets in
+    /// the usage object, so they need separate rates here.
     cache_write: f64,
+    /// 1-hour cache-write rate. `#[serde(default)]` (→ 0.0) tolerates a pre-schema-v2 entry
+    /// that omits it; every entry in the bundled schema-v2 table sets it explicitly, so 0.0
+    /// only ever applies if someone hand-adds a partial entry — and 1h cache is rare enough
+    /// that treating an unspecified rate as free is an acceptable degradation, not a silent
+    /// mispricing of normal traffic.
+    #[serde(default)]
+    cache_write_1h: f64,
     cache_read: f64,
 }
 
@@ -127,15 +139,28 @@ pub fn haiku_model_id() -> Option<&'static str> {
         .map(|k| k.as_str())
 }
 
-/// Computes the USD cost of a set of accumulated token totals for a session using the
+/// Computes the USD cost of a set of accumulated token totals for a *single model* using the
 /// bundled pricing table. `model: None` (no model seen yet) resolves to `_default` without
 /// treating that as an error case. Never panics.
+///
+/// Cache creation is split into 5-minute and 1-hour buckets because Anthropic prices them
+/// differently (1.25x vs 2x input). A caller that can't distinguish the two (a log format
+/// without the `cache_creation.ephemeral_1h_input_tokens` breakdown) passes the whole amount
+/// as `cache_creation_5m_tokens` and `0` for 1h — matching how the API reports cache creation
+/// when only the aggregate is available.
+///
+/// A session that used more than one model bills each model's tokens at its own rate, so the
+/// per-session total is the sum of `cost_usd` over that session's per-model token buckets (see
+/// `db::queries::session_model_usage`). Applying one model's rate to a whole mixed session — the
+/// old behavior — over- or under-counted whenever a sub-agent or `/model` switch changed models
+/// mid-session.
 pub fn cost_usd(
     model: Option<&str>,
     prompt_tokens: i64,
     completion_tokens: i64,
     cache_read_tokens: i64,
-    cache_creation_tokens: i64,
+    cache_creation_5m_tokens: i64,
+    cache_creation_1h_tokens: i64,
 ) -> f64 {
     let rates = match model {
         None => *default_rates(),
@@ -144,7 +169,8 @@ pub fn cost_usd(
 
     (prompt_tokens as f64 / 1e6) * rates.input
         + (completion_tokens as f64 / 1e6) * rates.output
-        + (cache_creation_tokens as f64 / 1e6) * rates.cache_write
+        + (cache_creation_5m_tokens as f64 / 1e6) * rates.cache_write
+        + (cache_creation_1h_tokens as f64 / 1e6) * rates.cache_write_1h
         + (cache_read_tokens as f64 / 1e6) * rates.cache_read
 }
 
@@ -154,15 +180,15 @@ mod tests {
 
     #[test]
     fn exact_match_uses_the_named_models_rates() {
-        // claude-opus-4-8: input 15.0, output 75.0, cache_write 18.75, cache_read 1.5
+        // claude-opus-4-8: input 5.0, output 25.0, cache_write 6.25, cache_read 0.5
         // (per resources/pricing.json), against the known fixture token totals from
         // session_builder.rs's ingesting_fixture_accumulates_token_totals_and_model_on_the_session
-        // test: 148 input / 700 output / 21800 cache_read / 290 cache_creation.
-        let cost = cost_usd(Some("claude-opus-4-8"), 148, 700, 21800, 290);
-        let expected = (148.0 / 1e6) * 15.0
-            + (700.0 / 1e6) * 75.0
-            + (290.0 / 1e6) * 18.75
-            + (21800.0 / 1e6) * 1.5;
+        // test: 148 input / 700 output / 21800 cache_read / 290 cache_creation (all 5m).
+        let cost = cost_usd(Some("claude-opus-4-8"), 148, 700, 21800, 290, 0);
+        let expected = (148.0 / 1e6) * 5.0
+            + (700.0 / 1e6) * 25.0
+            + (290.0 / 1e6) * 6.25
+            + (21800.0 / 1e6) * 0.5;
         assert!(
             (cost - expected).abs() < 1e-9,
             "expected {expected}, got {cost}"
@@ -170,9 +196,21 @@ mod tests {
     }
 
     #[test]
+    fn one_hour_cache_writes_bill_at_the_higher_rate() {
+        // 1h cache creation is priced at cache_write_1h (opus 4.8: 10.0), 5m at cache_write
+        // (6.25). Splitting the same 1000 cache-creation tokens between the two buckets must
+        // change the cost — proving the 1h rate is actually applied, not folded into 5m.
+        let five_min = cost_usd(Some("claude-opus-4-8"), 0, 0, 0, 1_000, 0);
+        let one_hour = cost_usd(Some("claude-opus-4-8"), 0, 0, 0, 0, 1_000);
+        assert!((five_min - (1_000.0 / 1e6) * 6.25).abs() < 1e-9);
+        assert!((one_hour - (1_000.0 / 1e6) * 10.0).abs() < 1e-9);
+        assert!(one_hour > five_min);
+    }
+
+    #[test]
     fn longest_prefix_match_resolves_a_dated_suffix_to_the_known_family_rate() {
-        let dated = cost_usd(Some("claude-opus-4-8-20260115"), 148, 700, 21800, 290);
-        let exact = cost_usd(Some("claude-opus-4-8"), 148, 700, 21800, 290);
+        let dated = cost_usd(Some("claude-opus-4-8-20260115"), 148, 700, 21800, 290, 0);
+        let exact = cost_usd(Some("claude-opus-4-8"), 148, 700, 21800, 290, 0);
         assert_eq!(dated, exact);
     }
 
@@ -180,27 +218,34 @@ mod tests {
     fn sentinel_model_is_non_billable_not_default() {
         // `<synthetic>` is a real sentinel value seen in Claude Code logs - must resolve to
         // exactly 0.0, not silently fall through to _default rates.
-        let cost = cost_usd(Some("<synthetic>"), 1_000_000, 1_000_000, 1_000_000, 1_000_000);
+        let cost = cost_usd(
+            Some("<synthetic>"),
+            1_000_000,
+            1_000_000,
+            1_000_000,
+            1_000_000,
+            1_000_000,
+        );
         assert_eq!(cost, 0.0);
     }
 
     #[test]
     fn unrecognized_model_string_falls_back_to_default_rates() {
-        let cost = cost_usd(Some("some-totally-unknown-future-model"), 1_000_000, 0, 0, 0);
+        let cost = cost_usd(Some("some-totally-unknown-future-model"), 1_000_000, 0, 0, 0, 0);
         // _default input rate is 3.0 per resources/pricing.json.
         assert_eq!(cost, 3.0);
     }
 
     #[test]
     fn none_model_resolves_to_default_without_panicking() {
-        let cost = cost_usd(None, 1_000_000, 0, 0, 0);
+        let cost = cost_usd(None, 1_000_000, 0, 0, 0, 0);
         assert_eq!(cost, 3.0);
     }
 
     #[test]
     fn zero_tokens_yields_zero_cost_regardless_of_model() {
-        assert_eq!(cost_usd(Some("claude-opus-4-8"), 0, 0, 0, 0), 0.0);
-        assert_eq!(cost_usd(None, 0, 0, 0, 0), 0.0);
+        assert_eq!(cost_usd(Some("claude-opus-4-8"), 0, 0, 0, 0, 0), 0.0);
+        assert_eq!(cost_usd(None, 0, 0, 0, 0, 0), 0.0);
     }
 
     #[test]

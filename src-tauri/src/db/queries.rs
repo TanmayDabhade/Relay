@@ -64,7 +64,13 @@ pub struct TokenDelta {
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
     pub cache_read_tokens: i64,
+    /// Total cache-creation tokens for this delta (5m + 1h). Accumulated onto the sessions
+    /// row's display column as-is.
     pub cache_creation_tokens: i64,
+    /// The 1-hour-TTL portion of `cache_creation_tokens`. The 5-minute portion is the
+    /// remainder. Split apart when writing the per-model usage row so each TTL bills at its
+    /// own rate (see `upsert_model_usage`).
+    pub cache_creation_1h_tokens: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -84,14 +90,43 @@ pub struct AgentUsage {
     pub total_cost_usd: f64,
 }
 
-/// For recomputing cost_usd against the current pricing table without re-parsing logs.
-pub struct SessionTokenTotals {
-    pub id: String,
+/// One (model, cache-TTL) token bucket for a session — a row of `session_model_usage`. Cost is
+/// `SUM` of `pricing::cost_usd` over a session's buckets, so a session that spanned several
+/// models bills each model's tokens at its own rate. `model` is `None` for the empty-string
+/// bucket (records seen before any model was known → priced at the `_default` rate).
+pub struct ModelUsage {
     pub model: Option<String>,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
     pub cache_read_tokens: i64,
-    pub cache_creation_tokens: i64,
+    pub cache_creation_5m_tokens: i64,
+    pub cache_creation_1h_tokens: i64,
+}
+
+impl ModelUsage {
+    fn from_row(row: &Row) -> rusqlite::Result<ModelUsage> {
+        let model: String = row.get(0)?;
+        Ok(ModelUsage {
+            model: if model.is_empty() { None } else { Some(model) },
+            prompt_tokens: row.get(1)?,
+            completion_tokens: row.get(2)?,
+            cache_read_tokens: row.get(3)?,
+            cache_creation_5m_tokens: row.get(4)?,
+            cache_creation_1h_tokens: row.get(5)?,
+        })
+    }
+
+    /// USD cost of this single bucket at the current pricing table.
+    fn cost_usd(&self) -> f64 {
+        crate::cost::pricing::cost_usd(
+            self.model.as_deref(),
+            self.prompt_tokens,
+            self.completion_tokens,
+            self.cache_read_tokens,
+            self.cache_creation_5m_tokens,
+            self.cache_creation_1h_tokens,
+        )
+    }
 }
 
 fn row_to_session(row: &Row) -> rusqlite::Result<Session> {
@@ -195,6 +230,44 @@ pub fn upsert_session(
     )?;
 
     Ok(!existed)
+}
+
+/// Accumulates a token delta into the per-(session, model) bucket, splitting cache creation
+/// into 5-minute and 1-hour TTLs. `model = None` lands in the empty-string bucket (priced at
+/// `_default`). Mirrors `upsert_session`'s monotonic accumulation so it's replay-safe if a log
+/// is ever re-scanned from offset 0. The 5-minute portion is `cache_creation_tokens` minus the
+/// 1-hour portion.
+pub fn upsert_model_usage(
+    conn: &Connection,
+    session_id: &str,
+    model: Option<&str>,
+    delta: &TokenDelta,
+) -> rusqlite::Result<()> {
+    let model_key = model.unwrap_or("");
+    let cache_5m = delta.cache_creation_tokens - delta.cache_creation_1h_tokens;
+    conn.execute(
+        "INSERT INTO session_model_usage (
+            session_id, model, prompt_tokens, completion_tokens,
+            cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens
+         )
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(session_id, model) DO UPDATE SET
+            prompt_tokens = prompt_tokens + excluded.prompt_tokens,
+            completion_tokens = completion_tokens + excluded.completion_tokens,
+            cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
+            cache_creation_5m_tokens = cache_creation_5m_tokens + excluded.cache_creation_5m_tokens,
+            cache_creation_1h_tokens = cache_creation_1h_tokens + excluded.cache_creation_1h_tokens",
+        params![
+            session_id,
+            model_key,
+            delta.prompt_tokens,
+            delta.completion_tokens,
+            delta.cache_read_tokens,
+            cache_5m,
+            delta.cache_creation_1h_tokens,
+        ],
+    )?;
+    Ok(())
 }
 
 pub fn insert_file_changed(
@@ -503,47 +576,168 @@ pub fn update_cost(conn: &Connection, session_id: &str, cost_usd: f64) -> rusqli
     Ok(())
 }
 
-/// Single-session variant of `all_session_token_totals`, used right after `upsert_session` to
-/// read back the now-updated accumulated totals for cost recomputation (see
-/// `session_builder::ingest_record`) without re-parsing logs.
-pub fn session_token_totals(
-    conn: &Connection,
-    session_id: &str,
-) -> rusqlite::Result<Option<SessionTokenTotals>> {
-    conn.query_row(
-        "SELECT id, model, prompt_tokens, completion_tokens, cache_read_tokens, cache_creation_tokens
-         FROM sessions WHERE id = ?1",
-        params![session_id],
-        |row| {
-            Ok(SessionTokenTotals {
-                id: row.get(0)?,
-                model: row.get(1)?,
-                prompt_tokens: row.get(2)?,
-                completion_tokens: row.get(3)?,
-                cache_read_tokens: row.get(4)?,
-                cache_creation_tokens: row.get(5)?,
-            })
-        },
-    )
-    .optional()
+/// Cost of one session at the current pricing table: the sum of `cost_usd` over its per-model
+/// buckets. Used right after `upsert_session`/`upsert_model_usage` to recompute the session's
+/// `cost_usd` (see `session_builder::ingest_record`) without re-parsing logs. A session with no
+/// usage rows yet costs `0.0`.
+pub fn session_cost(conn: &Connection, session_id: &str) -> rusqlite::Result<f64> {
+    let mut stmt = conn.prepare(
+        "SELECT model, prompt_tokens, completion_tokens, cache_read_tokens,
+                cache_creation_5m_tokens, cache_creation_1h_tokens
+         FROM session_model_usage WHERE session_id = ?1",
+    )?;
+    let rows = stmt.query_map(params![session_id], ModelUsage::from_row)?;
+    let mut total = 0.0;
+    for row in rows {
+        total += row?.cost_usd();
+    }
+    Ok(total)
 }
 
-pub fn all_session_token_totals(conn: &Connection) -> rusqlite::Result<Vec<SessionTokenTotals>> {
+/// Per-session cost for every session, keyed by session id — the startup backfill's input.
+/// Reads all `session_model_usage` rows in one query (cheap) and sums each session's buckets
+/// in memory, so cost is a pure function of stored tokens × the current pricing table. This is
+/// what makes a pricing.json edit retroactively correct historical cost without re-parsing.
+pub fn all_session_costs(conn: &Connection) -> rusqlite::Result<HashMap<String, f64>> {
     let mut stmt = conn.prepare(
-        "SELECT id, model, prompt_tokens, completion_tokens, cache_read_tokens, cache_creation_tokens
-         FROM sessions",
+        "SELECT session_id, model, prompt_tokens, completion_tokens, cache_read_tokens,
+                cache_creation_5m_tokens, cache_creation_1h_tokens
+         FROM session_model_usage",
     )?;
     let rows = stmt.query_map([], |row| {
-        Ok(SessionTokenTotals {
-            id: row.get(0)?,
-            model: row.get(1)?,
+        let session_id: String = row.get(0)?;
+        // Shift indices by one: from_row expects model at column 0.
+        let usage = ModelUsage {
+            model: {
+                let m: String = row.get(1)?;
+                if m.is_empty() { None } else { Some(m) }
+            },
             prompt_tokens: row.get(2)?,
             completion_tokens: row.get(3)?,
             cache_read_tokens: row.get(4)?,
-            cache_creation_tokens: row.get(5)?,
-        })
+            cache_creation_5m_tokens: row.get(5)?,
+            cache_creation_1h_tokens: row.get(6)?,
+        };
+        Ok((session_id, usage))
     })?;
-    rows.collect()
+
+    let mut costs: HashMap<String, f64> = HashMap::new();
+    for row in rows {
+        let (session_id, usage) = row?;
+        *costs.entry(session_id).or_insert(0.0) += usage.cost_usd();
+    }
+    Ok(costs)
+}
+
+#[cfg(test)]
+mod cost_tests {
+    use super::*;
+
+    fn in_memory_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        for sql in [
+            include_str!("../../migrations/0001_init.sql"),
+            include_str!("../../migrations/0007_session_model_usage.sql"),
+        ] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn
+    }
+
+    fn seed_session(conn: &Connection, id: &str) {
+        // 0001_init.sql enables `PRAGMA foreign_keys = ON`, so the parent project must exist.
+        upsert_project(conn, "p1", "p1", "/tmp/p1", 0).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, project_id, agent, started_at, last_activity_at, status, raw_log_path)
+             VALUES (?1, 'p1', 'claude', 0, 0, 'active', '/tmp/x.jsonl')",
+            params![id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn mixed_model_session_bills_each_model_at_its_own_rate() {
+        let conn = in_memory_db();
+        seed_session(&conn, "s1");
+
+        // 1M input tokens on Opus (input 5.0) + 1M input tokens on Haiku (input 1.0).
+        // A single-model cost would have priced all 2M at whichever model was recorded last;
+        // summing per-model buckets must give exactly 5.0 + 1.0 = 6.0.
+        upsert_model_usage(
+            &conn,
+            "s1",
+            Some("claude-opus-4-8"),
+            &TokenDelta { prompt_tokens: 1_000_000, ..Default::default() },
+        )
+        .unwrap();
+        upsert_model_usage(
+            &conn,
+            "s1",
+            Some("claude-haiku-4-5-20251001"),
+            &TokenDelta { prompt_tokens: 1_000_000, ..Default::default() },
+        )
+        .unwrap();
+
+        let cost = session_cost(&conn, "s1").unwrap();
+        assert!((cost - 6.0).abs() < 1e-9, "expected 6.0, got {cost}");
+        assert!((all_session_costs(&conn).unwrap()["s1"] - 6.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn same_model_across_records_accumulates_into_one_bucket() {
+        let conn = in_memory_db();
+        seed_session(&conn, "s1");
+
+        // Two deltas for the same model must fold into one bucket (monotonic accumulation),
+        // not create a second row — 2M Opus input tokens = 10.0.
+        for _ in 0..2 {
+            upsert_model_usage(
+                &conn,
+                "s1",
+                Some("claude-opus-4-8"),
+                &TokenDelta { prompt_tokens: 1_000_000, ..Default::default() },
+            )
+            .unwrap();
+        }
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_model_usage WHERE session_id = 's1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1, "same model must reuse one bucket");
+        assert!((session_cost(&conn, "s1").unwrap() - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn one_hour_cache_split_is_recorded_and_priced_higher_than_all_5m() {
+        let conn = in_memory_db();
+        seed_session(&conn, "s1");
+        seed_session(&conn, "s2");
+
+        // s1: 1000 cache-creation tokens, all 5m. s2: same 1000 total, all 1h.
+        upsert_model_usage(
+            &conn,
+            "s1",
+            Some("claude-opus-4-8"),
+            &TokenDelta { cache_creation_tokens: 1_000, cache_creation_1h_tokens: 0, ..Default::default() },
+        )
+        .unwrap();
+        upsert_model_usage(
+            &conn,
+            "s2",
+            Some("claude-opus-4-8"),
+            &TokenDelta { cache_creation_tokens: 1_000, cache_creation_1h_tokens: 1_000, ..Default::default() },
+        )
+        .unwrap();
+
+        let costs = all_session_costs(&conn).unwrap();
+        assert!(costs["s2"] > costs["s1"], "1h cache must cost more than 5m");
+        // opus cache_write 6.25 vs cache_write_1h 10.0 per million.
+        assert!((costs["s1"] - (1_000.0 / 1e6) * 6.25).abs() < 1e-9);
+        assert!((costs["s2"] - (1_000.0 / 1e6) * 10.0).abs() < 1e-9);
+    }
 }
 
 // --- Dashboard (spend + activity summary) ---

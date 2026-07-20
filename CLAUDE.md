@@ -58,7 +58,7 @@ A tokio interval (every `SWEEP_INTERVAL_SECS`) finalizes sessions idle longer th
 
 ### Cost tracking
 
-`src-tauri/src/cost/pricing.rs` computes `cost_usd` from token counts (prompt/completion/cache-read/cache-write) against a bundled `src-tauri/resources/pricing.json` lookup table, keyed by model name. Costs are recomputed once at every startup (`backfill_session_costs`) so pricing-table updates retroactively correct historical sessions, and recomputed live as a session's token counts grow.
+`src-tauri/src/cost/pricing.rs` computes `cost_usd` from token counts against a bundled `src-tauri/resources/pricing.json` lookup table, keyed by model name. Tokens are accumulated per `(session, model, cache-TTL)` in the `session_model_usage` table (migration `0007`), and a session's cost is the SUM of `pricing::cost_usd` over those buckets — so a session that spanned more than one model (a sub-agent on a cheaper model, or a mid-session `/model` switch) bills each model's tokens at its own rate, and 1-hour cache writes bill at their higher rate (`cache_write_1h`) than 5-minute ones. The `sessions` table keeps aggregate token columns for display; `session_model_usage` is consulted only for costing. Costs are recomputed once at every startup (`backfill_session_costs`, via `queries::all_session_costs`) so pricing-table updates retroactively correct historical sessions, and recomputed live (`queries::session_cost`) as a session's token counts grow.
 
 ### Tag classification & AI summaries
 

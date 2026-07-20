@@ -191,6 +191,7 @@ fn extract_token_usage(payload: &Value) -> Option<Usage> {
             .and_then(Value::as_i64)
             .unwrap_or(0),
         cache_creation_input_tokens: 0,
+        cache_creation_1h_input_tokens: 0,
     })
 }
 

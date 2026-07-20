@@ -84,29 +84,24 @@ pub fn run() {
     .expect("error while running tauri application");
 }
 
-/// Recomputes cost_usd for every session from its currently-stored token totals against the
-/// bundled pricing table. Runs once at startup, synchronously, before the DB is handed off as
-/// managed state — cheap enough at this scale that an equality check before writing isn't
-/// worth the complexity.
+/// Recomputes cost_usd for every session from its currently-stored per-model token buckets
+/// (`session_model_usage`) against the bundled pricing table — so a pricing.json edit (e.g. a
+/// corrected model rate) retroactively fixes historical cost, and each session bills every
+/// model it used at that model's own rate. Runs once at startup, synchronously, before the DB
+/// is handed off as managed state — cheap enough at this scale that an equality check before
+/// writing isn't worth the complexity.
 fn backfill_session_costs(conn: &rusqlite::Connection) {
-  let totals = match db::queries::all_session_token_totals(conn) {
-    Ok(totals) => totals,
+  let costs = match db::queries::all_session_costs(conn) {
+    Ok(costs) => costs,
     Err(e) => {
-      log::warn!("failed to load session token totals for cost backfill: {e:#}");
+      log::warn!("failed to load per-model usage for cost backfill: {e:#}");
       return;
     }
   };
 
-  for t in totals {
-    let cost = cost::pricing::cost_usd(
-      t.model.as_deref(),
-      t.prompt_tokens,
-      t.completion_tokens,
-      t.cache_read_tokens,
-      t.cache_creation_tokens,
-    );
-    if let Err(e) = db::queries::update_cost(conn, &t.id, cost) {
-      log::warn!("failed to backfill cost for session {}: {e:#}", t.id);
+  for (session_id, cost) in costs {
+    if let Err(e) = db::queries::update_cost(conn, &session_id, cost) {
+      log::warn!("failed to backfill cost for session {session_id}: {e:#}");
     }
   }
 }

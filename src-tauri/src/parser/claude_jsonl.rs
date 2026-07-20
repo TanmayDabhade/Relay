@@ -87,6 +87,14 @@ pub fn parse_line(line: &str) -> Option<ParsedRecord> {
             .get("cache_creation_input_tokens")
             .and_then(Value::as_i64)
             .unwrap_or(0),
+        // Newer usage objects break cache creation out by TTL under a nested `cache_creation`
+        // object; older ones only have the aggregate above. Absent → 0 (all cache creation
+        // billed at the 5m rate), which matches the pre-breakdown behavior.
+        cache_creation_1h_input_tokens: u
+            .get("cache_creation")
+            .and_then(|c| c.get("ephemeral_1h_input_tokens"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0),
     });
 
     let content = message.and_then(|m| m.get("content"));

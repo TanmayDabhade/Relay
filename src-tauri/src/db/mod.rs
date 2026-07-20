@@ -25,6 +25,7 @@ pub fn open(db_path: &Path) -> anyhow::Result<Connection> {
         M::up(include_str!("../../migrations/0004_session_title.sql")),
         M::up(include_str!("../../migrations/0005_plan.sql")),
         M::up(include_str!("../../migrations/0006_card_pending_launch.sql")),
+        M::up(include_str!("../../migrations/0007_session_model_usage.sql")),
     ]);
     migrations.to_latest(&mut conn)?;
 

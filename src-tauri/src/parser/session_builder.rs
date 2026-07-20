@@ -1,5 +1,4 @@
 use super::record::{ParsedRecord, ToolUse};
-use crate::cost::pricing;
 use crate::db::queries::{self, TokenDelta};
 use rusqlite::Connection;
 use std::collections::hash_map::DefaultHasher;
@@ -69,6 +68,7 @@ pub fn ingest_record(
             completion_tokens: u.output_tokens,
             cache_read_tokens: u.cache_read_input_tokens,
             cache_creation_tokens: u.cache_creation_input_tokens,
+            cache_creation_1h_tokens: u.cache_creation_1h_input_tokens,
         })
         .unwrap_or_default();
 
@@ -82,6 +82,14 @@ pub fn ingest_record(
         raw_log_path,
         &delta,
     )?;
+
+    // Record the same delta against this record's own model (not the session's last-seen
+    // model) so a mixed-model session bills each model at its own rate. Only records that
+    // actually carried usage contribute a bucket — a system/metadata record with no usage
+    // must not create an empty row.
+    if record.usage.is_some() {
+        queries::upsert_model_usage(conn, &session_id, record.model.as_deref(), &delta)?;
+    }
 
     if created {
         outcome.session_created = Some(session_id.clone());
@@ -102,19 +110,11 @@ pub fn ingest_record(
         outcome.session_updated = Some(session_id.clone());
     }
 
-    // Recompute cost_usd from the now-updated accumulated totals (not the delta just applied)
-    // so this stays consistent with `all_session_token_totals` + `update_cost`'s use for
-    // recomputing every session's cost after a pricing-table edit, without re-parsing logs.
-    if let Some(totals) = queries::session_token_totals(conn, &session_id)? {
-        let cost = pricing::cost_usd(
-            totals.model.as_deref(),
-            totals.prompt_tokens,
-            totals.completion_tokens,
-            totals.cache_read_tokens,
-            totals.cache_creation_tokens,
-        );
-        queries::update_cost(conn, &session_id, cost)?;
-    }
+    // Recompute cost_usd from the now-updated per-model usage buckets (not the delta just
+    // applied) so this stays consistent with the startup backfill's use of the same buckets to
+    // recompute every session's cost after a pricing-table edit, without re-parsing logs.
+    let cost = queries::session_cost(conn, &session_id)?;
+    queries::update_cost(conn, &session_id, cost)?;
 
     for tool_use in &record.tool_uses {
         ingest_tool_use(conn, &session_id, timestamp, tool_use)?;
@@ -241,6 +241,8 @@ mod tests {
         conn.execute_batch(include_str!("../../migrations/0005_plan.sql"))
             .unwrap();
         conn.execute_batch(include_str!("../../migrations/0006_card_pending_launch.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../../migrations/0007_session_model_usage.sql"))
             .unwrap();
         conn
     }
@@ -400,14 +402,15 @@ mod tests {
             .query_row("SELECT cost_usd FROM sessions", [], |r| r.get(0))
             .unwrap();
 
-        // claude-opus-4-8 rates from resources/pricing.json: input 15.0, output 75.0,
-        // cache_write 18.75, cache_read 1.5 (USD per million tokens). Fixture token totals
+        // claude-opus-4-8 rates from resources/pricing.json: input 5.0, output 25.0,
+        // cache_write 6.25, cache_read 0.5 (USD per million tokens). Fixture token totals
         // (asserted in ingesting_fixture_accumulates_token_totals_and_model_on_the_session):
-        // 148 input / 700 output / 21800 cache_read / 290 cache_creation.
-        let expected = (148.0 / 1e6) * 15.0
-            + (700.0 / 1e6) * 75.0
-            + (290.0 / 1e6) * 18.75
-            + (21800.0 / 1e6) * 1.5;
+        // 148 input / 700 output / 21800 cache_read / 290 cache_creation (all 5-minute — the
+        // fixture has no ephemeral_1h_input_tokens breakdown).
+        let expected = (148.0 / 1e6) * 5.0
+            + (700.0 / 1e6) * 25.0
+            + (290.0 / 1e6) * 6.25
+            + (21800.0 / 1e6) * 0.5;
 
         assert!(cost_usd > 0.0, "expected nonzero cost, got {cost_usd}");
         assert!(

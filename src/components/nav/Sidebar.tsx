@@ -7,16 +7,16 @@ export type View =
   | "timeline"
   | "report"
   | "connections"
-  | "agent-manager";
+  | "agent-viewer";
 
 const NAV_ITEMS: { id: View; label: string; icon: string; disabled?: boolean }[] = [
-  { id: "dashboard", label: "Dashboard", icon: "▦" },
+  { id: "dashboard", label: "Home", icon: "▦" },
   { id: "projects", label: "Projects", icon: "⊞" },
   { id: "sessions", label: "Sessions", icon: "◷" },
   { id: "timeline", label: "Timeline", icon: "⋮" },
   { id: "report", label: "Reports", icon: "▥" },
-  { id: "connections", label: "Connections", icon: "⟳", disabled: true },
-  { id: "agent-manager", label: "Agent Manager", icon: "▶", disabled: true },
+  { id: "agent-viewer", label: "Agent work", icon: "▶" },
+  { id: "connections", label: "Connections", icon: "⟳" },
 ];
 
 interface SidebarProps {
@@ -28,7 +28,9 @@ interface SidebarProps {
 export function Sidebar({ active, onSelect, footer }: SidebarProps) {
   return (
     <aside className="sidebar">
-      <div className="sidebar-brand">Relay</div>
+      <button className="sidebar-brand" onClick={() => onSelect("dashboard")}>
+        Relay
+      </button>
       <div className="sidebar-section-label">Workspace</div>
       <nav>
         {NAV_ITEMS.map((item) => (

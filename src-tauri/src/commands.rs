@@ -1,11 +1,13 @@
 use crate::activity;
 use crate::db::{queries, Db};
+use crate::dispatch::{self, AgentCommand, Runtime};
 use crate::parser;
 use crate::terminal;
 use chrono::{Duration, NaiveDate, Utc};
 use serde::Serialize;
+use std::collections::HashSet;
 use std::process::Command;
-use tauri::{Emitter, State};
+use tauri::{Emitter, Manager, State};
 
 /// Width of the Dashboard's GitHub-style activity heatmap, in days.
 const HEATMAP_DAYS: i64 = 365;
@@ -37,8 +39,34 @@ pub fn get_session_detail(
 ) -> Result<Option<SessionDetail>, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     queries::get_session_detail(&conn, &session_id)
-        .map(|opt| opt.map(|(session, files_changed)| SessionDetail { session, files_changed }))
+        .map(|opt| {
+            opt.map(|(session, files_changed)| SessionDetail {
+                session,
+                files_changed,
+            })
+        })
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn delete_session(
+    app: tauri::AppHandle,
+    db: State<'_, Db>,
+    session_id: String,
+) -> Result<(), String> {
+    let deleted = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        queries::delete_session(&conn, &session_id, Utc::now().timestamp())
+            .map_err(|e| e.to_string())?
+    };
+    if !deleted {
+        return Err(format!("session {session_id} not found"));
+    }
+    let _ = app.emit(
+        "data-changed",
+        serde_json::json!({ "entity": "session", "kind": "deleted", "session_id": session_id }),
+    );
+    Ok(())
 }
 
 /// Opens `path` in the user's editor: `$EDITOR <path>` if that env var is set, otherwise falls
@@ -62,7 +90,9 @@ pub fn open_in_editor(path: String) -> Result<(), String> {
         .arg(&path)
         .spawn()
         .map(|_| ())
-        .map_err(|e| format!("failed to launch editor: $EDITOR is not set and `code` failed to start: {e}"))
+        .map_err(|e| {
+            format!("failed to launch editor: $EDITOR is not set and `code` failed to start: {e}")
+        })
 }
 
 /// Returns a 14-day daily git-commit-count sparkline for the project at `project_path`, for
@@ -71,7 +101,10 @@ pub fn open_in_editor(path: String) -> Result<(), String> {
 /// repo, no `git` on `PATH`, shellout failure) already degrades to `vec![0; 14]` inside
 /// `activity::project_activity`, so there's no error state left for the frontend to handle.
 #[tauri::command]
-pub fn project_activity(project_path: String, cache: State<'_, activity::ActivityCache>) -> Vec<i64> {
+pub fn project_activity(
+    project_path: String,
+    cache: State<'_, activity::ActivityCache>,
+) -> Vec<i64> {
     activity::project_activity(&project_path, &cache)
 }
 
@@ -102,10 +135,13 @@ pub struct GitInsights {
 pub fn project_git_insights(project_path: String) -> GitInsights {
     let timestamps = activity::git_log_timestamps(&project_path, GIT_HEATMAP_DAYS);
 
-    let mut counts_by_day: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    let mut counts_by_day: std::collections::HashMap<String, i64> =
+        std::collections::HashMap::new();
     for ts in &timestamps {
         if let Some(dt) = chrono::DateTime::from_timestamp(*ts, 0) {
-            *counts_by_day.entry(dt.format("%Y-%m-%d").to_string()).or_insert(0) += 1;
+            *counts_by_day
+                .entry(dt.format("%Y-%m-%d").to_string())
+                .or_insert(0) += 1;
         }
     }
 
@@ -115,7 +151,10 @@ pub fn project_git_insights(project_path: String) -> GitInsights {
 
     let recent_commits = activity::git_recent_commits(&project_path, RECENT_COMMITS_LIMIT);
 
-    GitInsights { commit_heatmap, recent_commits }
+    GitInsights {
+        commit_heatmap,
+        recent_commits,
+    }
 }
 
 /// Caps how many diff lines `get_file_diff_for_session_file` will ever serialize over IPC —
@@ -155,7 +194,8 @@ pub fn get_file_diff_for_session_file(
     file_path: String,
 ) -> Result<Option<FileDiff>, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
-    let Some(span) = queries::file_diff_span(&conn, &session_id, &file_path).map_err(|e| e.to_string())?
+    let Some(span) =
+        queries::file_diff_span(&conn, &session_id, &file_path).map_err(|e| e.to_string())?
     else {
         return Ok(None);
     };
@@ -251,8 +291,7 @@ pub fn dashboard_stats(db: State<'_, Db>) -> Result<DashboardStats, String> {
     projects.truncate(TOP_PROJECTS_LIMIT);
 
     let agent_usage = queries::agent_usage(&conn).map_err(|e| e.to_string())?;
-    let active_session =
-        queries::most_recent_active_session(&conn).map_err(|e| e.to_string())?;
+    let active_session = queries::most_recent_active_session(&conn).map_err(|e| e.to_string())?;
 
     let today = Utc::now().date_naive();
     let window_start = today - Duration::days(HEATMAP_DAYS - 1);
@@ -358,11 +397,20 @@ pub fn export_report(db: State<'_, Db>, range_days: i64) -> Result<String, Strin
 
 fn render_report_markdown(report: &ReportData) -> String {
     let mut out = String::new();
-    out.push_str(&format!("# Relay spend report — last {} days\n\n", report.range_days));
-    out.push_str(&format!("Generated {}\n\n", Utc::now().format("%Y-%m-%d %H:%M UTC")));
+    out.push_str(&format!(
+        "# Relay spend report — last {} days\n\n",
+        report.range_days
+    ));
+    out.push_str(&format!(
+        "Generated {}\n\n",
+        Utc::now().format("%Y-%m-%d %H:%M UTC")
+    ));
 
     out.push_str("## Totals\n\n");
-    out.push_str(&format!("- Total spend: ${:.2}\n", report.totals.total_cost_usd));
+    out.push_str(&format!(
+        "- Total spend: ${:.2}\n",
+        report.totals.total_cost_usd
+    ));
     out.push_str(&format!("- Sessions: {}\n", report.totals.session_count));
     let avg = if report.totals.session_count > 0 {
         report.totals.total_cost_usd / report.totals.session_count as f64
@@ -453,8 +501,11 @@ pub fn export_transcript(db: State<'_, Db>, session_id: String) -> Result<String
         Utc::now().format("%Y-%m-%d-%H%M%S")
     );
     let path = dir.join(filename);
-    std::fs::write(&path, format!("{}{transcript}", render_transcript_header(&session)))
-        .map_err(|e| e.to_string())?;
+    std::fs::write(
+        &path,
+        format!("{}{transcript}", render_transcript_header(&session)),
+    )
+    .map_err(|e| e.to_string())?;
 
     Ok(path.to_string_lossy().to_string())
 }
@@ -475,12 +526,527 @@ fn render_transcript_header(session: &queries::Session) -> String {
     )
 }
 
+// --- Relay-owned agent dispatch ---
+
+const BUILT_IN_AGENTS: [&str; 4] = ["claude", "codex", "gemini", "cursor"];
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentConnection {
+    pub agent: String,
+    pub enabled: bool,
+    pub executable: String,
+    pub models: Vec<String>,
+    pub default_model: String,
+    pub updated_at: i64,
+    pub installed: bool,
+    pub resolved_executable: Option<String>,
+}
+
+fn validate_agent_config(
+    agent: &str,
+    executable: &str,
+    models: Vec<String>,
+    default_model: &str,
+) -> Result<Vec<String>, String> {
+    if !BUILT_IN_AGENTS.contains(&agent) {
+        return Err(format!("unsupported built-in agent: {agent}"));
+    }
+    if executable.trim().is_empty() {
+        return Err("executable cannot be empty".to_string());
+    }
+
+    let mut seen = HashSet::new();
+    let models: Vec<String> = models
+        .into_iter()
+        .map(|model| model.trim().to_string())
+        .filter(|model| !model.is_empty() && seen.insert(model.clone()))
+        .collect();
+    if models.is_empty() {
+        return Err("configure at least one model".to_string());
+    }
+    if !models.iter().any(|model| model == default_model) {
+        return Err("the default model must be in the configured model list".to_string());
+    }
+    Ok(models)
+}
+
+#[tauri::command]
+pub fn list_agent_connections(db: State<'_, Db>) -> Result<Vec<AgentConnection>, String> {
+    let configs = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        queries::list_agent_configs(&conn).map_err(|e| e.to_string())?
+    };
+    Ok(configs
+        .into_iter()
+        .map(|config| {
+            let resolved = dispatch::resolve_executable(&config.executable);
+            AgentConnection {
+                agent: config.agent,
+                enabled: config.enabled,
+                executable: config.executable,
+                models: config.models,
+                default_model: config.default_model,
+                updated_at: config.updated_at,
+                installed: resolved.is_some(),
+                resolved_executable: resolved.map(|path| path.to_string_lossy().to_string()),
+            }
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub fn save_agent_connection(
+    app: tauri::AppHandle,
+    db: State<'_, Db>,
+    agent: String,
+    enabled: bool,
+    executable: String,
+    models: Vec<String>,
+    default_model: String,
+) -> Result<(), String> {
+    let models = validate_agent_config(&agent, &executable, models, &default_model)?;
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    queries::update_agent_config(
+        &conn,
+        &agent,
+        enabled,
+        executable.trim(),
+        &models,
+        &default_model,
+    )
+    .map_err(|e| e.to_string())?;
+    drop(conn);
+    emit_data_changed(&app);
+    Ok(())
+}
+
+fn configured_command(
+    config: &queries::AgentConfig,
+    model: &str,
+    prompt: &str,
+    provider_session_id: Option<&str>,
+) -> Result<AgentCommand, String> {
+    if !config.enabled {
+        return Err(format!("{} is disabled in Connections", config.agent));
+    }
+    if !config.models.iter().any(|configured| configured == model) {
+        return Err(format!(
+            "model {model} is not configured for {}",
+            config.agent
+        ));
+    }
+    let resolved = dispatch::resolve_executable(&config.executable).ok_or_else(|| {
+        format!(
+            "{} executable '{}' was not found; update it in Connections",
+            config.agent, config.executable
+        )
+    })?;
+    let mut command =
+        dispatch::build_agent_command(&config.agent, model, prompt, provider_session_id)
+            .map_err(|e| e.to_string())?;
+    command.executable = resolved.to_string_lossy().to_string();
+    Ok(command)
+}
+
+fn mark_dispatch_start_failed(app: &tauri::AppHandle, run_id: &str, turn_id: &str, error: &str) {
+    let db = app.state::<Db>();
+    if let Ok(conn) = db.0.lock() {
+        if let Err(db_error) = queries::settle_dispatch_turn(
+            &conn,
+            run_id,
+            turn_id,
+            "failed",
+            "failed",
+            None,
+            Some(error),
+            Utc::now().timestamp(),
+        ) {
+            log::warn!("failed to record launch failure for run {run_id}: {db_error:#}");
+        }
+        let _ = queries::clear_pending_launch_for_dispatch_run(&conn, run_id);
+        let _ = queries::sync_card_for_dispatch_run(&conn, run_id, "review");
+    }
+    emit_data_changed(app);
+}
+
+#[tauri::command]
+pub fn dispatch_task(
+    app: tauri::AppHandle,
+    db: State<'_, Db>,
+    runtime: State<'_, Runtime>,
+    project_id: String,
+    card_id: Option<String>,
+    title: String,
+    prompt: String,
+    agent: String,
+    model: String,
+) -> Result<queries::CreatedDispatch, String> {
+    let title = title.trim();
+    let prompt = prompt.trim();
+    if title.is_empty() {
+        return Err("task title cannot be empty".to_string());
+    }
+    if prompt.is_empty() {
+        return Err("task prompt cannot be empty".to_string());
+    }
+
+    let (config, project_path) = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        let config = queries::get_agent_config(&conn, &agent)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("agent {agent} is not configured"))?;
+        let project_path = queries::project_path(&conn, &project_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("project {project_id} was not found"))?;
+        (config, project_path)
+    };
+    let command = configured_command(&config, &model, prompt, None)?;
+
+    let created = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        let transaction = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        if queries::has_active_dispatch_for_project_agent(&transaction, &project_id, &agent)
+            .map_err(|e| e.to_string())?
+        {
+            return Err(format!(
+                "{agent} already has an active Relay run in this project"
+            ));
+        }
+        let (board, columns, cards) =
+            queries::get_board(&transaction, &project_id).map_err(|e| e.to_string())?;
+        let in_progress = columns
+            .iter()
+            .find(|column| column.role.as_deref() == Some("in_progress"))
+            .ok_or_else(|| "this project board has no In Progress column".to_string())?;
+
+        let task_card_id = if let Some(card_id) = card_id.as_deref() {
+            let context = queries::card_launch_context(&transaction, card_id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("card {card_id} was not found"))?;
+            if context.project_id != project_id {
+                return Err("the selected card belongs to a different project".to_string());
+            }
+            if context.session_id.is_some() {
+                return Err("this card is already linked to an agent session".to_string());
+            }
+            let position = cards
+                .iter()
+                .filter(|card| card.column_id == in_progress.id)
+                .count() as i64;
+            queries::move_card(&transaction, card_id, &in_progress.id, position)
+                .map_err(|e| e.to_string())?;
+            card_id.to_string()
+        } else {
+            queries::create_card(
+                &transaction,
+                &board.id,
+                &in_progress.id,
+                title,
+                Some(prompt),
+            )
+            .map_err(|e| e.to_string())?
+            .id
+        };
+        queries::set_card_pending_launch_for_agent(&transaction, &task_card_id, &agent)
+            .map_err(|e| e.to_string())?;
+        let created = queries::create_dispatch_task(
+            &transaction,
+            &project_id,
+            Some(&task_card_id),
+            title,
+            prompt,
+            &agent,
+            &model,
+            Utc::now().timestamp(),
+        )
+        .map_err(|e| e.to_string())?;
+        transaction.commit().map_err(|e| e.to_string())?;
+        created
+    };
+
+    let (turn, user_event) = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        queries::begin_dispatch_turn(&conn, &created.run.id, prompt, Utc::now().timestamp())
+            .map_err(|e| e.to_string())?
+    };
+    dispatch::emit_dispatch_event(&app, &user_event);
+    if let Err(error) = runtime.start_turn(
+        app.clone(),
+        created.run.id.clone(),
+        turn.id.clone(),
+        agent.clone(),
+        &project_path,
+        command,
+    ) {
+        let message = error.to_string();
+        mark_dispatch_start_failed(&app, &created.run.id, &turn.id, &message);
+        return Err(format!("the run could not start: {message}"));
+    }
+    emit_data_changed(&app);
+    Ok(created)
+}
+
+#[tauri::command]
+pub fn retry_dispatch_task(
+    app: tauri::AppHandle,
+    db: State<'_, Db>,
+    runtime: State<'_, Runtime>,
+    task_id: String,
+    agent: String,
+    model: String,
+) -> Result<queries::CreatedDispatch, String> {
+    let (task, config, project_path) = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        let task = queries::get_dispatch_task(&conn, &task_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("task {task_id} was not found"))?;
+        let config = queries::get_agent_config(&conn, &agent)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("agent {agent} is not configured"))?;
+        let project_path = queries::project_path(&conn, &task.project_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("project {} was not found", task.project_id))?;
+        let active = queries::list_runs_for_task(&conn, &task_id)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .any(|run| {
+                matches!(
+                    run.status.as_str(),
+                    "queued"
+                        | "starting"
+                        | "running"
+                        | "awaiting_approval"
+                        | "interrupting"
+                        | "idle"
+                        | "failed"
+                )
+            });
+        if active {
+            return Err("this task already has an active run".to_string());
+        }
+        (task, config, project_path)
+    };
+    let command = configured_command(&config, &model, &task.prompt, None)?;
+    let run = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        if queries::has_active_dispatch_for_project_agent(&conn, &task.project_id, &agent)
+            .map_err(|e| e.to_string())?
+        {
+            return Err(format!(
+                "{agent} already has an active Relay run in this project"
+            ));
+        }
+        if let Some(card_id) = task.card_id.as_deref() {
+            queries::set_card_pending_launch_for_agent(&conn, card_id, &agent)
+                .map_err(|e| e.to_string())?;
+        }
+        queries::create_retry_run(&conn, &task_id, &agent, &model, Utc::now().timestamp())
+            .map_err(|e| e.to_string())?
+    };
+    let created = queries::CreatedDispatch { task, run };
+    let (turn, user_event) = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        queries::begin_dispatch_turn(
+            &conn,
+            &created.run.id,
+            &created.task.prompt,
+            Utc::now().timestamp(),
+        )
+        .map_err(|e| e.to_string())?
+    };
+    dispatch::emit_dispatch_event(&app, &user_event);
+    if let Err(error) = runtime.start_turn(
+        app.clone(),
+        created.run.id.clone(),
+        turn.id.clone(),
+        agent.clone(),
+        &project_path,
+        command,
+    ) {
+        let message = error.to_string();
+        mark_dispatch_start_failed(&app, &created.run.id, &turn.id, &message);
+        return Err(format!("the retry could not start: {message}"));
+    }
+    emit_data_changed(&app);
+    Ok(created)
+}
+
+#[tauri::command]
+pub fn list_dispatch_tasks(
+    db: State<'_, Db>,
+    day_start: i64,
+    day_end: i64,
+) -> Result<Vec<queries::DispatchTaskWithRun>, String> {
+    if day_end <= day_start {
+        return Err("day_end must be after day_start".to_string());
+    }
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    queries::list_dispatch_tasks(&conn, day_start, day_end).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn list_dispatch_runs(
+    db: State<'_, Db>,
+    task_id: String,
+) -> Result<Vec<queries::DispatchRun>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    queries::list_runs_for_task(&conn, &task_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn get_dispatch_conversation(
+    db: State<'_, Db>,
+    run_id: String,
+) -> Result<Option<queries::DispatchConversation>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    queries::get_dispatch_conversation(&conn, &run_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn send_dispatch_prompt(
+    app: tauri::AppHandle,
+    db: State<'_, Db>,
+    runtime: State<'_, Runtime>,
+    run_id: String,
+    prompt: String,
+) -> Result<(), String> {
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        return Err("prompt cannot be empty".to_string());
+    }
+    let (run, config, project_path) = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        let run = queries::get_dispatch_run(&conn, &run_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("conversation {run_id} was not found"))?;
+        if run.status == "shut_down" {
+            return Err("this conversation has been shut down".to_string());
+        }
+        let task = queries::get_dispatch_task(&conn, &run.task_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("task {} was not found", run.task_id))?;
+        let config = queries::get_agent_config(&conn, &run.agent)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("agent {} is not configured", run.agent))?;
+        let project_path = queries::project_path(&conn, &task.project_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("project {} was not found", task.project_id))?;
+        (run, config, project_path)
+    };
+    let command = configured_command(
+        &config,
+        &run.model,
+        prompt,
+        run.provider_session_id.as_deref(),
+    )?;
+    let (turn, user_event) = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        queries::begin_dispatch_turn(&conn, &run_id, prompt, Utc::now().timestamp())
+            .map_err(|e| e.to_string())?
+    };
+    dispatch::emit_dispatch_event(&app, &user_event);
+    if let Err(error) = runtime.start_turn(
+        app.clone(),
+        run_id.clone(),
+        turn.id.clone(),
+        run.agent,
+        &project_path,
+        command,
+    ) {
+        let message = error.to_string();
+        mark_dispatch_start_failed(&app, &run_id, &turn.id, &message);
+        return Err(format!("the next turn could not start: {message}"));
+    }
+    emit_data_changed(&app);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn interrupt_dispatch_turn(
+    app: tauri::AppHandle,
+    runtime: State<'_, Runtime>,
+    run_id: String,
+) -> Result<(), String> {
+    runtime
+        .interrupt_turn(&app, &run_id)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn resolve_dispatch_approval(
+    app: tauri::AppHandle,
+    db: State<'_, Db>,
+    runtime: State<'_, Runtime>,
+    run_id: String,
+    event_id: i64,
+    decision: String,
+) -> Result<(), String> {
+    if !matches!(
+        decision.as_str(),
+        "allowed_once" | "allowed_for_session" | "denied"
+    ) {
+        return Err("invalid approval decision".to_string());
+    }
+    let (agent, request_id) = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        let conversation = queries::get_dispatch_conversation(&conn, &run_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("conversation {run_id} was not found"))?;
+        let approval = conversation
+            .events
+            .into_iter()
+            .find(|event| event.id == event_id && event.kind == "approval_request")
+            .ok_or_else(|| format!("approval event {event_id} was not found"))?;
+        if approval.state.as_deref() != Some("pending") {
+            return Ok(());
+        }
+        (conversation.run.agent, approval.provider_event_id)
+    };
+    runtime
+        .resolve_approval(&run_id, &agent, request_id.as_deref(), &decision)
+        .map_err(|e| e.to_string())?;
+    {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        queries::resolve_dispatch_event(&conn, &run_id, event_id, &decision)
+            .map_err(|e| e.to_string())?;
+        queries::set_dispatch_run_status(&conn, &run_id, "running", None, Utc::now().timestamp())
+            .map_err(|e| e.to_string())?;
+    }
+    emit_data_changed(&app);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn shutdown_dispatch_conversation(
+    app: tauri::AppHandle,
+    db: State<'_, Db>,
+    runtime: State<'_, Runtime>,
+    run_id: String,
+) -> Result<(), String> {
+    runtime
+        .stop_for_shutdown(&run_id)
+        .map_err(|e| e.to_string())?;
+    {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        queries::shutdown_dispatch_conversation(&conn, &run_id, Utc::now().timestamp())
+            .map_err(|e| e.to_string())?;
+        queries::clear_pending_launch_for_dispatch_run(&conn, &run_id)
+            .map_err(|e| e.to_string())?;
+        queries::sync_card_for_dispatch_run(&conn, &run_id, "review").map_err(|e| e.to_string())?;
+    }
+    emit_data_changed(&app);
+    Ok(())
+}
+
 // --- Kanban board ---
 
 /// Emits the same coarse `data-changed` event every other mutation path uses — the frontend
 /// hook invalidates by query key, not by payload, so a new event *kind* isn't needed here.
 fn emit_data_changed(app: &tauri::AppHandle) {
-    let _ = app.emit("data-changed", serde_json::json!({ "entity": "board", "kind": "updated" }));
+    let _ = app.emit(
+        "data-changed",
+        serde_json::json!({ "entity": "board", "kind": "updated" }),
+    );
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -494,7 +1060,11 @@ pub struct BoardData {
 pub fn get_board(db: State<'_, Db>, project_id: String) -> Result<BoardData, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     queries::get_board(&conn, &project_id)
-        .map(|(board, columns, cards)| BoardData { board, columns, cards })
+        .map(|(board, columns, cards)| BoardData {
+            board,
+            columns,
+            cards,
+        })
         .map_err(|e| e.to_string())
 }
 
@@ -539,14 +1109,19 @@ pub fn update_card(
     description: Option<String>,
 ) -> Result<(), String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
-    queries::update_card(&conn, &card_id, &title, description.as_deref()).map_err(|e| e.to_string())?;
+    queries::update_card(&conn, &card_id, &title, description.as_deref())
+        .map_err(|e| e.to_string())?;
     drop(conn);
     emit_data_changed(&app);
     Ok(())
 }
 
 #[tauri::command]
-pub fn delete_card(app: tauri::AppHandle, db: State<'_, Db>, card_id: String) -> Result<(), String> {
+pub fn delete_card(
+    app: tauri::AppHandle,
+    db: State<'_, Db>,
+    card_id: String,
+) -> Result<(), String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     queries::delete_card(&conn, &card_id).map_err(|e| e.to_string())?;
     drop(conn);
@@ -618,7 +1193,8 @@ pub fn launch_or_attach_session(db: State<'_, Db>, card_id: String) -> Result<St
     let prepared = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
 
-        let Some(context) = queries::card_launch_context(&conn, &card_id).map_err(|e| e.to_string())?
+        let Some(context) =
+            queries::card_launch_context(&conn, &card_id).map_err(|e| e.to_string())?
         else {
             return Ok("skipped: card not found".to_string());
         };
@@ -667,8 +1243,29 @@ mod tests {
         let result = dense_daily_activity(start, end, &counts);
 
         assert_eq!(
-            result.iter().map(|d| (d.date.as_str(), d.count)).collect::<Vec<_>>(),
+            result
+                .iter()
+                .map(|d| (d.date.as_str(), d.count))
+                .collect::<Vec<_>>(),
             vec![("2026-01-01", 0), ("2026-01-02", 5), ("2026-01-03", 0)],
         );
+    }
+
+    #[test]
+    fn agent_config_validation_trims_deduplicates_and_requires_the_default() {
+        let models = validate_agent_config(
+            "codex",
+            " codex ",
+            vec!["default".into(), " gpt-5 ".into(), "gpt-5".into()],
+            "gpt-5",
+        )
+        .unwrap();
+        assert_eq!(models, vec!["default", "gpt-5"]);
+
+        assert!(
+            validate_agent_config("custom", "agent", vec!["default".into()], "default").is_err()
+        );
+        assert!(validate_agent_config("claude", "", vec!["default".into()], "default").is_err());
+        assert!(validate_agent_config("claude", "claude", vec!["sonnet".into()], "opus").is_err());
     }
 }

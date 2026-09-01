@@ -52,10 +52,7 @@ pub fn parse_line(line: &str) -> Option<ParsedRecord> {
         }
     }
 
-    let cwd = value
-        .get("cwd")
-        .and_then(Value::as_str)
-        .map(String::from);
+    let cwd = value.get("cwd").and_then(Value::as_str).map(String::from);
     let git_branch = value
         .get("gitBranch")
         .and_then(Value::as_str)
@@ -98,7 +95,10 @@ pub fn parse_line(line: &str) -> Option<ParsedRecord> {
 
     let text = extract_text(&record_type, content);
     let ai_title = if record_type == "ai-title" {
-        value.get("aiTitle").and_then(Value::as_str).map(String::from)
+        value
+            .get("aiTitle")
+            .and_then(Value::as_str)
+            .map(String::from)
     } else {
         None
     };
@@ -226,8 +226,7 @@ mod tests {
     /// files on this machine (field names, nesting, inert-type list) without containing any
     /// real session content. See PLAN.md's "Grounding note" for the real-log inspection this
     /// is based on.
-    const SESSION_BASIC_FIXTURE: &str =
-        include_str!("../../tests/fixtures/session_basic.jsonl");
+    const SESSION_BASIC_FIXTURE: &str = include_str!("../../tests/fixtures/session_basic.jsonl");
 
     fn parsed_fixture_lines() -> Vec<ParsedRecord> {
         SESSION_BASIC_FIXTURE
@@ -245,7 +244,11 @@ mod tests {
         // 14 total lines: 5 inert header lines + 1 user + 1 ai-title + 4 assistant +
         // 1 system + 1 unknown-future-type (inert-by-ignoring) + 1 queue-operation (inert) =
         // user + ai-title + 4 assistant + system = 7 real records survive.
-        assert_eq!(records.len(), 7, "expected exactly 7 real records, got: {records:#?}");
+        assert_eq!(
+            records.len(),
+            7,
+            "expected exactly 7 real records, got: {records:#?}"
+        );
     }
 
     #[test]
@@ -393,7 +396,10 @@ mod tests {
             .iter()
             .find(|r| r.record_type == "system")
             .expect("fixture has a system record");
-        assert_eq!(system.cwd.as_deref(), Some("/Users/testuser/Desktop/fixture-project"));
+        assert_eq!(
+            system.cwd.as_deref(),
+            Some("/Users/testuser/Desktop/fixture-project")
+        );
         assert_eq!(system.git_branch.as_deref(), Some("main"));
         assert!(system.usage.is_none());
         assert!(system.tool_uses.is_empty());
@@ -402,7 +408,10 @@ mod tests {
     #[test]
     fn malformed_json_line_is_skipped_without_panicking() {
         assert!(parse_line("not json at all").is_none());
-        assert!(parse_line(r#"{"type": "user", "message": {"role": "user", "content": "cut off mid-w"#).is_none());
+        assert!(parse_line(
+            r#"{"type": "user", "message": {"role": "user", "content": "cut off mid-w"#
+        )
+        .is_none());
         assert!(parse_line("").is_none());
         assert!(parse_line("   ").is_none());
     }
@@ -411,9 +420,19 @@ mod tests {
     fn malformed_line_fixture_only_yields_the_two_valid_records() {
         let fixture = include_str!("../../tests/fixtures/malformed_line.jsonl");
         let records: Vec<_> = fixture.lines().filter_map(parse_line).collect();
-        assert_eq!(records.len(), 2, "the truncated middle line must be skipped, not fatal");
-        assert_eq!(records[0].session_id.as_deref(), Some("fx-malformed-0000-0000-0000-000000000000"));
-        assert_eq!(records[1].session_id.as_deref(), Some("fx-malformed-0000-0000-0000-000000000000"));
+        assert_eq!(
+            records.len(),
+            2,
+            "the truncated middle line must be skipped, not fatal"
+        );
+        assert_eq!(
+            records[0].session_id.as_deref(),
+            Some("fx-malformed-0000-0000-0000-000000000000")
+        );
+        assert_eq!(
+            records[1].session_id.as_deref(),
+            Some("fx-malformed-0000-0000-0000-000000000000")
+        );
     }
 
     #[test]
@@ -440,7 +459,10 @@ mod tests {
             .filter(|r| r.record_type == "assistant")
             .nth(0)
             .expect("fixture has at least one assistant record");
-        assert_eq!(assistant.text.as_deref(), Some("I'll create the main function."));
+        assert_eq!(
+            assistant.text.as_deref(),
+            Some("I'll create the main function.")
+        );
     }
 
     #[test]

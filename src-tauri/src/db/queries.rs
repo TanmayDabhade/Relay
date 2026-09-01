@@ -84,6 +84,113 @@ pub struct AgentUsage {
     pub total_cost_usd: f64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentConfig {
+    pub agent: String,
+    pub enabled: bool,
+    pub executable: String,
+    pub models: Vec<String>,
+    pub default_model: String,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DispatchTask {
+    pub id: String,
+    pub project_id: String,
+    pub card_id: Option<String>,
+    pub title: String,
+    pub prompt: String,
+    pub status: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub completed_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DispatchRun {
+    pub id: String,
+    pub task_id: String,
+    pub attempt: i64,
+    pub agent: String,
+    pub model: String,
+    pub status: String,
+    pub started_at: Option<i64>,
+    pub ended_at: Option<i64>,
+    pub exit_code: Option<i64>,
+    pub error: Option<String>,
+    pub session_id: Option<String>,
+    pub provider_session_id: Option<String>,
+    pub shutdown_at: Option<i64>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CreatedDispatch {
+    pub task: DispatchTask,
+    pub run: DispatchRun,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DispatchTaskWithRun {
+    #[serde(flatten)]
+    pub task: DispatchTask,
+    pub project_name: String,
+    pub project_path: String,
+    pub run: DispatchRun,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DispatchRunEvent {
+    pub id: i64,
+    pub run_id: String,
+    pub sequence: i64,
+    pub stream: String,
+    pub content: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DispatchTurn {
+    pub id: String,
+    pub run_id: String,
+    pub sequence: i64,
+    pub prompt: String,
+    pub status: String,
+    pub started_at: i64,
+    pub ended_at: Option<i64>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DispatchEvent {
+    pub id: i64,
+    pub run_id: String,
+    pub turn_id: Option<String>,
+    pub sequence: i64,
+    pub kind: String,
+    pub role: Option<String>,
+    pub content: String,
+    pub payload: Option<String>,
+    pub provider_event_id: Option<String>,
+    pub state: Option<String>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchEventUpdate {
+    Append,
+    Replace,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DispatchConversation {
+    pub run: DispatchRun,
+    pub turns: Vec<DispatchTurn>,
+    pub events: Vec<DispatchEvent>,
+    pub legacy: bool,
+}
+
 /// For recomputing cost_usd against the current pricing table without re-parsing logs.
 pub struct SessionTokenTotals {
     pub id: String,
@@ -119,9 +226,49 @@ fn row_to_session(row: &Row) -> rusqlite::Result<Session> {
     })
 }
 
-const SESSION_COLUMNS: &str = "id, project_id, agent, model, started_at, ended_at, last_activity_at, status,
+fn row_to_dispatch_task(row: &Row) -> rusqlite::Result<DispatchTask> {
+    Ok(DispatchTask {
+        id: row.get(0)?,
+        project_id: row.get(1)?,
+        card_id: row.get(2)?,
+        title: row.get(3)?,
+        prompt: row.get(4)?,
+        status: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
+        completed_at: row.get(8)?,
+    })
+}
+
+fn row_to_dispatch_run(row: &Row) -> rusqlite::Result<DispatchRun> {
+    Ok(DispatchRun {
+        id: row.get(0)?,
+        task_id: row.get(1)?,
+        attempt: row.get(2)?,
+        agent: row.get(3)?,
+        model: row.get(4)?,
+        status: row.get(5)?,
+        started_at: row.get(6)?,
+        ended_at: row.get(7)?,
+        exit_code: row.get(8)?,
+        error: row.get(9)?,
+        session_id: row.get(10)?,
+        provider_session_id: row.get(11)?,
+        shutdown_at: row.get(12)?,
+        created_at: row.get(13)?,
+    })
+}
+
+const SESSION_COLUMNS: &str =
+    "id, project_id, agent, model, started_at, ended_at, last_activity_at, status,
      duration_seconds, summary, prompt_tokens, completion_tokens, cache_read_tokens,
      cache_creation_tokens, cost_usd, lines_added, lines_removed, tags, raw_log_path, title";
+
+const DISPATCH_TASK_COLUMNS: &str =
+    "id, project_id, card_id, title, prompt, status, created_at, updated_at, completed_at";
+const DISPATCH_RUN_COLUMNS: &str =
+    "id, task_id, attempt, agent, model, status, started_at, ended_at, exit_code, error,
+     session_id, provider_session_id, shutdown_at, created_at";
 
 // --- Ingest (parser/watcher) side ---
 
@@ -269,6 +416,1021 @@ pub fn set_ingest_state(
     Ok(())
 }
 
+// --- Relay-owned agent dispatch ---
+
+pub fn list_agent_configs(conn: &Connection) -> rusqlite::Result<Vec<AgentConfig>> {
+    let mut stmt = conn.prepare(
+        "SELECT agent, enabled, executable, models, default_model, updated_at
+         FROM agent_configs
+         ORDER BY CASE agent
+           WHEN 'claude' THEN 0 WHEN 'codex' THEN 1 WHEN 'gemini' THEN 2 WHEN 'cursor' THEN 3
+           ELSE 4 END, agent",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        let models_json: String = row.get(3)?;
+        Ok(AgentConfig {
+            agent: row.get(0)?,
+            enabled: row.get::<_, i64>(1)? != 0,
+            executable: row.get(2)?,
+            models: serde_json::from_str(&models_json)
+                .unwrap_or_else(|_| vec!["default".to_string()]),
+            default_model: row.get(4)?,
+            updated_at: row.get(5)?,
+        })
+    })?;
+    rows.collect()
+}
+
+pub fn get_agent_config(conn: &Connection, agent: &str) -> rusqlite::Result<Option<AgentConfig>> {
+    conn.query_row(
+        "SELECT agent, enabled, executable, models, default_model, updated_at
+         FROM agent_configs WHERE agent = ?1",
+        params![agent],
+        |row| {
+            let models_json: String = row.get(3)?;
+            Ok(AgentConfig {
+                agent: row.get(0)?,
+                enabled: row.get::<_, i64>(1)? != 0,
+                executable: row.get(2)?,
+                models: serde_json::from_str(&models_json)
+                    .unwrap_or_else(|_| vec!["default".to_string()]),
+                default_model: row.get(4)?,
+                updated_at: row.get(5)?,
+            })
+        },
+    )
+    .optional()
+}
+
+pub fn update_agent_config(
+    conn: &Connection,
+    agent: &str,
+    enabled: bool,
+    executable: &str,
+    models: &[String],
+    default_model: &str,
+) -> rusqlite::Result<()> {
+    let models_json = serde_json::to_string(models).unwrap_or_else(|_| "[\"default\"]".to_string());
+    conn.execute(
+        "UPDATE agent_configs
+         SET enabled = ?2, executable = ?3, models = ?4, default_model = ?5, updated_at = ?6
+         WHERE agent = ?1",
+        params![
+            agent,
+            i64::from(enabled),
+            executable,
+            models_json,
+            default_model,
+            chrono::Utc::now().timestamp()
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn create_dispatch_task(
+    conn: &Connection,
+    project_id: &str,
+    card_id: Option<&str>,
+    title: &str,
+    prompt: &str,
+    agent: &str,
+    model: &str,
+    now: i64,
+) -> rusqlite::Result<CreatedDispatch> {
+    let task = DispatchTask {
+        id: Uuid::new_v4().to_string(),
+        project_id: project_id.to_string(),
+        card_id: card_id.map(str::to_string),
+        title: title.to_string(),
+        prompt: prompt.to_string(),
+        status: "queued".to_string(),
+        created_at: now,
+        updated_at: now,
+        completed_at: None,
+    };
+    let run = DispatchRun {
+        id: Uuid::new_v4().to_string(),
+        task_id: task.id.clone(),
+        attempt: 1,
+        agent: agent.to_string(),
+        model: model.to_string(),
+        status: "queued".to_string(),
+        started_at: None,
+        ended_at: None,
+        exit_code: None,
+        error: None,
+        session_id: None,
+        provider_session_id: None,
+        shutdown_at: None,
+        created_at: now,
+    };
+
+    conn.execute(
+        "INSERT INTO dispatch_tasks
+         (id, project_id, card_id, title, prompt, status, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?6)",
+        params![task.id, project_id, card_id, title, prompt, now],
+    )?;
+    conn.execute(
+        "INSERT INTO dispatch_runs
+         (id, task_id, attempt, agent, model, status, created_at)
+         VALUES (?1, ?2, 1, ?3, ?4, 'queued', ?5)",
+        params![run.id, task.id, agent, model, now],
+    )?;
+
+    Ok(CreatedDispatch { task, run })
+}
+
+pub fn get_dispatch_task(
+    conn: &Connection,
+    task_id: &str,
+) -> rusqlite::Result<Option<DispatchTask>> {
+    let sql = format!("SELECT {DISPATCH_TASK_COLUMNS} FROM dispatch_tasks WHERE id = ?1");
+    conn.query_row(&sql, params![task_id], row_to_dispatch_task)
+        .optional()
+}
+
+pub fn get_dispatch_run(conn: &Connection, run_id: &str) -> rusqlite::Result<Option<DispatchRun>> {
+    let sql = format!("SELECT {DISPATCH_RUN_COLUMNS} FROM dispatch_runs WHERE id = ?1");
+    conn.query_row(&sql, params![run_id], row_to_dispatch_run)
+        .optional()
+}
+
+pub fn list_runs_for_task(conn: &Connection, task_id: &str) -> rusqlite::Result<Vec<DispatchRun>> {
+    let sql = format!(
+        "SELECT {DISPATCH_RUN_COLUMNS} FROM dispatch_runs WHERE task_id = ?1 ORDER BY attempt ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![task_id], row_to_dispatch_run)?;
+    rows.collect()
+}
+
+pub fn has_active_dispatch_for_project_agent(
+    conn: &Connection,
+    project_id: &str,
+    agent: &str,
+) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM dispatch_runs r
+           JOIN dispatch_tasks t ON t.id = r.task_id
+           WHERE t.project_id = ?1 AND r.agent = ?2
+             AND r.status IN (
+               'queued', 'starting', 'running', 'awaiting_approval',
+               'interrupting', 'idle', 'failed'
+             )
+         )",
+        params![project_id, agent],
+        |row| row.get(0),
+    )
+}
+
+pub fn list_dispatch_tasks(
+    conn: &Connection,
+    day_start: i64,
+    day_end: i64,
+) -> rusqlite::Result<Vec<DispatchTaskWithRun>> {
+    let mut stmt = conn.prepare(
+        "SELECT
+           t.id, t.project_id, t.card_id, t.title, t.prompt, t.status,
+           t.created_at, t.updated_at, t.completed_at,
+           p.name, p.path,
+           r.id, r.task_id, r.attempt, r.agent, r.model, r.status,
+           r.started_at, r.ended_at, r.exit_code, r.error, r.session_id,
+           r.provider_session_id, r.shutdown_at, r.created_at
+         FROM dispatch_tasks t
+         JOIN projects p ON p.id = t.project_id
+         JOIN dispatch_runs r ON r.task_id = t.id
+         WHERE COALESCE(r.started_at, r.created_at) >= ?1
+           AND COALESCE(r.started_at, r.created_at) < ?2
+         ORDER BY COALESCE(r.started_at, r.created_at) DESC",
+    )?;
+    let rows = stmt.query_map(params![day_start, day_end], |row| {
+        Ok(DispatchTaskWithRun {
+            task: DispatchTask {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                card_id: row.get(2)?,
+                title: row.get(3)?,
+                prompt: row.get(4)?,
+                status: row.get(5)?,
+                created_at: row.get(6)?,
+                updated_at: row.get(7)?,
+                completed_at: row.get(8)?,
+            },
+            project_name: row.get(9)?,
+            project_path: row.get(10)?,
+            run: DispatchRun {
+                id: row.get(11)?,
+                task_id: row.get(12)?,
+                attempt: row.get(13)?,
+                agent: row.get(14)?,
+                model: row.get(15)?,
+                status: row.get(16)?,
+                started_at: row.get(17)?,
+                ended_at: row.get(18)?,
+                exit_code: row.get(19)?,
+                error: row.get(20)?,
+                session_id: row.get(21)?,
+                provider_session_id: row.get(22)?,
+                shutdown_at: row.get(23)?,
+                created_at: row.get(24)?,
+            },
+        })
+    })?;
+    rows.collect()
+}
+
+pub fn mark_dispatch_run_running(
+    conn: &Connection,
+    run_id: &str,
+    now: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE dispatch_runs SET status = 'running', started_at = COALESCE(started_at, ?2)
+         WHERE id = ?1",
+        params![run_id, now],
+    )?;
+    conn.execute(
+        "UPDATE dispatch_tasks SET status = 'running', updated_at = ?2, completed_at = NULL
+         WHERE id = (SELECT task_id FROM dispatch_runs WHERE id = ?1)
+           AND ?1 = (
+             SELECT id FROM dispatch_runs
+             WHERE task_id = dispatch_tasks.id ORDER BY attempt DESC LIMIT 1
+           )",
+        params![run_id, now],
+    )?;
+    Ok(())
+}
+
+pub fn mark_dispatch_run_cancelling(
+    conn: &Connection,
+    run_id: &str,
+    now: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE dispatch_runs SET status = 'cancelling'
+         WHERE id = ?1 AND status IN ('queued', 'starting', 'running')",
+        params![run_id],
+    )?;
+    conn.execute(
+        "UPDATE dispatch_tasks SET status = 'cancelling', updated_at = ?2
+         WHERE id = (SELECT task_id FROM dispatch_runs WHERE id = ?1)
+           AND ?1 = (
+             SELECT id FROM dispatch_runs
+             WHERE task_id = dispatch_tasks.id ORDER BY attempt DESC LIMIT 1
+           )",
+        params![run_id, now],
+    )?;
+    Ok(())
+}
+
+pub fn finish_dispatch_run(
+    conn: &Connection,
+    run_id: &str,
+    status: &str,
+    exit_code: Option<i64>,
+    error: Option<&str>,
+    now: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE dispatch_runs
+         SET status = ?2, ended_at = ?3, exit_code = ?4, error = ?5
+         WHERE id = ?1 AND status != 'cancelled'",
+        params![run_id, status, now, exit_code, error],
+    )?;
+    let actual_status: Option<String> = conn
+        .query_row(
+            "SELECT status FROM dispatch_runs WHERE id = ?1",
+            params![run_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(actual_status) = actual_status {
+        conn.execute(
+            "UPDATE dispatch_tasks
+             SET status = ?2, updated_at = ?3, completed_at = ?3
+             WHERE id = (SELECT task_id FROM dispatch_runs WHERE id = ?1)
+               AND ?1 = (
+                 SELECT id FROM dispatch_runs
+                 WHERE task_id = dispatch_tasks.id ORDER BY attempt DESC LIMIT 1
+               )",
+            params![run_id, actual_status, now],
+        )?;
+    }
+    Ok(())
+}
+
+pub fn create_retry_run(
+    conn: &Connection,
+    task_id: &str,
+    agent: &str,
+    model: &str,
+    now: i64,
+) -> rusqlite::Result<DispatchRun> {
+    let attempt: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(attempt), 0) + 1 FROM dispatch_runs WHERE task_id = ?1",
+        params![task_id],
+        |row| row.get(0),
+    )?;
+    let run = DispatchRun {
+        id: Uuid::new_v4().to_string(),
+        task_id: task_id.to_string(),
+        attempt,
+        agent: agent.to_string(),
+        model: model.to_string(),
+        status: "queued".to_string(),
+        started_at: None,
+        ended_at: None,
+        exit_code: None,
+        error: None,
+        session_id: None,
+        provider_session_id: None,
+        shutdown_at: None,
+        created_at: now,
+    };
+    conn.execute(
+        "INSERT INTO dispatch_runs
+         (id, task_id, attempt, agent, model, status, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6)",
+        params![run.id, task_id, attempt, agent, model, now],
+    )?;
+    conn.execute(
+        "UPDATE dispatch_tasks SET status = 'queued', updated_at = ?2, completed_at = NULL
+         WHERE id = ?1",
+        params![task_id, now],
+    )?;
+    Ok(run)
+}
+
+pub fn append_run_event(
+    conn: &Connection,
+    run_id: &str,
+    stream: &str,
+    content: &str,
+    now: i64,
+) -> rusqlite::Result<DispatchRunEvent> {
+    let sequence: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(sequence), 0) + 1 FROM dispatch_run_events WHERE run_id = ?1",
+        params![run_id],
+        |row| row.get(0),
+    )?;
+    conn.execute(
+        "INSERT INTO dispatch_run_events (run_id, sequence, stream, content, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![run_id, sequence, stream, content, now],
+    )?;
+    let id = conn.last_insert_rowid();
+    Ok(DispatchRunEvent {
+        id,
+        run_id: run_id.to_string(),
+        sequence,
+        stream: stream.to_string(),
+        content: content.to_string(),
+        created_at: now,
+    })
+}
+
+pub fn list_run_events(conn: &Connection, run_id: &str) -> rusqlite::Result<Vec<DispatchRunEvent>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, run_id, sequence, stream, content, created_at
+         FROM dispatch_run_events WHERE run_id = ?1 ORDER BY sequence ASC",
+    )?;
+    let rows = stmt.query_map(params![run_id], |row| {
+        Ok(DispatchRunEvent {
+            id: row.get(0)?,
+            run_id: row.get(1)?,
+            sequence: row.get(2)?,
+            stream: row.get(3)?,
+            content: row.get(4)?,
+            created_at: row.get(5)?,
+        })
+    })?;
+    rows.collect()
+}
+
+pub fn begin_dispatch_turn(
+    conn: &Connection,
+    run_id: &str,
+    prompt: &str,
+    now: i64,
+) -> rusqlite::Result<(DispatchTurn, DispatchEvent)> {
+    let transaction = conn.unchecked_transaction()?;
+    let status: Option<String> = transaction
+        .query_row(
+            "SELECT status FROM dispatch_runs WHERE id = ?1",
+            params![run_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(status) = status else {
+        return Err(rusqlite::Error::QueryReturnedNoRows);
+    };
+    if !matches!(
+        status.as_str(),
+        "queued" | "idle" | "failed" | "interrupted"
+    ) {
+        return Err(rusqlite::Error::InvalidParameterName(format!(
+            "conversation is {status}, not ready for a prompt"
+        )));
+    }
+
+    let turn_sequence: i64 = transaction.query_row(
+        "SELECT COALESCE(MAX(sequence), 0) + 1 FROM dispatch_turns WHERE run_id = ?1",
+        params![run_id],
+        |row| row.get(0),
+    )?;
+    let turn = DispatchTurn {
+        id: Uuid::new_v4().to_string(),
+        run_id: run_id.to_string(),
+        sequence: turn_sequence,
+        prompt: prompt.to_string(),
+        status: "running".to_string(),
+        started_at: now,
+        ended_at: None,
+        error: None,
+    };
+    transaction.execute(
+        "INSERT INTO dispatch_turns
+         (id, run_id, sequence, prompt, status, started_at)
+         VALUES (?1, ?2, ?3, ?4, 'running', ?5)",
+        params![turn.id, run_id, turn_sequence, prompt, now],
+    )?;
+    let event = append_dispatch_event_in_transaction(
+        &transaction,
+        run_id,
+        Some(&turn.id),
+        "user_message",
+        Some("user"),
+        prompt,
+        None,
+        None,
+        Some("completed"),
+        now,
+    )?;
+    transaction.execute(
+        "UPDATE dispatch_runs
+         SET status = 'running', started_at = COALESCE(started_at, ?2), ended_at = NULL,
+             exit_code = NULL, error = NULL
+         WHERE id = ?1",
+        params![run_id, now],
+    )?;
+    transaction.execute(
+        "UPDATE dispatch_tasks
+         SET status = 'running', updated_at = ?2, completed_at = NULL
+         WHERE id = (SELECT task_id FROM dispatch_runs WHERE id = ?1)",
+        params![run_id, now],
+    )?;
+    transaction.commit()?;
+    Ok((turn, event))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_dispatch_event_in_transaction(
+    conn: &Connection,
+    run_id: &str,
+    turn_id: Option<&str>,
+    kind: &str,
+    role: Option<&str>,
+    content: &str,
+    payload: Option<&str>,
+    provider_event_id: Option<&str>,
+    state: Option<&str>,
+    now: i64,
+) -> rusqlite::Result<DispatchEvent> {
+    let sequence: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(sequence), 0) + 1 FROM dispatch_events WHERE run_id = ?1",
+        params![run_id],
+        |row| row.get(0),
+    )?;
+    conn.execute(
+        "INSERT INTO dispatch_events
+         (run_id, turn_id, sequence, kind, role, content, payload,
+          provider_event_id, state, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            run_id,
+            turn_id,
+            sequence,
+            kind,
+            role,
+            content,
+            payload,
+            provider_event_id,
+            state,
+            now
+        ],
+    )?;
+    Ok(DispatchEvent {
+        id: conn.last_insert_rowid(),
+        run_id: run_id.to_string(),
+        turn_id: turn_id.map(str::to_string),
+        sequence,
+        kind: kind.to_string(),
+        role: role.map(str::to_string),
+        content: content.to_string(),
+        payload: payload.map(str::to_string),
+        provider_event_id: provider_event_id.map(str::to_string),
+        state: state.map(str::to_string),
+        created_at: now,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn append_dispatch_event(
+    conn: &Connection,
+    run_id: &str,
+    turn_id: Option<&str>,
+    kind: &str,
+    role: Option<&str>,
+    content: &str,
+    payload: Option<&str>,
+    provider_event_id: Option<&str>,
+    state: Option<&str>,
+    now: i64,
+) -> rusqlite::Result<DispatchEvent> {
+    append_dispatch_event_in_transaction(
+        conn,
+        run_id,
+        turn_id,
+        kind,
+        role,
+        content,
+        payload,
+        provider_event_id,
+        state,
+        now,
+    )
+}
+
+fn dispatch_event_channel(kind: &str) -> &str {
+    match kind {
+        "tool_call" | "tool_result" => "tool",
+        "assistant_message" => "assistant",
+        "approval_request" | "approval_decision" => "approval",
+        _ => kind,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn upsert_dispatch_event(
+    conn: &Connection,
+    run_id: &str,
+    turn_id: Option<&str>,
+    kind: &str,
+    role: Option<&str>,
+    content: &str,
+    payload: Option<&str>,
+    provider_event_id: Option<&str>,
+    state: Option<&str>,
+    update: DispatchEventUpdate,
+    now: i64,
+) -> rusqlite::Result<DispatchEvent> {
+    let Some(provider_event_id) = provider_event_id.filter(|id| !id.is_empty()) else {
+        return append_dispatch_event_in_transaction(
+            conn,
+            run_id,
+            turn_id,
+            kind,
+            role,
+            content,
+            payload,
+            provider_event_id,
+            state,
+            now,
+        );
+    };
+
+    let existing = {
+        let mut stmt = conn.prepare(
+            "SELECT id, run_id, turn_id, sequence, kind, role, content, payload,
+                    provider_event_id, state, created_at
+             FROM dispatch_events
+             WHERE run_id = ?1 AND turn_id IS ?2 AND provider_event_id = ?3
+             ORDER BY sequence DESC",
+        )?;
+        let rows = stmt.query_map(params![run_id, turn_id, provider_event_id], row_to_dispatch_event)?;
+        let matching = rows
+            .filter_map(Result::ok)
+            .find(|event| dispatch_event_channel(&event.kind) == dispatch_event_channel(kind));
+        matching
+    };
+
+    let Some(existing) = existing else {
+        return append_dispatch_event_in_transaction(
+            conn,
+            run_id,
+            turn_id,
+            kind,
+            role,
+            content,
+            payload,
+            Some(provider_event_id),
+            state,
+            now,
+        );
+    };
+
+    let next_content = if dispatch_event_channel(kind) == "tool" && kind == "tool_result" {
+        existing.content.clone()
+    } else {
+        match update {
+            DispatchEventUpdate::Append => format!("{}{}", existing.content, content),
+            DispatchEventUpdate::Replace => content.to_string(),
+        }
+    };
+    let next_payload = payload
+        .map(str::to_string)
+        .or_else(|| existing.payload.clone());
+    let next_role = role.map(str::to_string).or_else(|| existing.role.clone());
+    let next_state = state.map(str::to_string).or_else(|| existing.state.clone());
+    conn.execute(
+        "UPDATE dispatch_events
+         SET kind = ?2, role = ?3, content = ?4, payload = ?5, state = ?6
+         WHERE id = ?1",
+        params![
+            existing.id,
+            kind,
+            next_role,
+            next_content,
+            next_payload,
+            next_state
+        ],
+    )?;
+
+    Ok(DispatchEvent {
+        kind: kind.to_string(),
+        role: next_role,
+        content: next_content,
+        payload: next_payload,
+        state: next_state,
+        ..existing
+    })
+}
+
+pub fn set_dispatch_provider_session(
+    conn: &Connection,
+    run_id: &str,
+    provider_session_id: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE dispatch_runs
+         SET provider_session_id = ?2
+         WHERE id = ?1 AND (provider_session_id IS NULL OR provider_session_id = '')",
+        params![run_id, provider_session_id],
+    )?;
+    Ok(())
+}
+
+pub fn set_dispatch_run_status(
+    conn: &Connection,
+    run_id: &str,
+    status: &str,
+    error: Option<&str>,
+    now: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE dispatch_runs SET status = ?2, error = ?3 WHERE id = ?1 AND status != 'shut_down'",
+        params![run_id, status, error],
+    )?;
+    conn.execute(
+        "UPDATE dispatch_tasks SET status = ?2, updated_at = ?3
+         WHERE id = (SELECT task_id FROM dispatch_runs WHERE id = ?1)",
+        params![run_id, status, now],
+    )?;
+    Ok(())
+}
+
+pub fn settle_dispatch_turn(
+    conn: &Connection,
+    run_id: &str,
+    turn_id: &str,
+    turn_status: &str,
+    conversation_status: &str,
+    exit_code: Option<i64>,
+    error: Option<&str>,
+    now: i64,
+) -> rusqlite::Result<()> {
+    let transaction = conn.unchecked_transaction()?;
+    transaction.execute(
+        "UPDATE dispatch_turns
+         SET status = ?2, ended_at = ?3, error = ?4 WHERE id = ?1",
+        params![turn_id, turn_status, now, error],
+    )?;
+    transaction.execute(
+        "UPDATE dispatch_runs
+         SET status = CASE WHEN status = 'shut_down' THEN status ELSE ?2 END,
+             exit_code = ?3,
+             error = CASE WHEN status = 'shut_down' THEN error ELSE ?4 END
+         WHERE id = ?1",
+        params![run_id, conversation_status, exit_code, error],
+    )?;
+    let actual_status: Option<String> = transaction
+        .query_row(
+            "SELECT status FROM dispatch_runs WHERE id = ?1",
+            params![run_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(actual_status) = actual_status {
+        transaction.execute(
+            "UPDATE dispatch_tasks SET status = ?2, updated_at = ?3,
+                    completed_at = CASE WHEN ?2 = 'shut_down' THEN ?3 ELSE NULL END
+             WHERE id = (SELECT task_id FROM dispatch_runs WHERE id = ?1)",
+            params![run_id, actual_status, now],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+pub fn resolve_dispatch_event(
+    conn: &Connection,
+    run_id: &str,
+    event_id: i64,
+    decision: &str,
+) -> rusqlite::Result<bool> {
+    let changed = conn.execute(
+        "UPDATE dispatch_events SET state = ?3
+         WHERE id = ?2 AND run_id = ?1 AND kind = 'approval_request' AND state = 'pending'",
+        params![run_id, event_id, decision],
+    )?;
+    Ok(changed > 0)
+}
+
+pub fn shutdown_dispatch_conversation(
+    conn: &Connection,
+    run_id: &str,
+    now: i64,
+) -> rusqlite::Result<()> {
+    let transaction = conn.unchecked_transaction()?;
+    transaction.execute(
+        "UPDATE dispatch_runs
+         SET status = 'shut_down', shutdown_at = ?2, ended_at = ?2
+         WHERE id = ?1",
+        params![run_id, now],
+    )?;
+    transaction.execute(
+        "UPDATE dispatch_turns
+         SET status = CASE WHEN status IN ('running', 'interrupting') THEN 'interrupted' ELSE status END,
+             ended_at = CASE WHEN ended_at IS NULL THEN ?2 ELSE ended_at END
+         WHERE run_id = ?1",
+        params![run_id, now],
+    )?;
+    transaction.execute(
+        "UPDATE dispatch_tasks
+         SET status = 'shut_down', updated_at = ?2, completed_at = ?2
+         WHERE id = (SELECT task_id FROM dispatch_runs WHERE id = ?1)",
+        params![run_id, now],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn row_to_dispatch_turn(row: &Row) -> rusqlite::Result<DispatchTurn> {
+    Ok(DispatchTurn {
+        id: row.get(0)?,
+        run_id: row.get(1)?,
+        sequence: row.get(2)?,
+        prompt: row.get(3)?,
+        status: row.get(4)?,
+        started_at: row.get(5)?,
+        ended_at: row.get(6)?,
+        error: row.get(7)?,
+    })
+}
+
+fn row_to_dispatch_event(row: &Row) -> rusqlite::Result<DispatchEvent> {
+    Ok(DispatchEvent {
+        id: row.get(0)?,
+        run_id: row.get(1)?,
+        turn_id: row.get(2)?,
+        sequence: row.get(3)?,
+        kind: row.get(4)?,
+        role: row.get(5)?,
+        content: row.get(6)?,
+        payload: row.get(7)?,
+        provider_event_id: row.get(8)?,
+        state: row.get(9)?,
+        created_at: row.get(10)?,
+    })
+}
+
+fn strip_terminal_control(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for next in chars.by_ref() {
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+            } else {
+                chars.next();
+            }
+            continue;
+        }
+        if ch == '\r' {
+            continue;
+        }
+        if !ch.is_control() || ch == '\n' || ch == '\t' {
+            result.push(ch);
+        }
+    }
+    result
+}
+
+pub fn get_dispatch_conversation(
+    conn: &Connection,
+    run_id: &str,
+) -> rusqlite::Result<Option<DispatchConversation>> {
+    let Some(run) = get_dispatch_run(conn, run_id)? else {
+        return Ok(None);
+    };
+    let mut turn_stmt = conn.prepare(
+        "SELECT id, run_id, sequence, prompt, status, started_at, ended_at, error
+         FROM dispatch_turns WHERE run_id = ?1 ORDER BY sequence ASC",
+    )?;
+    let turns = turn_stmt
+        .query_map(params![run_id], row_to_dispatch_turn)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut event_stmt = conn.prepare(
+        "SELECT id, run_id, turn_id, sequence, kind, role, content, payload,
+                provider_event_id, state, created_at
+         FROM dispatch_events WHERE run_id = ?1 ORDER BY sequence ASC",
+    )?;
+    let mut events = event_stmt
+        .query_map(params![run_id], row_to_dispatch_event)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let legacy = events.is_empty();
+    if legacy {
+        events = list_run_events(conn, run_id)?
+            .into_iter()
+            .filter_map(|event| {
+                let content = strip_terminal_control(&event.content);
+                (!content.trim().is_empty()).then_some(DispatchEvent {
+                    id: -event.id,
+                    run_id: event.run_id,
+                    turn_id: None,
+                    sequence: event.sequence,
+                    kind: "legacy_output".to_string(),
+                    role: (event.stream == "input").then(|| "user".to_string()),
+                    content,
+                    payload: None,
+                    provider_event_id: None,
+                    state: Some("completed".to_string()),
+                    created_at: event.created_at,
+                })
+            })
+            .collect();
+    }
+    Ok(Some(DispatchConversation {
+        run,
+        turns,
+        events,
+        legacy,
+    }))
+}
+
+pub fn mark_incomplete_dispatch_runs_interrupted(
+    conn: &Connection,
+    now: i64,
+) -> rusqlite::Result<()> {
+    let transaction = conn.unchecked_transaction()?;
+    let run_ids = {
+        let mut stmt = transaction.prepare(
+            "SELECT id FROM dispatch_runs
+             WHERE status IN (
+               'queued', 'starting', 'running', 'awaiting_approval',
+               'interrupting', 'cancelling'
+             )",
+        )?;
+        let run_ids = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        run_ids
+    };
+    for run_id in run_ids {
+        transaction.execute(
+            "UPDATE dispatch_turns
+             SET status = 'interrupted', ended_at = ?2,
+                 error = 'Relay closed while this turn was active'
+             WHERE run_id = ?1 AND status IN ('running', 'awaiting_approval', 'interrupting')",
+            params![run_id, now],
+        )?;
+        transaction.execute(
+            "UPDATE dispatch_runs
+             SET status = 'idle', error = 'Relay closed while the last turn was active'
+             WHERE id = ?1",
+            params![run_id],
+        )?;
+        transaction.execute(
+            "UPDATE dispatch_tasks SET status = 'idle', updated_at = ?2
+             WHERE id = (SELECT task_id FROM dispatch_runs WHERE id = ?1)",
+            params![run_id, now],
+        )?;
+        clear_pending_launch_for_dispatch_run(&transaction, &run_id)?;
+        sync_card_for_dispatch_run(&transaction, &run_id, "review")?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+pub fn link_latest_run_to_session(
+    conn: &Connection,
+    project_id: &str,
+    agent: &str,
+    session_id: &str,
+) -> rusqlite::Result<()> {
+    let cutoff = chrono::Utc::now().timestamp() - PENDING_LAUNCH_WINDOW_SECS;
+    conn.execute(
+        "UPDATE dispatch_runs SET session_id = ?3
+         WHERE id = (
+           SELECT r.id FROM dispatch_runs r
+           JOIN dispatch_tasks t ON t.id = r.task_id
+           JOIN cards c ON c.id = t.card_id
+           WHERE t.project_id = ?1 AND r.agent = ?2 AND r.session_id IS NULL
+             AND c.pending_launch_at IS NOT NULL AND c.pending_launch_at >= ?4
+             AND (c.pending_launch_agent IS NULL OR c.pending_launch_agent = ?2)
+           ORDER BY COALESCE(r.started_at, r.created_at) DESC LIMIT 1
+         )",
+        params![project_id, agent, session_id, cutoff],
+    )?;
+    Ok(())
+}
+
+pub fn project_path(conn: &Connection, project_id: &str) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT path FROM projects WHERE id = ?1",
+        params![project_id],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+/// Keeps a dispatched task's board card aligned with the lifecycle Relay owns even when an
+/// agent does not expose an ingestible native session log. If an ingested session is linked,
+/// the existing session-based sync remains compatible because both target the same role.
+pub fn sync_card_for_dispatch_run(
+    conn: &Connection,
+    run_id: &str,
+    role: &str,
+) -> rusqlite::Result<()> {
+    let linked: Option<(String, String)> = conn
+        .query_row(
+            "SELECT c.id, c.board_id
+             FROM dispatch_runs r
+             JOIN dispatch_tasks t ON t.id = r.task_id
+             JOIN cards c ON c.id = t.card_id
+             WHERE r.id = ?1
+               AND r.attempt = (
+                 SELECT MAX(r2.attempt) FROM dispatch_runs r2 WHERE r2.task_id = r.task_id
+               )",
+            params![run_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((card_id, board_id)) = linked else {
+        return Ok(());
+    };
+    let column_id: Option<String> = conn
+        .query_row(
+            "SELECT id FROM columns WHERE board_id = ?1 AND role = ?2",
+            params![board_id, role],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(column_id) = column_id else {
+        return Ok(());
+    };
+    let position = next_position_in_column(conn, &column_id)?;
+    conn.execute(
+        "UPDATE cards SET column_id = ?2, position = ?3, updated_at = ?4 WHERE id = ?1",
+        params![card_id, column_id, position, chrono::Utc::now().timestamp()],
+    )?;
+    Ok(())
+}
+
+pub fn clear_pending_launch_for_dispatch_run(
+    conn: &Connection,
+    run_id: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE cards
+         SET pending_launch_at = NULL, pending_launch_agent = NULL
+         WHERE id = (
+           SELECT t.card_id FROM dispatch_runs r
+           JOIN dispatch_tasks t ON t.id = r.task_id
+           WHERE r.id = ?1
+         )",
+        params![run_id],
+    )?;
+    Ok(())
+}
+
 // --- Read side (frontend commands) ---
 
 /// Lists projects for display. A project row can exist for a directory Relay noticed but that
@@ -354,6 +1516,55 @@ pub fn get_session(conn: &Connection, session_id: &str) -> rusqlite::Result<Opti
     let sql = format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE id = ?1");
     conn.query_row(&sql, params![session_id], row_to_session)
         .optional()
+}
+
+pub fn is_session_deleted(conn: &Connection, session_id: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM deleted_sessions WHERE session_id = ?1)",
+        params![session_id],
+        |row| row.get(0),
+    )
+}
+
+/// Removes Relay's derived session data while preserving the agent-owned raw log. Cards and
+/// dispatch attempts remain as standalone work history with their session links cleared.
+/// Returns false when the session no longer exists.
+pub fn delete_session(conn: &Connection, session_id: &str, now: i64) -> rusqlite::Result<bool> {
+    let transaction = conn.unchecked_transaction()?;
+    let raw_log_path = transaction
+        .query_row(
+            "SELECT raw_log_path FROM sessions WHERE id = ?1",
+            params![session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(raw_log_path) = raw_log_path else {
+        return Ok(false);
+    };
+
+    transaction.execute(
+        "INSERT INTO deleted_sessions (session_id, raw_log_path, deleted_at)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(session_id) DO UPDATE SET
+           raw_log_path = excluded.raw_log_path,
+           deleted_at = excluded.deleted_at",
+        params![session_id, raw_log_path, now],
+    )?;
+    transaction.execute(
+        "UPDATE cards SET session_id = NULL, updated_at = ?2 WHERE session_id = ?1",
+        params![session_id, now],
+    )?;
+    transaction.execute(
+        "UPDATE dispatch_runs SET session_id = NULL WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM files_changed WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    transaction.execute("DELETE FROM sessions WHERE id = ?1", params![session_id])?;
+    transaction.commit()?;
+    Ok(true)
 }
 
 /// Before/after text spanning every `files_changed` row for one file within one session,
@@ -873,7 +2084,14 @@ pub fn ensure_board_for_project(conn: &Connection, project_id: &str) -> rusqlite
         conn.execute(
             "INSERT INTO columns (id, board_id, name, role, position, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![Uuid::new_v4().to_string(), board_id, name, role, position as i64, now],
+            params![
+                Uuid::new_v4().to_string(),
+                board_id,
+                name,
+                role,
+                position as i64,
+                now
+            ],
         )?;
     }
 
@@ -996,22 +2214,36 @@ const PENDING_LAUNCH_WINDOW_SECS: i64 = 120;
 pub fn set_card_pending_launch(conn: &Connection, card_id: &str) -> rusqlite::Result<()> {
     let now = chrono::Utc::now().timestamp();
     conn.execute(
-        "UPDATE cards SET pending_launch_at = ?2 WHERE id = ?1",
+        "UPDATE cards SET pending_launch_at = ?2, pending_launch_agent = NULL WHERE id = ?1",
         params![card_id, now],
     )?;
     Ok(())
 }
 
+pub fn set_card_pending_launch_for_agent(
+    conn: &Connection,
+    card_id: &str,
+    agent: &str,
+) -> rusqlite::Result<()> {
+    let now = chrono::Utc::now().timestamp();
+    conn.execute(
+        "UPDATE cards SET pending_launch_at = ?2, pending_launch_agent = ?3 WHERE id = ?1",
+        params![card_id, now, agent],
+    )?;
+    Ok(())
+}
+
 /// Reconciles a brand-new session against a card that spawned it. If `project_id` has an
-/// unlinked card stamped with a recent `pending_launch_at` (within `PENDING_LAUNCH_WINDOW_SECS`,
+/// card stamped with a recent `pending_launch_at` (within `PENDING_LAUNCH_WINDOW_SECS`,
 /// most-recent stamp wins), links `session_id` into that card, clears the stamp, and syncs it
 /// to the `in_progress` column — then returns `true` so the caller skips auto-creating a
-/// duplicate. Returns `false` (leaving the normal `auto_create_card_for_session` path to run)
-/// when no eligible card exists. The card keeps its user-authored title; only the linkage
-/// changes. See `commands::launch_or_attach_session` for the launch-side stamp.
+/// duplicate. A retry intentionally replaces the card's prior session link: the card tracks
+/// the durable task while `dispatch_runs` retains every attempt/session. Returns `false`
+/// (leaving the normal auto-create path to run) when no eligible card exists.
 pub fn adopt_pending_card_for_session(
     conn: &Connection,
     project_id: &str,
+    agent: &str,
     session_id: &str,
 ) -> rusqlite::Result<bool> {
     let cutoff = chrono::Utc::now().timestamp() - PENDING_LAUNCH_WINDOW_SECS;
@@ -1021,12 +2253,12 @@ pub fn adopt_pending_card_for_session(
              FROM cards c
              JOIN boards b ON b.id = c.board_id
              WHERE b.project_id = ?1
-               AND c.session_id IS NULL
                AND c.pending_launch_at IS NOT NULL
                AND c.pending_launch_at >= ?2
+               AND (c.pending_launch_agent IS NULL OR c.pending_launch_agent = ?3)
              ORDER BY c.pending_launch_at DESC
              LIMIT 1",
-            params![project_id, cutoff],
+            params![project_id, cutoff, agent],
             |row| row.get(0),
         )
         .optional()?;
@@ -1036,10 +2268,24 @@ pub fn adopt_pending_card_for_session(
 
     let now = chrono::Utc::now().timestamp();
     conn.execute(
-        "UPDATE cards SET session_id = ?2, pending_launch_at = NULL, updated_at = ?3 WHERE id = ?1",
+        "UPDATE cards
+         SET session_id = ?2, pending_launch_at = NULL, pending_launch_agent = NULL, updated_at = ?3
+         WHERE id = ?1",
         params![card_id, session_id, now],
     )?;
-    sync_card_for_session(conn, session_id, "in_progress")?;
+    let dispatch_status: Option<String> = conn
+        .query_row(
+            "SELECT status FROM dispatch_runs WHERE session_id = ?1
+             ORDER BY COALESCE(started_at, created_at) DESC LIMIT 1",
+            params![session_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let role = match dispatch_status.as_deref() {
+        Some("queued" | "starting" | "running") | None => "in_progress",
+        Some(_) => "review",
+    };
+    sync_card_for_session(conn, session_id, role)?;
     Ok(true)
 }
 
@@ -1096,7 +2342,11 @@ pub fn auto_create_card_for_session(
 /// wherever the user last dragged the card, per the design's "auto-sync always wins on
 /// transition" rule. No-ops if no card is linked to this session, or if the target role
 /// column doesn't exist on the card's board.
-pub fn sync_card_for_session(conn: &Connection, session_id: &str, role: &str) -> rusqlite::Result<()> {
+pub fn sync_card_for_session(
+    conn: &Connection,
+    session_id: &str,
+    role: &str,
+) -> rusqlite::Result<()> {
     let linked: Option<(String, String)> = conn
         .query_row(
             "SELECT id, board_id FROM cards WHERE session_id = ?1",
@@ -1129,7 +2379,12 @@ pub fn sync_card_for_session(conn: &Connection, session_id: &str, role: &str) ->
     Ok(())
 }
 
-pub fn move_card(conn: &Connection, card_id: &str, column_id: &str, position: i64) -> rusqlite::Result<()> {
+pub fn move_card(
+    conn: &Connection,
+    card_id: &str,
+    column_id: &str,
+    position: i64,
+) -> rusqlite::Result<()> {
     let now = chrono::Utc::now().timestamp();
     conn.execute(
         "UPDATE cards SET column_id = ?2, position = ?3, updated_at = ?4 WHERE id = ?1",
@@ -1203,7 +2458,11 @@ pub fn delete_card(conn: &Connection, card_id: &str) -> rusqlite::Result<()> {
 /// that duplicate is deleted first, since `cards.session_id` is UNIQUE. Immediately syncs the
 /// card to whichever column matches the session's *current* status, so linking a card to an
 /// already-active or already-ended session doesn't leave it stranded wherever it was created.
-pub fn link_session_to_card(conn: &Connection, card_id: &str, session_id: &str) -> rusqlite::Result<()> {
+pub fn link_session_to_card(
+    conn: &Connection,
+    card_id: &str,
+    session_id: &str,
+) -> rusqlite::Result<()> {
     conn.execute(
         "DELETE FROM cards WHERE session_id = ?1 AND id != ?2",
         params![session_id, card_id],
@@ -1268,10 +2527,14 @@ mod file_diff_span_tests {
 
     fn in_memory_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(include_str!("../../migrations/0001_init.sql")).unwrap();
-        conn.execute_batch(include_str!("../../migrations/0002_file_diff_content.sql")).unwrap();
-        conn.execute_batch(include_str!("../../migrations/0003_kanban.sql")).unwrap();
-        conn.execute_batch(include_str!("../../migrations/0004_session_title.sql")).unwrap();
+        conn.execute_batch(include_str!("../../migrations/0001_init.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../../migrations/0002_file_diff_content.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../../migrations/0003_kanban.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../../migrations/0004_session_title.sql"))
+            .unwrap();
         conn
     }
 
@@ -1290,14 +2553,55 @@ mod file_diff_span_tests {
         let conn = in_memory_db();
         seed_session(&conn, "s1");
 
-        insert_file_changed(&conn, "s1", "src/main.rs", "write", 3, 0, 100, None, Some("fn main() {}")).unwrap();
-        insert_file_changed(&conn, "s1", "src/main.rs", "edit", 1, 0, 200, Some("fn main() {}"), Some("fn main() { a(); }")).unwrap();
-        insert_file_changed(&conn, "s1", "src/main.rs", "edit", 1, 0, 300, Some("fn main() { a(); }"), Some("fn main() { a(); b(); }")).unwrap();
+        insert_file_changed(
+            &conn,
+            "s1",
+            "src/main.rs",
+            "write",
+            3,
+            0,
+            100,
+            None,
+            Some("fn main() {}"),
+        )
+        .unwrap();
+        insert_file_changed(
+            &conn,
+            "s1",
+            "src/main.rs",
+            "edit",
+            1,
+            0,
+            200,
+            Some("fn main() {}"),
+            Some("fn main() { a(); }"),
+        )
+        .unwrap();
+        insert_file_changed(
+            &conn,
+            "s1",
+            "src/main.rs",
+            "edit",
+            1,
+            0,
+            300,
+            Some("fn main() { a(); }"),
+            Some("fn main() { a(); b(); }"),
+        )
+        .unwrap();
 
         let span = file_diff_span(&conn, "s1", "src/main.rs").unwrap().unwrap();
 
-        assert_eq!(span.old_content.as_deref(), None, "before-text is from the earliest edit (a Write, so None)");
-        assert_eq!(span.new_content.as_deref(), Some("fn main() { a(); b(); }"), "after-text is from the most recent edit");
+        assert_eq!(
+            span.old_content.as_deref(),
+            None,
+            "before-text is from the earliest edit (a Write, so None)"
+        );
+        assert_eq!(
+            span.new_content.as_deref(),
+            Some("fn main() { a(); b(); }"),
+            "after-text is from the most recent edit"
+        );
         assert_eq!(span.latest_occurred_at, 300);
         assert_eq!(span.edit_count, 3);
     }
@@ -1306,9 +2610,22 @@ mod file_diff_span_tests {
     fn returns_none_when_the_session_never_touched_that_file() {
         let conn = in_memory_db();
         seed_session(&conn, "s1");
-        insert_file_changed(&conn, "s1", "src/main.rs", "write", 1, 0, 100, None, Some("x")).unwrap();
+        insert_file_changed(
+            &conn,
+            "s1",
+            "src/main.rs",
+            "write",
+            1,
+            0,
+            100,
+            None,
+            Some("x"),
+        )
+        .unwrap();
 
-        assert!(file_diff_span(&conn, "s1", "src/other.rs").unwrap().is_none());
+        assert!(file_diff_span(&conn, "s1", "src/other.rs")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -1316,8 +2633,30 @@ mod file_diff_span_tests {
         let conn = in_memory_db();
         seed_session(&conn, "s1");
         seed_session(&conn, "s2");
-        insert_file_changed(&conn, "s1", "src/main.rs", "write", 1, 0, 100, None, Some("from s1")).unwrap();
-        insert_file_changed(&conn, "s2", "src/main.rs", "write", 1, 0, 200, None, Some("from s2")).unwrap();
+        insert_file_changed(
+            &conn,
+            "s1",
+            "src/main.rs",
+            "write",
+            1,
+            0,
+            100,
+            None,
+            Some("from s1"),
+        )
+        .unwrap();
+        insert_file_changed(
+            &conn,
+            "s2",
+            "src/main.rs",
+            "write",
+            1,
+            0,
+            200,
+            None,
+            Some("from s2"),
+        )
+        .unwrap();
 
         let span = file_diff_span(&conn, "s1", "src/main.rs").unwrap().unwrap();
         assert_eq!(span.new_content.as_deref(), Some("from s1"));
@@ -1331,10 +2670,14 @@ mod report_tests {
 
     fn in_memory_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(include_str!("../../migrations/0001_init.sql")).unwrap();
-        conn.execute_batch(include_str!("../../migrations/0002_file_diff_content.sql")).unwrap();
-        conn.execute_batch(include_str!("../../migrations/0003_kanban.sql")).unwrap();
-        conn.execute_batch(include_str!("../../migrations/0004_session_title.sql")).unwrap();
+        conn.execute_batch(include_str!("../../migrations/0001_init.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../../migrations/0002_file_diff_content.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../../migrations/0003_kanban.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../../migrations/0004_session_title.sql"))
+            .unwrap();
         conn
     }
 
@@ -1378,7 +2721,11 @@ mod report_tests {
         // p1 has no sessions at all inside (or outside) the window.
 
         let rows = report_by_project(&conn, 1000).unwrap();
-        assert_eq!(rows.len(), 1, "a project with zero sessions in the window must not appear");
+        assert_eq!(
+            rows.len(),
+            1,
+            "a project with zero sessions in the window must not appear"
+        );
         assert_eq!(rows[0].project_name, "busy");
         assert_eq!(rows[0].session_count, 2);
         assert_eq!(rows[0].total_cost_usd, 10.0);
@@ -1388,8 +2735,24 @@ mod report_tests {
     fn report_by_tag_credits_full_cost_to_every_tag_on_a_multi_tagged_session() {
         let conn = in_memory_db();
         upsert_project(&conn, "p1", "fixture", "/fixture", 1000).unwrap();
-        seed_session(&conn, "s1", "p1", "claude", 2000, 4.0, Some(r#"["feature","bugfix"]"#));
-        seed_session(&conn, "s2", "p1", "claude", 2000, 2.0, Some(r#"["feature"]"#));
+        seed_session(
+            &conn,
+            "s1",
+            "p1",
+            "claude",
+            2000,
+            4.0,
+            Some(r#"["feature","bugfix"]"#),
+        );
+        seed_session(
+            &conn,
+            "s2",
+            "p1",
+            "claude",
+            2000,
+            2.0,
+            Some(r#"["feature"]"#),
+        );
         seed_session(&conn, "s3", "p1", "claude", 2000, 100.0, None); // untagged, must be skipped
 
         let rows = report_by_tag(&conn, 1000).unwrap();
@@ -1405,7 +2768,15 @@ mod report_tests {
     fn report_by_tag_skips_malformed_json_instead_of_failing_the_whole_query() {
         let conn = in_memory_db();
         upsert_project(&conn, "p1", "fixture", "/fixture", 1000).unwrap();
-        seed_session(&conn, "s1", "p1", "claude", 2000, 3.0, Some("not valid json"));
+        seed_session(
+            &conn,
+            "s1",
+            "p1",
+            "claude",
+            2000,
+            3.0,
+            Some("not valid json"),
+        );
         seed_session(&conn, "s2", "p1", "claude", 2000, 1.0, Some(r#"["docs"]"#));
 
         let rows = report_by_tag(&conn, 1000).unwrap();
@@ -1433,12 +2804,24 @@ mod kanban_tests {
 
     fn in_memory_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(include_str!("../../migrations/0001_init.sql")).unwrap();
-        conn.execute_batch(include_str!("../../migrations/0002_file_diff_content.sql")).unwrap();
-        conn.execute_batch(include_str!("../../migrations/0003_kanban.sql")).unwrap();
-        conn.execute_batch(include_str!("../../migrations/0004_session_title.sql")).unwrap();
-        conn.execute_batch(include_str!("../../migrations/0005_plan.sql")).unwrap();
-        conn.execute_batch(include_str!("../../migrations/0006_card_pending_launch.sql")).unwrap();
+        conn.execute_batch(include_str!("../../migrations/0001_init.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../../migrations/0002_file_diff_content.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../../migrations/0003_kanban.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../../migrations/0004_session_title.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../../migrations/0005_plan.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!(
+            "../../migrations/0006_card_pending_launch.sql"
+        ))
+        .unwrap();
+        conn.execute_batch(include_str!("../../migrations/0007_dispatch.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../../migrations/0009_dispatch_chat.sql"))
+            .unwrap();
         conn
     }
 
@@ -1472,10 +2855,17 @@ mod kanban_tests {
 
         let board_id_1 = ensure_board_for_project(&conn, "p1").unwrap();
         let board_id_2 = ensure_board_for_project(&conn, "p1").unwrap();
-        assert_eq!(board_id_1, board_id_2, "second call must not create a second board");
+        assert_eq!(
+            board_id_1, board_id_2,
+            "second call must not create a second board"
+        );
 
         let column_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM columns WHERE board_id = ?1", params![board_id_1], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM columns WHERE board_id = ?1",
+                params![board_id_1],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(column_count, 4);
 
@@ -1498,11 +2888,19 @@ mod kanban_tests {
         let board_id = ensure_board_for_project(&conn, "p1").unwrap();
         auto_create_card_for_session(&conn, &board_id, "s1", "New session").unwrap();
 
-        let card_id: String = conn.query_row("SELECT id FROM cards", [], |r| r.get(0)).unwrap();
-        assert_eq!(column_role_for_card(&conn, &card_id).as_deref(), Some("in_progress"));
+        let card_id: String = conn
+            .query_row("SELECT id FROM cards", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            column_role_for_card(&conn, &card_id).as_deref(),
+            Some("in_progress")
+        );
 
         sync_card_for_session(&conn, "s1", "review").unwrap();
-        assert_eq!(column_role_for_card(&conn, &card_id).as_deref(), Some("review"));
+        assert_eq!(
+            column_role_for_card(&conn, &card_id).as_deref(),
+            Some("review")
+        );
     }
 
     #[test]
@@ -1514,7 +2912,9 @@ mod kanban_tests {
         // No card was ever created for "s1" — must not error.
         sync_card_for_session(&conn, "s1", "review").unwrap();
 
-        let card_count: i64 = conn.query_row("SELECT COUNT(*) FROM cards", [], |r| r.get(0)).unwrap();
+        let card_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM cards", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(card_count, 0);
     }
 
@@ -1526,42 +2926,68 @@ mod kanban_tests {
 
         // Simulates the session starting first (auto-creates a card)...
         auto_create_card_for_session(&conn, &board_id, "s1", "New session").unwrap();
-        let auto_card_id: String = conn.query_row("SELECT id FROM cards", [], |r| r.get(0)).unwrap();
+        let auto_card_id: String = conn
+            .query_row("SELECT id FROM cards", [], |r| r.get(0))
+            .unwrap();
 
         // ...then the user retroactively linking it to a manual planning card instead.
         let todo_column_id: String = conn
-            .query_row("SELECT id FROM columns WHERE board_id = ?1 AND role = 'todo'", params![board_id], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM columns WHERE board_id = ?1 AND role = 'todo'",
+                params![board_id],
+                |r| r.get(0),
+            )
             .unwrap();
-        let manual_card = create_card(&conn, &board_id, &todo_column_id, "Plan the thing", None).unwrap();
+        let manual_card =
+            create_card(&conn, &board_id, &todo_column_id, "Plan the thing", None).unwrap();
 
         link_session_to_card(&conn, &manual_card.id, "s1").unwrap();
 
-        let card_count: i64 = conn.query_row("SELECT COUNT(*) FROM cards", [], |r| r.get(0)).unwrap();
-        assert_eq!(card_count, 1, "the duplicate auto-created card must be gone");
+        let card_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM cards", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            card_count, 1,
+            "the duplicate auto-created card must be gone"
+        );
 
-        let remaining_id: String = conn.query_row("SELECT id FROM cards", [], |r| r.get(0)).unwrap();
+        let remaining_id: String = conn
+            .query_row("SELECT id FROM cards", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(remaining_id, manual_card.id);
         assert_ne!(remaining_id, auto_card_id);
 
         // Session "s1" is still 'active', so linking must place the card in 'in_progress'.
-        assert_eq!(column_role_for_card(&conn, &manual_card.id).as_deref(), Some("in_progress"));
+        assert_eq!(
+            column_role_for_card(&conn, &manual_card.id).as_deref(),
+            Some("in_progress")
+        );
     }
 
     #[test]
     fn link_session_to_card_places_card_in_review_for_an_already_ended_session() {
         let conn = in_memory_db();
         seed_project_and_session(&conn, "p1", "s1");
-        conn.execute("UPDATE sessions SET status = 'ended' WHERE id = 's1'", []).unwrap();
+        conn.execute("UPDATE sessions SET status = 'ended' WHERE id = 's1'", [])
+            .unwrap();
         let board_id = ensure_board_for_project(&conn, "p1").unwrap();
 
         let todo_column_id: String = conn
-            .query_row("SELECT id FROM columns WHERE board_id = ?1 AND role = 'todo'", params![board_id], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM columns WHERE board_id = ?1 AND role = 'todo'",
+                params![board_id],
+                |r| r.get(0),
+            )
             .unwrap();
-        let manual_card = create_card(&conn, &board_id, &todo_column_id, "Plan the thing", None).unwrap();
+        let manual_card =
+            create_card(&conn, &board_id, &todo_column_id, "Plan the thing", None).unwrap();
 
         link_session_to_card(&conn, &manual_card.id, "s1").unwrap();
 
-        assert_eq!(column_role_for_card(&conn, &manual_card.id).as_deref(), Some("review"));
+        assert_eq!(
+            column_role_for_card(&conn, &manual_card.id).as_deref(),
+            Some("review")
+        );
     }
 
     #[test]
@@ -1570,20 +2996,36 @@ mod kanban_tests {
         upsert_project(&conn, "p1", "fixture", "/fixture", 1000).unwrap();
         let board_id = ensure_board_for_project(&conn, "p1").unwrap();
         let in_progress_id: String = conn
-            .query_row("SELECT id FROM columns WHERE board_id = ?1 AND role = 'in_progress'", params![board_id], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM columns WHERE board_id = ?1 AND role = 'in_progress'",
+                params![board_id],
+                |r| r.get(0),
+            )
             .unwrap();
 
         // A user-authored planning card that was just used to spawn a terminal session.
-        let card = create_card(&conn, &board_id, &in_progress_id, "Fix the linkedin section", None).unwrap();
+        let card = create_card(
+            &conn,
+            &board_id,
+            &in_progress_id,
+            "Fix the linkedin section",
+            None,
+        )
+        .unwrap();
         set_card_pending_launch(&conn, &card.id).unwrap();
 
         // The session Claude Code creates then gets ingested.
         seed_session_only(&conn, "p1", "s1");
-        let adopted = adopt_pending_card_for_session(&conn, "p1", "s1").unwrap();
-        assert!(adopted, "the stamped card should have adopted the new session");
+        let adopted = adopt_pending_card_for_session(&conn, "p1", "claude", "s1").unwrap();
+        assert!(
+            adopted,
+            "the stamped card should have adopted the new session"
+        );
 
         // Exactly one card, still the user's card and title, now linked and with the stamp cleared.
-        let card_count: i64 = conn.query_row("SELECT COUNT(*) FROM cards", [], |r| r.get(0)).unwrap();
+        let card_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM cards", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(card_count, 1, "no duplicate card should have been created");
         let (title, session_id, pending): (String, Option<String>, Option<i64>) = conn
             .query_row(
@@ -1603,21 +3045,65 @@ mod kanban_tests {
         upsert_project(&conn, "p1", "fixture", "/fixture", 1000).unwrap();
         let board_id = ensure_board_for_project(&conn, "p1").unwrap();
         let in_progress_id: String = conn
-            .query_row("SELECT id FROM columns WHERE board_id = ?1 AND role = 'in_progress'", params![board_id], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM columns WHERE board_id = ?1 AND role = 'in_progress'",
+                params![board_id],
+                |r| r.get(0),
+            )
             .unwrap();
         let card = create_card(&conn, &board_id, &in_progress_id, "Stale plan", None).unwrap();
         // Stamp far outside the adoption window.
         let stale = chrono::Utc::now().timestamp() - PENDING_LAUNCH_WINDOW_SECS - 60;
-        conn.execute("UPDATE cards SET pending_launch_at = ?2 WHERE id = ?1", params![card.id, stale]).unwrap();
+        conn.execute(
+            "UPDATE cards SET pending_launch_at = ?2 WHERE id = ?1",
+            params![card.id, stale],
+        )
+        .unwrap();
 
         seed_session_only(&conn, "p1", "s1");
-        let adopted = adopt_pending_card_for_session(&conn, "p1", "s1").unwrap();
-        assert!(!adopted, "an expired stamp must fall through to the auto-create path");
+        let adopted = adopt_pending_card_for_session(&conn, "p1", "claude", "s1").unwrap();
+        assert!(
+            !adopted,
+            "an expired stamp must fall through to the auto-create path"
+        );
         // Card is untouched (still unlinked) so the caller will auto-create as normal.
         let session_id: Option<String> = conn
-            .query_row("SELECT session_id FROM cards WHERE id = ?1", params![card.id], |r| r.get(0))
+            .query_row(
+                "SELECT session_id FROM cards WHERE id = ?1",
+                params![card.id],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(session_id, None);
+    }
+
+    #[test]
+    fn adoption_uses_the_launch_agent_when_multiple_agents_share_a_project() {
+        let conn = in_memory_db();
+        upsert_project(&conn, "p1", "fixture", "/fixture", 1000).unwrap();
+        let board_id = ensure_board_for_project(&conn, "p1").unwrap();
+        let in_progress_id: String = conn
+            .query_row(
+                "SELECT id FROM columns WHERE board_id = ?1 AND role = 'in_progress'",
+                params![board_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let claude_card =
+            create_card(&conn, &board_id, &in_progress_id, "Claude task", None).unwrap();
+        let codex_card =
+            create_card(&conn, &board_id, &in_progress_id, "Codex task", None).unwrap();
+        set_card_pending_launch_for_agent(&conn, &claude_card.id, "claude").unwrap();
+        set_card_pending_launch_for_agent(&conn, &codex_card.id, "codex").unwrap();
+        seed_session_only(&conn, "p1", "s1");
+
+        assert!(adopt_pending_card_for_session(&conn, "p1", "claude", "s1").unwrap());
+        let adopted_card: String = conn
+            .query_row("SELECT id FROM cards WHERE session_id = 's1'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(adopted_card, claude_card.id);
     }
 
     #[test]
@@ -1643,7 +3129,10 @@ mod kanban_tests {
 
         let context = card_launch_context(&conn, &card.id).unwrap().unwrap();
         assert_eq!(context.title, "Fix the login bug");
-        assert_eq!(context.description.as_deref(), Some("Repros on SSO cookie expiry"));
+        assert_eq!(
+            context.description.as_deref(),
+            Some("Repros on SSO cookie expiry")
+        );
         assert_eq!(context.session_id, None);
         assert_eq!(context.column_role.as_deref(), Some("in_progress"));
         assert_eq!(context.project_id, "p1");
@@ -1653,7 +3142,9 @@ mod kanban_tests {
     #[test]
     fn card_launch_context_returns_none_for_an_unknown_card_id() {
         let conn = in_memory_db();
-        assert!(card_launch_context(&conn, "does-not-exist").unwrap().is_none());
+        assert!(card_launch_context(&conn, "does-not-exist")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -1684,7 +3175,10 @@ mod kanban_tests {
     fn most_recent_active_session_id_for_project_returns_none_when_nothing_is_active() {
         let conn = in_memory_db();
         upsert_project(&conn, "p1", "fixture", "/fixture", 1000).unwrap();
-        assert_eq!(most_recent_active_session_id_for_project(&conn, "p1").unwrap(), None);
+        assert_eq!(
+            most_recent_active_session_id_for_project(&conn, "p1").unwrap(),
+            None
+        );
     }
 }
 
@@ -1695,16 +3189,27 @@ mod list_query_tests {
 
     fn in_memory_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(include_str!("../../migrations/0001_init.sql")).unwrap();
-        conn.execute_batch(include_str!("../../migrations/0002_file_diff_content.sql")).unwrap();
-        conn.execute_batch(include_str!("../../migrations/0003_kanban.sql")).unwrap();
-        conn.execute_batch(include_str!("../../migrations/0004_session_title.sql")).unwrap();
+        conn.execute_batch(include_str!("../../migrations/0001_init.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../../migrations/0002_file_diff_content.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../../migrations/0003_kanban.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../../migrations/0004_session_title.sql"))
+            .unwrap();
         conn
     }
 
     /// Insert a project plus one session per id in `session_ids`.
     fn seed(conn: &Connection, project_id: &str, created_at: i64, session_ids: &[&str]) {
-        upsert_project(conn, project_id, project_id, &format!("/{project_id}"), created_at).unwrap();
+        upsert_project(
+            conn,
+            project_id,
+            project_id,
+            &format!("/{project_id}"),
+            created_at,
+        )
+        .unwrap();
         for sid in session_ids {
             conn.execute(
                 "INSERT INTO sessions (id, project_id, agent, started_at, last_activity_at, status, cost_usd, raw_log_path)
@@ -1764,5 +3269,481 @@ mod list_query_tests {
 
         let projects = list_projects(&conn).unwrap();
         assert_eq!(ids(&projects, |p| p.id.clone()), set(&["active"]));
+    }
+}
+
+#[cfg(test)]
+mod dispatch_query_tests {
+    use super::*;
+
+    fn in_memory_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!("../../migrations/0001_init.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../../migrations/0002_file_diff_content.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../../migrations/0003_kanban.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../../migrations/0004_session_title.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../../migrations/0005_plan.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!(
+            "../../migrations/0006_card_pending_launch.sql"
+        ))
+        .unwrap();
+        conn.execute_batch(include_str!("../../migrations/0007_dispatch.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../../migrations/0009_dispatch_chat.sql"))
+            .unwrap();
+        conn
+    }
+
+    #[test]
+    fn migration_seeds_editable_configs_for_all_four_built_in_agents() {
+        let conn = in_memory_db();
+        let configs = list_agent_configs(&conn).unwrap();
+
+        assert_eq!(
+            configs
+                .iter()
+                .map(|config| config.agent.as_str())
+                .collect::<Vec<_>>(),
+            vec!["claude", "codex", "gemini", "cursor"],
+        );
+        assert!(configs.iter().all(|config| config.enabled));
+        assert!(configs
+            .iter()
+            .all(|config| config.models.contains(&"default".to_string())));
+    }
+
+    #[test]
+    fn task_run_and_terminal_events_round_trip_across_the_workday_query() {
+        let conn = in_memory_db();
+        upsert_project(&conn, "p1", "relay", "/work/relay", 1_000).unwrap();
+
+        let created = create_dispatch_task(
+            &conn,
+            "p1",
+            None,
+            "Fix authentication",
+            "Find the auth race and fix it.",
+            "codex",
+            "gpt-5",
+            2_000,
+        )
+        .unwrap();
+
+        append_run_event(
+            &conn,
+            &created.run.id,
+            "output",
+            "Inspecting auth.rs\n",
+            2_001,
+        )
+        .unwrap();
+        append_run_event(&conn, &created.run.id, "input", "yes\n", 2_002).unwrap();
+
+        let tasks = list_dispatch_tasks(&conn, 1_900, 2_100).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].project_name, "relay");
+        assert_eq!(tasks[0].run.agent, "codex");
+        assert_eq!(tasks[0].run.model, "gpt-5");
+
+        let events = list_run_events(&conn, &created.run.id).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].sequence, 1);
+        assert_eq!(events[0].stream, "output");
+        assert_eq!(events[1].sequence, 2);
+        assert_eq!(events[1].content, "yes\n");
+    }
+
+    #[test]
+    fn finishing_and_retrying_a_run_preserves_attempt_history() {
+        let conn = in_memory_db();
+        upsert_project(&conn, "p1", "relay", "/work/relay", 1_000).unwrap();
+        let created = create_dispatch_task(
+            &conn,
+            "p1",
+            None,
+            "Run tests",
+            "Run the test suite and fix failures.",
+            "claude",
+            "sonnet",
+            2_000,
+        )
+        .unwrap();
+
+        finish_dispatch_run(
+            &conn,
+            &created.run.id,
+            "failed",
+            Some(1),
+            Some("exit 1"),
+            2_100,
+        )
+        .unwrap();
+        let retry = create_retry_run(&conn, &created.task.id, "gemini", "auto", 2_200).unwrap();
+
+        assert_eq!(retry.attempt, 2);
+        assert_eq!(retry.agent, "gemini");
+        assert_eq!(
+            list_runs_for_task(&conn, &created.task.id).unwrap().len(),
+            2
+        );
+        assert_eq!(
+            get_dispatch_task(&conn, &created.task.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "queued"
+        );
+
+        let workday = list_dispatch_tasks(&conn, 1_900, 2_300).unwrap();
+        assert_eq!(
+            workday.len(),
+            2,
+            "the global viewer must retain both attempts"
+        );
+        assert_eq!(workday[0].run.attempt, 2);
+        assert_eq!(workday[1].run.attempt, 1);
+    }
+
+    #[test]
+    fn dispatched_run_lifecycle_moves_its_task_card_by_role() {
+        let conn = in_memory_db();
+        upsert_project(&conn, "p1", "relay", "/work/relay", 1_000).unwrap();
+        let (board, columns, _) = get_board(&conn, "p1").unwrap();
+        let todo = columns
+            .iter()
+            .find(|column| column.role.as_deref() == Some("todo"))
+            .unwrap();
+        let card = create_card(&conn, &board.id, &todo.id, "Run tests", None).unwrap();
+        let created = create_dispatch_task(
+            &conn,
+            "p1",
+            Some(&card.id),
+            "Run tests",
+            "Run the suite.",
+            "claude",
+            "default",
+            2_000,
+        )
+        .unwrap();
+
+        sync_card_for_dispatch_run(&conn, &created.run.id, "in_progress").unwrap();
+        let in_progress_role: String = conn
+            .query_row(
+                "SELECT col.role FROM cards c JOIN columns col ON col.id = c.column_id WHERE c.id = ?1",
+                params![card.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(in_progress_role, "in_progress");
+
+        sync_card_for_dispatch_run(&conn, &created.run.id, "review").unwrap();
+        let review_role: String = conn
+            .query_row(
+                "SELECT col.role FROM cards c JOIN columns col ON col.id = c.column_id WHERE c.id = ?1",
+                params![card.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(review_role, "review");
+    }
+
+    #[test]
+    fn active_dispatch_detection_is_scoped_to_project_and_agent() {
+        let conn = in_memory_db();
+        upsert_project(&conn, "p1", "relay", "/work/relay", 1_000).unwrap();
+        let created = create_dispatch_task(
+            &conn,
+            "p1",
+            None,
+            "Run tests",
+            "Run the suite.",
+            "codex",
+            "default",
+            2_000,
+        )
+        .unwrap();
+
+        assert!(has_active_dispatch_for_project_agent(&conn, "p1", "codex").unwrap());
+        assert!(!has_active_dispatch_for_project_agent(&conn, "p1", "claude").unwrap());
+        finish_dispatch_run(&conn, &created.run.id, "completed", Some(0), None, 2_100).unwrap();
+        assert!(!has_active_dispatch_for_project_agent(&conn, "p1", "codex").unwrap());
+    }
+
+    #[test]
+    fn tool_result_replaces_its_running_tool_event_without_adding_a_row() {
+        let conn = in_memory_db();
+        upsert_project(&conn, "p1", "relay", "/work/relay", 1_000).unwrap();
+        let created = create_dispatch_task(
+            &conn,
+            "p1",
+            None,
+            "Update readme",
+            "Update the readme.",
+            "codex",
+            "default",
+            2_000,
+        )
+        .unwrap();
+        let (turn, _) = begin_dispatch_turn(&conn, &created.run.id, "Update the readme.", 2_001)
+            .unwrap();
+
+        let running = upsert_dispatch_event(
+            &conn,
+            &created.run.id,
+            Some(&turn.id),
+            "tool_call",
+            None,
+            "Bash",
+            Some(r#"{"command":"git status"}"#),
+            Some("tool-1"),
+            Some("running"),
+            DispatchEventUpdate::Replace,
+            2_002,
+        )
+        .unwrap();
+        let completed = upsert_dispatch_event(
+            &conn,
+            &created.run.id,
+            Some(&turn.id),
+            "tool_result",
+            None,
+            "On branch main",
+            Some(r#"{"output":"On branch main"}"#),
+            Some("tool-1"),
+            Some("completed"),
+            DispatchEventUpdate::Replace,
+            2_003,
+        )
+        .unwrap();
+
+        assert_eq!(completed.id, running.id);
+        assert_eq!(completed.sequence, running.sequence);
+        assert_eq!(completed.created_at, running.created_at);
+        assert_eq!(completed.kind, "tool_result");
+        assert_eq!(completed.content, "Bash");
+        assert_eq!(
+            completed.payload.as_deref(),
+            Some(r#"{"output":"On branch main"}"#)
+        );
+        assert_eq!(completed.state.as_deref(), Some("completed"));
+
+        let conversation = get_dispatch_conversation(&conn, &created.run.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            conversation
+                .events
+                .iter()
+                .filter(|event| matches!(event.kind.as_str(), "tool_call" | "tool_result"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn assistant_deltas_append_into_one_stable_message() {
+        let conn = in_memory_db();
+        upsert_project(&conn, "p1", "relay", "/work/relay", 1_000).unwrap();
+        let created = create_dispatch_task(
+            &conn,
+            "p1",
+            None,
+            "Explain the change",
+            "Explain the change.",
+            "claude",
+            "default",
+            2_000,
+        )
+        .unwrap();
+        let (turn, _) = begin_dispatch_turn(&conn, &created.run.id, "Explain the change.", 2_001)
+            .unwrap();
+
+        let first = upsert_dispatch_event(
+            &conn,
+            &created.run.id,
+            Some(&turn.id),
+            "assistant_message",
+            Some("assistant"),
+            "Updated",
+            None,
+            Some("message-1"),
+            Some("running"),
+            DispatchEventUpdate::Append,
+            2_002,
+        )
+        .unwrap();
+        let completed = upsert_dispatch_event(
+            &conn,
+            &created.run.id,
+            Some(&turn.id),
+            "assistant_message",
+            Some("assistant"),
+            " the README.",
+            None,
+            Some("message-1"),
+            Some("completed"),
+            DispatchEventUpdate::Append,
+            2_003,
+        )
+        .unwrap();
+
+        assert_eq!(completed.id, first.id);
+        assert_eq!(completed.content, "Updated the README.");
+        assert_eq!(completed.state.as_deref(), Some("completed"));
+
+        let conversation = get_dispatch_conversation(&conn, &created.run.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            conversation
+                .events
+                .iter()
+                .filter(|event| event.kind == "assistant_message")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn native_session_links_even_when_a_fast_run_has_already_exited() {
+        let conn = in_memory_db();
+        let now = chrono::Utc::now().timestamp();
+        upsert_project(&conn, "p1", "relay", "/work/relay", now).unwrap();
+        let (board, columns, _) = get_board(&conn, "p1").unwrap();
+        let in_progress = columns
+            .iter()
+            .find(|column| column.role.as_deref() == Some("in_progress"))
+            .unwrap();
+        let card = create_card(&conn, &board.id, &in_progress.id, "Quick task", None).unwrap();
+        set_card_pending_launch_for_agent(&conn, &card.id, "codex").unwrap();
+        let created = create_dispatch_task(
+            &conn,
+            "p1",
+            Some(&card.id),
+            "Quick task",
+            "Answer quickly.",
+            "codex",
+            "default",
+            now,
+        )
+        .unwrap();
+        finish_dispatch_run(&conn, &created.run.id, "completed", Some(0), None, now).unwrap();
+        conn.execute(
+            "INSERT INTO sessions
+             (id, project_id, agent, started_at, last_activity_at, status, raw_log_path)
+             VALUES ('s-fast', 'p1', 'codex', ?1, ?1, 'active', '')",
+            params![now],
+        )
+        .unwrap();
+
+        link_latest_run_to_session(&conn, "p1", "codex", "s-fast").unwrap();
+        let linked = get_dispatch_run(&conn, &created.run.id).unwrap().unwrap();
+        assert_eq!(linked.session_id.as_deref(), Some("s-fast"));
+        assert!(adopt_pending_card_for_session(&conn, "p1", "codex", "s-fast").unwrap());
+        let role: String = conn
+            .query_row(
+                "SELECT col.role FROM cards c JOIN columns col ON col.id = c.column_id
+                 WHERE c.id = ?1",
+                params![card.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            role, "review",
+            "a completed run must not jump back to In Progress"
+        );
+    }
+}
+
+#[cfg(test)]
+mod session_deletion_tests {
+    use super::*;
+
+    fn in_memory_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        for migration in [
+            include_str!("../../migrations/0001_init.sql"),
+            include_str!("../../migrations/0002_file_diff_content.sql"),
+            include_str!("../../migrations/0003_kanban.sql"),
+            include_str!("../../migrations/0004_session_title.sql"),
+            include_str!("../../migrations/0005_plan.sql"),
+            include_str!("../../migrations/0006_card_pending_launch.sql"),
+            include_str!("../../migrations/0007_dispatch.sql"),
+            include_str!("../../migrations/0008_deleted_sessions.sql"),
+            include_str!("../../migrations/0009_dispatch_chat.sql"),
+        ] {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn
+    }
+
+    #[test]
+    fn deleting_a_session_tombstones_it_and_unlinks_derived_records() {
+        let conn = in_memory_db();
+        upsert_project(&conn, "p1", "relay", "/work/relay", 1_000).unwrap();
+        conn.execute(
+            "INSERT INTO sessions
+             (id, project_id, agent, started_at, last_activity_at, status, raw_log_path)
+             VALUES ('s1', 'p1', 'claude', 1_000, 1_000, 'ended', '/logs/s1.jsonl')",
+            [],
+        )
+        .unwrap();
+        insert_file_changed(
+            &conn,
+            "s1",
+            "src/main.rs",
+            "edit",
+            1,
+            1,
+            1_000,
+            Some("old"),
+            Some("new"),
+        )
+        .unwrap();
+        let board_id = ensure_board_for_project(&conn, "p1").unwrap();
+        auto_create_card_for_session(&conn, &board_id, "s1", "Keep this task").unwrap();
+        let created = create_dispatch_task(
+            &conn, "p1", None, "Task", "Prompt", "claude", "default", 1_000,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE dispatch_runs SET session_id = 's1' WHERE id = ?1",
+            params![created.run.id],
+        )
+        .unwrap();
+
+        assert!(delete_session(&conn, "s1", 2_000).unwrap());
+
+        assert!(get_session(&conn, "s1").unwrap().is_none());
+        assert!(is_session_deleted(&conn, "s1").unwrap());
+        let file_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files_changed WHERE session_id = 's1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(file_count, 0);
+        let card_link: Option<String> = conn
+            .query_row(
+                "SELECT session_id FROM cards WHERE title = 'Keep this task'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(card_link, None);
+        let run_link: Option<String> = conn
+            .query_row(
+                "SELECT session_id FROM dispatch_runs WHERE id = ?1",
+                params![created.run.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(run_link, None);
     }
 }

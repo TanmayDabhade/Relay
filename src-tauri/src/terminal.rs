@@ -86,7 +86,11 @@ pub fn attach_or_launch(
 const ATTACH_SESSION_SCRIPT: &str = include_str!("../resources/attach_session.applescript");
 
 #[cfg(target_os = "macos")]
-fn run_applescript(project_path: &str, resume_id: &str, prompt_arg: &str) -> anyhow::Result<String> {
+fn run_applescript(
+    project_path: &str,
+    resume_id: &str,
+    prompt_arg: &str,
+) -> anyhow::Result<String> {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
@@ -155,7 +159,10 @@ mod tests {
 
     #[test]
     fn single_line_prompt_is_wrapped_in_ansi_c_quotes() {
-        assert_eq!(shell_ansi_c_quote("fix the login bug"), "$'fix the login bug'");
+        assert_eq!(
+            shell_ansi_c_quote("fix the login bug"),
+            "$'fix the login bug'"
+        );
     }
 
     #[test]

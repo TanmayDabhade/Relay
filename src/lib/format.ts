@@ -1,3 +1,5 @@
+import type { DispatchStatus } from "./types";
+
 /** A session's best available display name: Claude Code's own auto-generated title first
  * (matches "Session name" in `claude`'s `/status` and `--resume` picker), falling back to
  * Relay's own AI-generated one-line summary, then a fixed placeholder if neither exists yet. */
@@ -17,4 +19,19 @@ export function formatRelativeTime(unixSeconds: number): string {
   const diffHr = Math.round(diffMin / 60);
   if (diffHr < 24) return `${diffHr}h ago`;
   return `${Math.round(diffHr / 24)}d ago`;
+}
+
+const ONGOING_DISPATCH_STATUSES = new Set<DispatchStatus>([
+  "queued",
+  "starting",
+  "running",
+  "awaiting_approval",
+  "interrupting",
+  "idle",
+  "shutting_down",
+]);
+
+/** A Relay conversation remains ongoing while it can still advance or accept a follow-up. */
+export function isOngoingDispatch(status: DispatchStatus): boolean {
+  return ONGOING_DISPATCH_STATUSES.has(status);
 }

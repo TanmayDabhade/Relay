@@ -184,8 +184,14 @@ fn extract_token_usage(payload: &Value) -> Option<Usage> {
     let totals = info.get("total_token_usage").unwrap_or(info);
 
     Some(Usage {
-        input_tokens: totals.get("input_tokens").and_then(Value::as_i64).unwrap_or(0),
-        output_tokens: totals.get("output_tokens").and_then(Value::as_i64).unwrap_or(0),
+        input_tokens: totals
+            .get("input_tokens")
+            .and_then(Value::as_i64)
+            .unwrap_or(0),
+        output_tokens: totals
+            .get("output_tokens")
+            .and_then(Value::as_i64)
+            .unwrap_or(0),
         cache_read_input_tokens: totals
             .get("cached_input_tokens")
             .and_then(Value::as_i64)
@@ -209,7 +215,10 @@ mod tests {
         let record = parse_line(line, path).expect("session_meta should parse");
         assert_eq!(record.agent, "codex");
         assert_eq!(record.session_id.as_deref(), Some("cx-1234"));
-        assert_eq!(record.cwd.as_deref(), Some("/Users/testuser/Desktop/fixture-project"));
+        assert_eq!(
+            record.cwd.as_deref(),
+            Some("/Users/testuser/Desktop/fixture-project")
+        );
     }
 
     #[test]

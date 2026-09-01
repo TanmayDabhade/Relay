@@ -172,7 +172,8 @@ const GIT_LOG_FIELD_SEP: &str = "\x1f";
 /// `git_log_timestamps` — not a git repo, no `git` on `PATH`, or unparseable output all
 /// resolve to an empty `Vec` rather than an error the frontend would need to handle.
 pub fn git_recent_commits(project_path: &str, limit: usize) -> Vec<CommitInfo> {
-    let format_arg = format!("--format=%h{GIT_LOG_FIELD_SEP}%s{GIT_LOG_FIELD_SEP}%an{GIT_LOG_FIELD_SEP}%ct");
+    let format_arg =
+        format!("--format=%h{GIT_LOG_FIELD_SEP}%s{GIT_LOG_FIELD_SEP}%an{GIT_LOG_FIELD_SEP}%ct");
     let output = match Command::new("git")
         .args(["log", &format!("-n{limit}"), &format_arg])
         .current_dir(project_path)
@@ -195,7 +196,9 @@ pub fn git_recent_commits(project_path: &str, limit: usize) -> Vec<CommitInfo> {
     let stdout = match String::from_utf8(output.stdout) {
         Ok(stdout) => stdout,
         Err(e) => {
-            log::warn!("git_recent_commits: `git log` stdout for {project_path} wasn't valid UTF-8: {e}");
+            log::warn!(
+                "git_recent_commits: `git log` stdout for {project_path} wasn't valid UTF-8: {e}"
+            );
             return Vec::new();
         }
     };
@@ -208,7 +211,12 @@ pub fn git_recent_commits(project_path: &str, limit: usize) -> Vec<CommitInfo> {
             let message = parts.next()?.to_string();
             let author = parts.next()?.to_string();
             let timestamp = parts.next()?.trim().parse::<i64>().ok()?;
-            Some(CommitInfo { hash, message, author, timestamp })
+            Some(CommitInfo {
+                hash,
+                message,
+                author,
+                timestamp,
+            })
         })
         .collect()
 }

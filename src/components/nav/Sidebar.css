@@ -10,11 +10,19 @@
 }
 
 .sidebar-brand {
+  border: 0;
+  background: transparent;
   font-family: var(--font-mono);
   font-size: var(--text-md);
   font-weight: 600;
   color: var(--text-primary);
   padding: 0 var(--space-2) var(--space-4);
+  text-align: left;
+}
+
+.sidebar-brand:focus-visible {
+  outline: 0.125rem solid var(--accent-border);
+  outline-offset: 0.125rem;
 }
 
 .sidebar-section-label {

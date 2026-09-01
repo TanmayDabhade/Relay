@@ -184,3 +184,128 @@ export interface BoardData {
   columns: BoardColumn[];
   cards: Card[];
 }
+
+export type BuiltInAgent = "claude" | "codex" | "gemini" | "cursor";
+
+export interface AgentConnection {
+  agent: BuiltInAgent;
+  enabled: boolean;
+  executable: string;
+  models: string[];
+  default_model: string;
+  updated_at: number;
+  installed: boolean;
+  resolved_executable: string | null;
+}
+
+export type DispatchStatus =
+  | "queued"
+  | "starting"
+  | "running"
+  | "awaiting_approval"
+  | "interrupting"
+  | "idle"
+  | "shutting_down"
+  | "shut_down"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "interrupted";
+
+export interface DispatchTask {
+  id: string;
+  project_id: string;
+  card_id: string | null;
+  title: string;
+  prompt: string;
+  status: DispatchStatus;
+  created_at: number;
+  updated_at: number;
+  completed_at: number | null;
+}
+
+export interface DispatchRun {
+  id: string;
+  task_id: string;
+  attempt: number;
+  agent: BuiltInAgent;
+  model: string;
+  status: DispatchStatus;
+  started_at: number | null;
+  ended_at: number | null;
+  exit_code: number | null;
+  error: string | null;
+  session_id: string | null;
+  provider_session_id: string | null;
+  shutdown_at: number | null;
+  created_at: number;
+}
+
+export interface CreatedDispatch {
+  task: DispatchTask;
+  run: DispatchRun;
+}
+
+/** DispatchTask fields are flattened by the backend for convenient workday list rendering. */
+export interface DispatchTaskWithRun extends DispatchTask {
+  project_name: string;
+  project_path: string;
+  run: DispatchRun;
+}
+
+export interface DispatchRunEvent {
+  id: number;
+  run_id: string;
+  sequence: number;
+  stream: "output" | "input";
+  content: string;
+  created_at: number;
+}
+
+export interface DispatchTurn {
+  id: string;
+  run_id: string;
+  sequence: number;
+  prompt: string;
+  status: string;
+  started_at: number;
+  ended_at: number | null;
+  error: string | null;
+}
+
+export type DispatchEventKind =
+  | "user_message"
+  | "assistant_message"
+  | "tool_call"
+  | "tool_result"
+  | "approval_request"
+  | "approval_decision"
+  | "status"
+  | "error"
+  | "legacy_output";
+
+export interface DispatchEvent {
+  id: number;
+  run_id: string;
+  turn_id: string | null;
+  sequence: number;
+  kind: DispatchEventKind;
+  role: "user" | "assistant" | null;
+  content: string;
+  payload: string | null;
+  provider_event_id: string | null;
+  state: string | null;
+  created_at: number;
+}
+
+export interface DispatchConversation {
+  run: DispatchRun;
+  turns: DispatchTurn[];
+  events: DispatchEvent[];
+  legacy: boolean;
+}
+
+export type DispatchApprovalDecision =
+  | "allowed_once"
+  | "allowed_for_session"
+  | "denied";

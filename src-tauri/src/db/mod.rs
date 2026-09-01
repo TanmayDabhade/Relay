@@ -24,7 +24,12 @@ pub fn open(db_path: &Path) -> anyhow::Result<Connection> {
         M::up(include_str!("../../migrations/0003_kanban.sql")),
         M::up(include_str!("../../migrations/0004_session_title.sql")),
         M::up(include_str!("../../migrations/0005_plan.sql")),
-        M::up(include_str!("../../migrations/0006_card_pending_launch.sql")),
+        M::up(include_str!(
+            "../../migrations/0006_card_pending_launch.sql"
+        )),
+        M::up(include_str!("../../migrations/0007_dispatch.sql")),
+        M::up(include_str!("../../migrations/0008_deleted_sessions.sql")),
+        M::up(include_str!("../../migrations/0009_dispatch_chat.sql")),
     ]);
     migrations.to_latest(&mut conn)?;
 

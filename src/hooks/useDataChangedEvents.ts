@@ -25,6 +25,10 @@ export function useDataChangedEvents() {
       // tags, or finalized cost without the user having to close and reopen it.
       queryClient.invalidateQueries({ queryKey: ["session-detail"] });
       queryClient.invalidateQueries({ queryKey: ["report"] });
+      queryClient.invalidateQueries({ queryKey: ["agent-connections"] });
+      queryClient.invalidateQueries({ queryKey: ["dispatch-tasks"] });
+      queryClient.invalidateQueries({ queryKey: ["dispatch-runs"] });
+      queryClient.invalidateQueries({ queryKey: ["dispatch-conversation"] });
     });
 
     return () => {

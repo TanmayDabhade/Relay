@@ -59,7 +59,10 @@ pub fn parse_line(line: &str, raw_log_path: &str) -> Option<ParsedRecord> {
 
     match record_type.as_str() {
         "session_start" => {
-            let session_id = value.get("sessionId").and_then(Value::as_str).map(String::from);
+            let session_id = value
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .map(String::from);
             let cwd = value.get("cwd").and_then(Value::as_str).map(String::from);
 
             let mut cache = context_cache().lock().unwrap();
@@ -128,8 +131,14 @@ fn cached_context(raw_log_path: &str) -> FileContext {
 /// has no separate cache-write count, so `cache_creation_input_tokens` is always 0 here.
 fn extract_usage_metadata(usage: &Value) -> Usage {
     Usage {
-        input_tokens: usage.get("promptTokenCount").and_then(Value::as_i64).unwrap_or(0),
-        output_tokens: usage.get("candidatesTokenCount").and_then(Value::as_i64).unwrap_or(0),
+        input_tokens: usage
+            .get("promptTokenCount")
+            .and_then(Value::as_i64)
+            .unwrap_or(0),
+        output_tokens: usage
+            .get("candidatesTokenCount")
+            .and_then(Value::as_i64)
+            .unwrap_or(0),
         cache_read_input_tokens: usage
             .get("cachedContentTokenCount")
             .and_then(Value::as_i64)
@@ -153,7 +162,10 @@ mod tests {
         let record = parse_line(line, path).expect("session_start should parse");
         assert_eq!(record.agent, "gemini");
         assert_eq!(record.session_id.as_deref(), Some("gm-1"));
-        assert_eq!(record.cwd.as_deref(), Some("/Users/testuser/Desktop/fixture-project"));
+        assert_eq!(
+            record.cwd.as_deref(),
+            Some("/Users/testuser/Desktop/fixture-project")
+        );
     }
 
     #[test]

@@ -1,9 +1,15 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  AgentConnection,
   BoardColumn,
   BoardData,
   Card,
+  CreatedDispatch,
   DashboardStats,
+  DispatchRun,
+  DispatchApprovalDecision,
+  DispatchConversation,
+  DispatchTaskWithRun,
   FileDiff,
   GitInsights,
   ProjectSummary,
@@ -22,6 +28,10 @@ export function listSessions(): Promise<Session[]> {
 
 export function getSessionDetail(sessionId: string): Promise<SessionDetail | null> {
   return invoke("get_session_detail", { sessionId });
+}
+
+export function deleteSession(sessionId: string): Promise<void> {
+  return invoke("delete_session", { sessionId });
 }
 
 export function openInEditor(path: string): Promise<void> {
@@ -112,4 +122,69 @@ export function renameColumn(columnId: string, name: string): Promise<void> {
  * reach/drive Terminal.app. */
 export function launchOrAttachSession(cardId: string): Promise<string> {
   return invoke("launch_or_attach_session", { cardId });
+}
+
+export function listAgentConnections(): Promise<AgentConnection[]> {
+  return invoke("list_agent_connections");
+}
+
+export function saveAgentConnection(connection: {
+  agent: string;
+  enabled: boolean;
+  executable: string;
+  models: string[];
+  defaultModel: string;
+}): Promise<void> {
+  return invoke("save_agent_connection", connection);
+}
+
+export function dispatchTask(request: {
+  projectId: string;
+  cardId?: string | null;
+  title: string;
+  prompt: string;
+  agent: string;
+  model: string;
+}): Promise<CreatedDispatch> {
+  return invoke("dispatch_task", { ...request, cardId: request.cardId ?? null });
+}
+
+export function retryDispatchTask(
+  taskId: string,
+  agent: string,
+  model: string,
+): Promise<CreatedDispatch> {
+  return invoke("retry_dispatch_task", { taskId, agent, model });
+}
+
+export function listDispatchTasks(dayStart: number, dayEnd: number): Promise<DispatchTaskWithRun[]> {
+  return invoke("list_dispatch_tasks", { dayStart, dayEnd });
+}
+
+export function listDispatchRuns(taskId: string): Promise<DispatchRun[]> {
+  return invoke("list_dispatch_runs", { taskId });
+}
+
+export function getDispatchConversation(runId: string): Promise<DispatchConversation | null> {
+  return invoke("get_dispatch_conversation", { runId });
+}
+
+export function sendDispatchPrompt(runId: string, prompt: string): Promise<void> {
+  return invoke("send_dispatch_prompt", { runId, prompt });
+}
+
+export function interruptDispatchTurn(runId: string): Promise<void> {
+  return invoke("interrupt_dispatch_turn", { runId });
+}
+
+export function resolveDispatchApproval(
+  runId: string,
+  eventId: number,
+  decision: DispatchApprovalDecision,
+): Promise<void> {
+  return invoke("resolve_dispatch_approval", { runId, eventId, decision });
+}
+
+export function shutdownDispatchConversation(runId: string): Promise<void> {
+  return invoke("shutdown_dispatch_conversation", { runId });
 }

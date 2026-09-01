@@ -5,7 +5,6 @@ import {
   createColumn,
   deleteCard,
   getBoard,
-  launchOrAttachSession,
   linkSessionToCard,
   listSessions,
   moveCard,
@@ -14,6 +13,7 @@ import {
 import type { Card } from "../../lib/types";
 import { BoardColumn } from "./BoardColumn";
 import { CardModal } from "./CardModal";
+import { DispatchModal } from "../dispatch/DispatchModal";
 import "./ProjectBoard.css";
 
 interface ProjectBoardProps {
@@ -25,6 +25,7 @@ interface ProjectBoardProps {
  * `ProjectDetail`. */
 export function ProjectBoard({ projectId }: ProjectBoardProps) {
   const [selectedCardId, setSelectedCardId] = useState<string | null>(null);
+  const [dispatchCardId, setDispatchCardId] = useState<string | null>(null);
   const [isAddingColumn, setIsAddingColumn] = useState(false);
   const [newColumnName, setNewColumnName] = useState("");
 
@@ -67,25 +68,19 @@ export function ProjectBoard({ projectId }: ProjectBoardProps) {
             onCardClick={(card) => setSelectedCardId(card.id)}
             onCardDrop={(cardId, columnId) => {
               const card = boardData.cards.find((c) => c.id === cardId);
-              if (card?.column_id === columnId) return;
-              const position = boardData.cards.filter((c) => c.column_id === columnId).length;
-
               const targetColumn = boardData.columns.find((c) => c.id === columnId);
               const shouldLaunch =
                 card != null && card.session_id === null && targetColumn?.role === "in_progress";
 
-              const moved = moveCard(cardId, columnId, position);
               if (shouldLaunch) {
-                // Only attempted once `moveCard` has landed — the backend re-checks the
-                // card's column role against the DB, so it'd still see the old column
-                // (and skip) if this fired first.
-                void moved
-                  .then(() => launchOrAttachSession(cardId))
-                  .then((outcome) => console.log(`launch_or_attach_session: ${outcome}`))
-                  .catch((err) => console.error("Failed to launch/attach session:", err));
-              } else {
-                void moved;
+                // The dispatch command performs the move and launch as one durable backend
+                // operation after the user chooses an installed agent/model.
+                setDispatchCardId(cardId);
+                return;
               }
+              if (card?.column_id === columnId) return;
+              const position = boardData.cards.filter((c) => c.column_id === columnId).length;
+              void moveCard(cardId, columnId, position);
             }}
             onAddCard={(columnId, title) => {
               void createCard(boardData.board.id, columnId, title);
@@ -142,6 +137,14 @@ export function ProjectBoard({ projectId }: ProjectBoardProps) {
           onLinkSession={(sessionId) => {
             void linkSessionToCard(selectedCard.id, sessionId);
           }}
+        />
+      ) : null}
+
+      {dispatchCardId ? (
+        <DispatchModal
+          projectId={projectId}
+          card={boardData.cards.find((card) => card.id === dispatchCardId) ?? null}
+          onClose={() => setDispatchCardId(null)}
         />
       ) : null}
     </div>

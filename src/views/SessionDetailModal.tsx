@@ -1,12 +1,18 @@
 import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Button } from "../components/ui/Button";
 import { Modal } from "../components/ui/Modal";
 import { Pill } from "../components/ui/Pill";
 import { StatTile } from "../components/ui/StatTile";
 import { agentMeta } from "../lib/agents";
 import { sessionDisplayName } from "../lib/format";
-import { exportTranscript, getSessionDetail, openInEditor, revealInFinder } from "../lib/tauri";
+import {
+  deleteSession,
+  exportTranscript,
+  getSessionDetail,
+  openInEditor,
+  revealInFinder,
+} from "../lib/tauri";
 import type { FileChanged } from "../lib/types";
 import { DiffModal } from "./DiffModal";
 import "./SessionDetailModal.css";
@@ -74,6 +80,7 @@ function handleOpenInEditor(path: string) {
 }
 
 export function SessionDetailModal({ sessionId, onClose }: SessionDetailModalProps) {
+  const queryClient = useQueryClient();
   const { data, isLoading, isError } = useQuery({
     queryKey: ["session-detail", sessionId],
     queryFn: () => getSessionDetail(sessionId!),
@@ -88,6 +95,12 @@ export function SessionDetailModal({ sessionId, onClose }: SessionDetailModalPro
     ? sessionDisplayName(data.session.title, data.session.summary)
     : "Session detail";
 
+  function handleDeleted() {
+    onClose();
+    queryClient.removeQueries({ queryKey: ["session-detail", sessionId] });
+    void queryClient.invalidateQueries({ queryKey: ["sessions"] });
+  }
+
   return (
     <Modal isOpen={sessionId !== null} onClose={onClose} title={title}>
       {isLoading && <p className="session-detail-status">Loading session…</p>}
@@ -99,15 +112,23 @@ export function SessionDetailModal({ sessionId, onClose }: SessionDetailModalPro
           This session no longer exists.
         </p>
       )}
-      {data && <SessionDetailContent detail={data} />}
+      {data && (
+        <SessionDetailContent
+          key={data.session.id}
+          detail={data}
+          onDeleted={handleDeleted}
+        />
+      )}
     </Modal>
   );
 }
 
 function SessionDetailContent({
   detail,
+  onDeleted,
 }: {
   detail: NonNullable<Awaited<ReturnType<typeof getSessionDetail>>>;
+  onDeleted: () => void;
 }) {
   const { session, files_changed } = detail;
   const tags = parseTags(session.tags);
@@ -116,6 +137,9 @@ function SessionDetailContent({
   const [exportState, setExportState] = useState<
     { status: "idle" } | { status: "saving" } | { status: "saved"; path: string } | { status: "error"; message: string }
   >({ status: "idle" });
+  const [deleteState, setDeleteState] = useState<
+    "idle" | "confirming" | "deleting" | "error"
+  >("idle");
   const agent = agentMeta(session.agent);
   const sessionLabel = `${agent.icon} ${session.model ?? agent.label} · ${session.id.slice(0, 8)}`;
 
@@ -126,6 +150,16 @@ function SessionDetailContent({
       setExportState({ status: "saved", path });
     } catch (e) {
       setExportState({ status: "error", message: String(e) });
+    }
+  }
+
+  async function handleDeleteSession() {
+    setDeleteState("deleting");
+    try {
+      await deleteSession(session.id);
+      onDeleted();
+    } catch {
+      setDeleteState("error");
     }
   }
 
@@ -233,6 +267,47 @@ function SessionDetailContent({
               </li>
             ))}
           </ul>
+        )}
+      </div>
+
+      <div className="session-detail-delete">
+        {deleteState === "idle" ? (
+          <Button
+            variant="secondary"
+            className="session-detail-delete-trigger"
+            onClick={() => setDeleteState("confirming")}
+          >
+            Delete session
+          </Button>
+        ) : (
+          <div className="session-detail-delete-confirmation">
+            <div>
+              <strong>Delete this session from Relay?</strong>
+              <p>
+                Its Relay history and file-change data will be removed. The original agent
+                log stays on disk, and linked task cards and run attempts are kept.
+              </p>
+              {deleteState === "error" ? (
+                <span>Relay couldn't delete this session. Please try again.</span>
+              ) : null}
+            </div>
+            <div className="session-detail-delete-actions">
+              <Button
+                variant="secondary"
+                onClick={() => setDeleteState("idle")}
+                disabled={deleteState === "deleting"}
+              >
+                Cancel
+              </Button>
+              <Button
+                className="session-detail-delete-confirm"
+                onClick={handleDeleteSession}
+                disabled={deleteState === "deleting"}
+              >
+                {deleteState === "deleting" ? "Deleting…" : "Delete from Relay"}
+              </Button>
+            </div>
+          </div>
         )}
       </div>
 

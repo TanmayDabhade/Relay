@@ -26,7 +26,7 @@ const TABS: { id: ProjectTab; label: string }[] = [
  * Full-page detail shown in `ProjectsView` once a project card is clicked. Three tabs
  * (Overview / Board / Sessions) behind a top tab bar rather than one long scrolling
  * column — the Kanban board in particular wants its own uncluttered page. Reuses
- * `SessionRow` (shared with `SessionsView`) rather than re-implementing row rendering
+ * `SessionRow` rather than re-implementing row rendering
  * here, and `ProjectBoard` (shared with the old standalone Board page) for the Kanban tab.
  */
 export function ProjectDetail({ project }: ProjectDetailProps) {

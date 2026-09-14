@@ -5,15 +5,17 @@ import { Modal } from "../components/ui/Modal";
 import { Pill } from "../components/ui/Pill";
 import { StatTile } from "../components/ui/StatTile";
 import { agentMeta } from "../lib/agents";
-import { sessionDisplayName } from "../lib/format";
+import { formatCost, sessionDisplayName } from "../lib/format";
 import {
   deleteSession,
   exportTranscript,
   getSessionDetail,
+  getTranscriptMarkdown,
   openInEditor,
   revealInFinder,
 } from "../lib/tauri";
 import type { FileChanged } from "../lib/types";
+import { CopyButton } from "./CopyButton";
 import { DiffModal } from "./DiffModal";
 import "./SessionDetailModal.css";
 
@@ -181,6 +183,10 @@ function SessionDetailContent({
       </div>
 
       <div className="session-detail-export-row">
+        <CopyButton
+          label="Copy transcript"
+          getText={() => getTranscriptMarkdown(session.id)}
+        />
         <Button
           variant="secondary"
           onClick={handleExportTranscript}
@@ -208,7 +214,7 @@ function SessionDetailContent({
 
       <div className="session-detail-stats">
         <StatTile value={durationDisplay} label="Duration" />
-        <StatTile value={`$${session.cost_usd.toFixed(2)}`} label="Cost" />
+        <StatTile value={formatCost(session.cost_usd, session.cost_unpriced)} label="Cost" />
         <StatTile value={session.prompt_tokens} label="Prompt tokens" />
         <StatTile value={session.completion_tokens} label="Completion tokens" />
         <StatTile value={session.cache_read_tokens} label="Cache read tokens" />

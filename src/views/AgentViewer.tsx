@@ -4,6 +4,7 @@ import { agentMeta } from "../lib/agents";
 import { isOngoingDispatch } from "../lib/format";
 import {
   interruptDispatchTurn,
+  stopDispatchLoop,
   listDispatchRuns,
   listDispatchTasks,
   retryDispatchTask,
@@ -134,6 +135,21 @@ export function AgentViewer({
     setActionError(null);
     try {
       await interruptDispatchTurn(selectedRun.id);
+    } catch (reason) {
+      setActionError(String(reason));
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  async function stopLoop() {
+    if (!selectedRun) return;
+    setBusyAction("stop-loop");
+    setActionError(null);
+    try {
+      await stopDispatchLoop(selectedRun.id);
+      await queryClient.invalidateQueries({ queryKey: ["dispatch-tasks"] });
+      await queryClient.invalidateQueries({ queryKey: ["dispatch-runs"] });
     } catch (reason) {
       setActionError(String(reason));
     } finally {
@@ -355,10 +371,25 @@ export function AgentViewer({
                 <span>{selectedRun.model}</span>
                 <span>attempt {selectedRun.attempt}</span>
                 {selectedRun.session_id ? <span>session {selectedRun.session_id.slice(0, 8)}</span> : null}
+                {selectedRun.loop_max_iterations != null ? (
+                  <span className="run-loop-chip">
+                    loop {selectedRun.loop_iterations}/{selectedRun.loop_max_iterations}
+                    {!isShutDown ? (
+                      <button
+                        type="button"
+                        onClick={stopLoop}
+                        disabled={busyAction != null}
+                        title="Let the current turn finish, then stop continuing"
+                      >
+                        {busyAction === "stop-loop" ? "Stopping…" : "Stop loop"}
+                      </button>
+                    ) : null}
+                  </span>
+                ) : null}
               </div>
 
               <div className="run-console">
-                <RunChat runId={selectedRun.id} />
+                <RunChat runId={selectedRun.id} active={hasActiveTurn} />
               </div>
 
               {selectedRun.error ? <p className="run-action-error">{selectedRun.error}</p> : null}

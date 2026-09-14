@@ -1,6 +1,8 @@
 import { useQuery } from "@tanstack/react-query";
 import { Modal } from "../components/ui/Modal";
 import { getFileDiffForSessionFile } from "../lib/tauri";
+import { CopyButton } from "./CopyButton";
+import { DIFF_TAG_PREFIX, formatDiffForClipboard } from "./diffClipboard";
 import "./DiffModal.css";
 
 interface DiffModalProps {
@@ -11,8 +13,6 @@ interface DiffModalProps {
   filePath: string | null;
   onClose: () => void;
 }
-
-const TAG_PREFIX: Record<string, string> = { insert: "+", delete: "-", equal: " " };
 
 /**
  * Shows one cumulative before/after diff for everything this session did to `filePath` —
@@ -42,10 +42,19 @@ export function DiffModal({ sessionId, sessionLabel, filePath, onClose }: DiffMo
       )}
       {!isLoading && !isError && data && (
         <>
-          <p className="diff-modal-meta">
-            {sessionLabel} · {data.edit_count} edit{data.edit_count === 1 ? "" : "s"} ·{" "}
-            {new Date(data.occurred_at * 1000).toLocaleString()}
-          </p>
+          <div className="diff-modal-meta-row">
+            <p className="diff-modal-meta">
+              {sessionLabel} · {data.edit_count} edit{data.edit_count === 1 ? "" : "s"} ·{" "}
+              {new Date(data.occurred_at * 1000).toLocaleString()}
+            </p>
+            {data.lines.length > 0 && (
+              <CopyButton
+                label="Copy diff"
+                variant="secondary"
+                getText={() => formatDiffForClipboard(data)}
+              />
+            )}
+          </div>
 
           {data.lines.length === 0 ? (
             <p className="diff-modal-status">
@@ -57,7 +66,7 @@ export function DiffModal({ sessionId, sessionLabel, filePath, onClose }: DiffMo
               <div className="diff-modal-lines">
                 {data.lines.map((line, i) => (
                   <div key={i} className={`diff-modal-line diff-modal-line-${line.tag}`}>
-                    <span className="diff-modal-line-prefix">{TAG_PREFIX[line.tag]}</span>
+                    <span className="diff-modal-line-prefix">{DIFF_TAG_PREFIX[line.tag]}</span>
                     <span className="diff-modal-line-content">{line.content}</span>
                   </div>
                 ))}

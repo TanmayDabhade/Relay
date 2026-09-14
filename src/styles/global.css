@@ -5,12 +5,11 @@
 }
 
 html {
-  /* Fluid base font-size: every var(--space-*)/var(--text-*) token is rem, so the whole UI
-     scales together as the window grows — 16px at a typical laptop window width (matches
-     the old fixed-px values exactly, so nothing changes at that size), growing gently up to
-     21px on a maximized window on a large external display, instead of staying pinned at a
-     small fixed size while only the layout stretches to fill the extra width. */
-  font-size: clamp(16px, 0.55vw + 9.5px, 21px);
+  /* Fixed root size: every var(--space-*)/var(--text-*) token is rem, so this one value sizes
+     the whole UI. It deliberately does NOT follow window width — like a native macOS app,
+     text stays put while the window resizes. The user picks it in Settings → Text size
+     (`src/lib/textSize.ts`), which overrides this default inline on <html> at startup. */
+  font-size: 16px;
   /* Lets native form controls (select, scrollbars, etc.) render in the matching OS theme
      instead of defaulting to light chrome inside a dark-themed page. */
   color-scheme: light dark;

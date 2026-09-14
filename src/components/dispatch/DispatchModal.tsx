@@ -6,6 +6,9 @@ import { Button } from "../ui/Button";
 import { Modal } from "../ui/Modal";
 import "./DispatchModal.css";
 
+/** Mirrors `looping::MAX_LOOP_ITERATIONS` in the backend, which rejects anything larger. */
+const MAX_LOOP_ITERATIONS = 50;
+
 interface DispatchModalProps {
   projectId?: string;
   card?: Card | null;
@@ -40,6 +43,9 @@ export function DispatchModal({ projectId, card, onClose, onDispatched }: Dispat
       : selectedConnection?.default_model ?? "";
   const [title, setTitle] = useState(card?.title ?? "");
   const [prompt, setPrompt] = useState(card?.description ?? card?.title ?? "");
+  const [loopEnabled, setLoopEnabled] = useState(false);
+  const [loopMax, setLoopMax] = useState(5);
+  const loopMaxValid = Number.isInteger(loopMax) && loopMax >= 1 && loopMax <= MAX_LOOP_ITERATIONS;
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -56,6 +62,7 @@ export function DispatchModal({ projectId, card, onClose, onDispatched }: Dispat
         prompt,
         agent: selectedConnection.agent,
         model,
+        loopMaxIterations: loopEnabled ? loopMax : null,
       });
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ["board", selectedProjectId] }),
@@ -154,6 +161,36 @@ export function DispatchModal({ projectId, card, onClose, onDispatched }: Dispat
           </div>
         ) : null}
 
+        <div className="dispatch-loop">
+          <label className="dispatch-loop-toggle">
+            <input
+              type="checkbox"
+              checked={loopEnabled}
+              onChange={(event) => setLoopEnabled(event.target.checked)}
+            />
+            <span>
+              <strong>Loop until done</strong>
+              <small>
+                After each turn, Relay tells the agent to keep going until it reports the task
+                complete. Each turn costs money, so set a limit.
+              </small>
+            </span>
+          </label>
+          {loopEnabled ? (
+            <label className="dispatch-field dispatch-loop-max">
+              <span>Max continuations</span>
+              <input
+                type="number"
+                min={1}
+                max={MAX_LOOP_ITERATIONS}
+                value={Number.isNaN(loopMax) ? "" : loopMax}
+                onChange={(event) => setLoopMax(event.target.valueAsNumber)}
+              />
+              {!loopMaxValid ? <small>Enter 1–{MAX_LOOP_ITERATIONS}.</small> : null}
+            </label>
+          ) : null}
+        </div>
+
         {error ? <p className="dispatch-form-error">{error}</p> : null}
 
         <div className="dispatch-form-actions">
@@ -168,7 +205,8 @@ export function DispatchModal({ projectId, card, onClose, onDispatched }: Dispat
               !selectedProjectId ||
               !title.trim() ||
               !prompt.trim() ||
-              !model
+              !model ||
+              (loopEnabled && !loopMaxValid)
             }
           >
             {submitting ? "Starting…" : "Start run"}

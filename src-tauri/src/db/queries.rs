@@ -41,7 +41,12 @@ pub struct Session {
     pub completion_tokens: i64,
     pub cache_read_tokens: i64,
     pub cache_creation_tokens: i64,
+    /// 1-hour-TTL share of `cache_creation_tokens`.
+    pub cache_creation_1h_tokens: i64,
     pub cost_usd: f64,
+    /// Some of this session's usage is on a model with no known price, so `cost_usd` only
+    /// covers the priced part (zero when none of it is priced).
+    pub cost_unpriced: bool,
     pub lines_added: i64,
     pub lines_removed: i64,
     pub tags: Option<String>,
@@ -82,6 +87,8 @@ pub struct AgentUsage {
     pub agent: String,
     pub session_count: i64,
     pub total_cost_usd: f64,
+    /// Sessions whose usage (or part of it) has no known price and isn't in `total_cost_usd`.
+    pub unpriced_session_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -123,6 +130,8 @@ pub struct DispatchRun {
     pub provider_session_id: Option<String>,
     pub shutdown_at: Option<i64>,
     pub created_at: i64,
+    pub loop_max_iterations: Option<i64>,
+    pub loop_iterations: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -199,6 +208,19 @@ pub struct SessionTokenTotals {
     pub completion_tokens: i64,
     pub cache_read_tokens: i64,
     pub cache_creation_tokens: i64,
+    pub cache_creation_1h_tokens: i64,
+}
+
+impl SessionTokenTotals {
+    pub fn token_usage(&self) -> crate::cost::pricing::TokenUsage {
+        crate::cost::pricing::TokenUsage {
+            input: self.prompt_tokens,
+            output: self.completion_tokens,
+            cache_read: self.cache_read_tokens,
+            cache_write_5m: (self.cache_creation_tokens - self.cache_creation_1h_tokens).max(0),
+            cache_write_1h: self.cache_creation_1h_tokens,
+        }
+    }
 }
 
 fn row_to_session(row: &Row) -> rusqlite::Result<Session> {
@@ -223,6 +245,8 @@ fn row_to_session(row: &Row) -> rusqlite::Result<Session> {
         tags: row.get(17)?,
         raw_log_path: row.get(18)?,
         title: row.get(19)?,
+        cache_creation_1h_tokens: row.get(20)?,
+        cost_unpriced: row.get::<_, i64>(21)? != 0,
     })
 }
 
@@ -256,19 +280,23 @@ fn row_to_dispatch_run(row: &Row) -> rusqlite::Result<DispatchRun> {
         provider_session_id: row.get(11)?,
         shutdown_at: row.get(12)?,
         created_at: row.get(13)?,
+        loop_max_iterations: row.get(14)?,
+        loop_iterations: row.get(15)?,
     })
 }
 
 const SESSION_COLUMNS: &str =
     "id, project_id, agent, model, started_at, ended_at, last_activity_at, status,
      duration_seconds, summary, prompt_tokens, completion_tokens, cache_read_tokens,
-     cache_creation_tokens, cost_usd, lines_added, lines_removed, tags, raw_log_path, title";
+     cache_creation_tokens, cost_usd, lines_added, lines_removed, tags, raw_log_path, title,
+     cache_creation_1h_tokens, cost_unpriced";
 
 const DISPATCH_TASK_COLUMNS: &str =
     "id, project_id, card_id, title, prompt, status, created_at, updated_at, completed_at";
 const DISPATCH_RUN_COLUMNS: &str =
     "id, task_id, attempt, agent, model, status, started_at, ended_at, exit_code, error,
-     session_id, provider_session_id, shutdown_at, created_at";
+     session_id, provider_session_id, shutdown_at, created_at, loop_max_iterations,
+     loop_iterations";
 
 // --- Ingest (parser/watcher) side ---
 
@@ -495,6 +523,7 @@ pub fn create_dispatch_task(
     prompt: &str,
     agent: &str,
     model: &str,
+    loop_max_iterations: Option<i64>,
     now: i64,
 ) -> rusqlite::Result<CreatedDispatch> {
     let task = DispatchTask {
@@ -523,6 +552,8 @@ pub fn create_dispatch_task(
         provider_session_id: None,
         shutdown_at: None,
         created_at: now,
+        loop_max_iterations,
+        loop_iterations: 0,
     };
 
     conn.execute(
@@ -533,9 +564,9 @@ pub fn create_dispatch_task(
     )?;
     conn.execute(
         "INSERT INTO dispatch_runs
-         (id, task_id, attempt, agent, model, status, created_at)
-         VALUES (?1, ?2, 1, ?3, ?4, 'queued', ?5)",
-        params![run.id, task.id, agent, model, now],
+         (id, task_id, attempt, agent, model, status, created_at, loop_max_iterations)
+         VALUES (?1, ?2, 1, ?3, ?4, 'queued', ?5, ?6)",
+        params![run.id, task.id, agent, model, now, loop_max_iterations],
     )?;
 
     Ok(CreatedDispatch { task, run })
@@ -565,6 +596,12 @@ pub fn list_runs_for_task(conn: &Connection, task_id: &str) -> rusqlite::Result<
     rows.collect()
 }
 
+/// Whether a launch of `agent` in this project is still in flight. Guards native-session
+/// linking (`link_latest_run_to_session` matches a new log to the newest pending launch by
+/// project + agent, so two concurrent launches would be ambiguous). Deliberately excludes
+/// `idle` and `failed`: those conversations have no live process, and their follow-ups resume
+/// an already-linked session — counting them blocked every future launch in the project until
+/// the old conversation was manually shut down.
 pub fn has_active_dispatch_for_project_agent(
     conn: &Connection,
     project_id: &str,
@@ -576,8 +613,7 @@ pub fn has_active_dispatch_for_project_agent(
            JOIN dispatch_tasks t ON t.id = r.task_id
            WHERE t.project_id = ?1 AND r.agent = ?2
              AND r.status IN (
-               'queued', 'starting', 'running', 'awaiting_approval',
-               'interrupting', 'idle', 'failed'
+               'queued', 'starting', 'running', 'awaiting_approval', 'interrupting'
              )
          )",
         params![project_id, agent],
@@ -597,7 +633,8 @@ pub fn list_dispatch_tasks(
            p.name, p.path,
            r.id, r.task_id, r.attempt, r.agent, r.model, r.status,
            r.started_at, r.ended_at, r.exit_code, r.error, r.session_id,
-           r.provider_session_id, r.shutdown_at, r.created_at
+           r.provider_session_id, r.shutdown_at, r.created_at,
+           r.loop_max_iterations, r.loop_iterations
          FROM dispatch_tasks t
          JOIN projects p ON p.id = t.project_id
          JOIN dispatch_runs r ON r.task_id = t.id
@@ -635,6 +672,8 @@ pub fn list_dispatch_tasks(
                 provider_session_id: row.get(22)?,
                 shutdown_at: row.get(23)?,
                 created_at: row.get(24)?,
+                loop_max_iterations: row.get(25)?,
+                loop_iterations: row.get(26)?,
             },
         })
     })?;
@@ -726,6 +765,7 @@ pub fn create_retry_run(
     task_id: &str,
     agent: &str,
     model: &str,
+    loop_max_iterations: Option<i64>,
     now: i64,
 ) -> rusqlite::Result<DispatchRun> {
     let attempt: i64 = conn.query_row(
@@ -748,12 +788,14 @@ pub fn create_retry_run(
         provider_session_id: None,
         shutdown_at: None,
         created_at: now,
+        loop_max_iterations,
+        loop_iterations: 0,
     };
     conn.execute(
         "INSERT INTO dispatch_runs
-         (id, task_id, attempt, agent, model, status, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6)",
-        params![run.id, task_id, attempt, agent, model, now],
+         (id, task_id, attempt, agent, model, status, created_at, loop_max_iterations)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7)",
+        params![run.id, task_id, attempt, agent, model, now, loop_max_iterations],
     )?;
     conn.execute(
         "UPDATE dispatch_tasks SET status = 'queued', updated_at = ?2, completed_at = NULL
@@ -1142,6 +1184,48 @@ pub fn settle_dispatch_turn(
     }
     transaction.commit()?;
     Ok(())
+}
+
+/// Text of the last assistant message a turn produced, used to look for the loop's
+/// completion marker. Only the final message counts: an agent that quotes the marker while
+/// explaining its plan mid-turn hasn't declared the work done.
+pub fn last_assistant_message_for_turn(
+    conn: &Connection,
+    turn_id: &str,
+) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT content FROM dispatch_events
+         WHERE turn_id = ?1 AND kind = 'assistant_message'
+         ORDER BY sequence DESC LIMIT 1",
+        params![turn_id],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+/// Records that Relay is about to send loop continuation number `iteration`. Conditional on
+/// the stored count so two settle paths racing on one run can't both claim the same step.
+pub fn claim_dispatch_loop_iteration(
+    conn: &Connection,
+    run_id: &str,
+    iteration: i64,
+) -> rusqlite::Result<bool> {
+    let changed = conn.execute(
+        "UPDATE dispatch_runs SET loop_iterations = ?2
+         WHERE id = ?1 AND loop_max_iterations IS NOT NULL AND loop_iterations = ?2 - 1",
+        params![run_id, iteration],
+    )?;
+    Ok(changed > 0)
+}
+
+/// Turns looping off for a run; the in-flight turn (if any) finishes normally.
+pub fn stop_dispatch_loop(conn: &Connection, run_id: &str) -> rusqlite::Result<bool> {
+    let changed = conn.execute(
+        "UPDATE dispatch_runs SET loop_max_iterations = NULL
+         WHERE id = ?1 AND loop_max_iterations IS NOT NULL",
+        params![run_id],
+    )?;
+    Ok(changed > 0)
 }
 
 pub fn resolve_dispatch_event(
@@ -1706,54 +1790,174 @@ pub fn session_raw_log_path(
 
 // --- Cost recompute (pricing-table edits applied without re-parsing logs) ---
 
-pub fn update_cost(conn: &Connection, session_id: &str, cost_usd: f64) -> rusqlite::Result<()> {
+/// Stores a session's cost from aggregate totals (the path for sessions without per-response
+/// usage rows). `None` means the model has no known price.
+pub fn update_cost(
+    conn: &Connection,
+    session_id: &str,
+    cost_usd: Option<f64>,
+) -> rusqlite::Result<()> {
     conn.execute(
-        "UPDATE sessions SET cost_usd = ?2 WHERE id = ?1",
-        params![session_id, cost_usd],
+        "UPDATE sessions SET cost_usd = ?2, cost_unpriced = ?3 WHERE id = ?1",
+        params![session_id, cost_usd.unwrap_or(0.0), cost_usd.is_none() as i64],
     )?;
     Ok(())
 }
 
-/// Single-session variant of `all_session_token_totals`, used right after `upsert_session` to
-/// read back the now-updated accumulated totals for cost recomputation (see
+const TOKEN_TOTALS_COLUMNS: &str = "id, model, prompt_tokens, completion_tokens, cache_read_tokens,
+     cache_creation_tokens, cache_creation_1h_tokens";
+
+fn row_to_token_totals(row: &Row) -> rusqlite::Result<SessionTokenTotals> {
+    Ok(SessionTokenTotals {
+        id: row.get(0)?,
+        model: row.get(1)?,
+        prompt_tokens: row.get(2)?,
+        completion_tokens: row.get(3)?,
+        cache_read_tokens: row.get(4)?,
+        cache_creation_tokens: row.get(5)?,
+        cache_creation_1h_tokens: row.get(6)?,
+    })
+}
+
+/// Single-session variant of `legacy_session_token_totals`, used right after `upsert_session`
+/// to read back the now-updated accumulated totals for cost recomputation (see
 /// `session_builder::ingest_record`) without re-parsing logs.
 pub fn session_token_totals(
     conn: &Connection,
     session_id: &str,
 ) -> rusqlite::Result<Option<SessionTokenTotals>> {
-    conn.query_row(
-        "SELECT id, model, prompt_tokens, completion_tokens, cache_read_tokens, cache_creation_tokens
-         FROM sessions WHERE id = ?1",
-        params![session_id],
-        |row| {
-            Ok(SessionTokenTotals {
-                id: row.get(0)?,
-                model: row.get(1)?,
-                prompt_tokens: row.get(2)?,
-                completion_tokens: row.get(3)?,
-                cache_read_tokens: row.get(4)?,
-                cache_creation_tokens: row.get(5)?,
-            })
-        },
-    )
-    .optional()
+    let sql = format!("SELECT {TOKEN_TOTALS_COLUMNS} FROM sessions WHERE id = ?1");
+    conn.query_row(&sql, params![session_id], row_to_token_totals)
+        .optional()
 }
 
-pub fn all_session_token_totals(conn: &Connection) -> rusqlite::Result<Vec<SessionTokenTotals>> {
+/// Totals for sessions priced from aggregates — those with no `session_usage` rows. Sessions
+/// with rows are repriced row by row instead (see `all_session_usage_rows`).
+pub fn legacy_session_token_totals(conn: &Connection) -> rusqlite::Result<Vec<SessionTokenTotals>> {
+    let sql = format!(
+        "SELECT {TOKEN_TOTALS_COLUMNS} FROM sessions s
+         WHERE NOT EXISTS (SELECT 1 FROM session_usage u WHERE u.session_id = s.id)"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], row_to_token_totals)?;
+    rows.collect()
+}
+
+/// One billable API response, as stored in `session_usage`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsageRow {
+    pub session_id: String,
+    pub usage_key: String,
+    pub model: Option<String>,
+    pub speed: Option<String>,
+    pub tokens: crate::cost::pricing::TokenUsage,
+}
+
+/// Records one API response's usage. Returns `false` (and changes nothing) when this response
+/// was already recorded — the dedupe that stops repeated log lines from inflating totals.
+pub fn insert_session_usage(
+    conn: &Connection,
+    row: &UsageRow,
+    cost_usd: Option<f64>,
+) -> rusqlite::Result<bool> {
+    let changed = conn.execute(
+        "INSERT OR IGNORE INTO session_usage
+         (session_id, usage_key, model, speed, input_tokens, output_tokens, cache_read_tokens,
+          cache_write_5m_tokens, cache_write_1h_tokens, cost_usd)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![
+            row.session_id,
+            row.usage_key,
+            row.model,
+            row.speed,
+            row.tokens.input,
+            row.tokens.output,
+            row.tokens.cache_read,
+            row.tokens.cache_write_5m,
+            row.tokens.cache_write_1h,
+            cost_usd,
+        ],
+    )?;
+    Ok(changed > 0)
+}
+
+/// Rewrites a session's token and cost totals as the sum of its `session_usage` rows. A no-op
+/// for sessions with no rows. Idempotent, so the watcher and the startup rebuild can both call
+/// it for the same session in any order.
+pub fn refresh_session_totals_from_usage(
+    conn: &Connection,
+    session_id: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE sessions SET
+            prompt_tokens = u.input, completion_tokens = u.output, cache_read_tokens = u.cache_read,
+            cache_creation_tokens = u.write_5m + u.write_1h, cache_creation_1h_tokens = u.write_1h,
+            cost_usd = u.cost, cost_unpriced = u.unpriced
+         FROM (
+            SELECT SUM(input_tokens) AS input, SUM(output_tokens) AS output,
+                   SUM(cache_read_tokens) AS cache_read, SUM(cache_write_5m_tokens) AS write_5m,
+                   SUM(cache_write_1h_tokens) AS write_1h, COALESCE(SUM(cost_usd), 0.0) AS cost,
+                   MAX(cost_usd IS NULL) AS unpriced
+            FROM session_usage WHERE session_id = ?1
+            HAVING COUNT(*) > 0
+         ) AS u
+         WHERE sessions.id = ?1",
+        params![session_id],
+    )?;
+    Ok(())
+}
+
+pub fn all_session_usage_rows(conn: &Connection) -> rusqlite::Result<Vec<UsageRow>> {
     let mut stmt = conn.prepare(
-        "SELECT id, model, prompt_tokens, completion_tokens, cache_read_tokens, cache_creation_tokens
-         FROM sessions",
+        "SELECT session_id, usage_key, model, speed, input_tokens, output_tokens,
+                cache_read_tokens, cache_write_5m_tokens, cache_write_1h_tokens
+         FROM session_usage",
     )?;
     let rows = stmt.query_map([], |row| {
-        Ok(SessionTokenTotals {
-            id: row.get(0)?,
-            model: row.get(1)?,
-            prompt_tokens: row.get(2)?,
-            completion_tokens: row.get(3)?,
-            cache_read_tokens: row.get(4)?,
-            cache_creation_tokens: row.get(5)?,
+        Ok(UsageRow {
+            session_id: row.get(0)?,
+            usage_key: row.get(1)?,
+            model: row.get(2)?,
+            speed: row.get(3)?,
+            tokens: crate::cost::pricing::TokenUsage {
+                input: row.get(4)?,
+                output: row.get(5)?,
+                cache_read: row.get(6)?,
+                cache_write_5m: row.get(7)?,
+                cache_write_1h: row.get(8)?,
+            },
         })
     })?;
+    rows.collect()
+}
+
+pub fn update_session_usage_cost(
+    conn: &Connection,
+    session_id: &str,
+    usage_key: &str,
+    cost_usd: Option<f64>,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE session_usage SET cost_usd = ?3 WHERE session_id = ?1 AND usage_key = ?2",
+        params![session_id, usage_key, cost_usd],
+    )?;
+    Ok(())
+}
+
+/// Sessions whose agent logs expose per-response identity but that have no usage rows yet —
+/// ingested before `session_usage` existed, so their totals were summed line by line. The
+/// startup rebuild re-reads these logs once.
+pub fn sessions_needing_usage_rebuild(
+    conn: &Connection,
+) -> rusqlite::Result<Vec<(String, String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT s.id, s.agent, s.raw_log_path FROM sessions s
+         WHERE s.agent IN ('claude', 'codex')
+           AND (s.prompt_tokens + s.completion_tokens + s.cache_read_tokens
+                + s.cache_creation_tokens) > 0
+           AND NOT EXISTS (SELECT 1 FROM session_usage u WHERE u.session_id = s.id)",
+    )?;
+    let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
     rows.collect()
 }
 
@@ -1765,7 +1969,8 @@ pub fn all_session_token_totals(conn: &Connection) -> rusqlite::Result<Vec<Sessi
 /// gemini_log,cursor_jsonl}.rs`).
 pub fn agent_usage(conn: &Connection) -> rusqlite::Result<Vec<AgentUsage>> {
     let mut stmt = conn.prepare(
-        "SELECT agent, COUNT(*) as session_count, COALESCE(SUM(cost_usd), 0.0) as total_cost_usd
+        "SELECT agent, COUNT(*) as session_count, COALESCE(SUM(cost_usd), 0.0) as total_cost_usd,
+                COALESCE(SUM(cost_unpriced), 0)
          FROM sessions
          GROUP BY agent
          ORDER BY total_cost_usd DESC",
@@ -1775,6 +1980,7 @@ pub fn agent_usage(conn: &Connection) -> rusqlite::Result<Vec<AgentUsage>> {
             agent: row.get(0)?,
             session_count: row.get(1)?,
             total_cost_usd: row.get(2)?,
+            unpriced_session_count: row.get(3)?,
         })
     })?;
     rows.collect()
@@ -1862,7 +2068,8 @@ pub fn report_by_project(
 /// all-time call site has no window to pass.
 pub fn agent_usage_since(conn: &Connection, since_epoch: i64) -> rusqlite::Result<Vec<AgentUsage>> {
     let mut stmt = conn.prepare(
-        "SELECT agent, COUNT(*) as session_count, COALESCE(SUM(cost_usd), 0.0) as total_cost_usd
+        "SELECT agent, COUNT(*) as session_count, COALESCE(SUM(cost_usd), 0.0) as total_cost_usd,
+                COALESCE(SUM(cost_unpriced), 0)
          FROM sessions
          WHERE last_activity_at >= ?1
          GROUP BY agent
@@ -1873,6 +2080,7 @@ pub fn agent_usage_since(conn: &Connection, since_epoch: i64) -> rusqlite::Resul
             agent: row.get(0)?,
             session_count: row.get(1)?,
             total_cost_usd: row.get(2)?,
+            unpriced_session_count: row.get(3)?,
         })
     })?;
     rows.collect()
@@ -2535,6 +2743,8 @@ mod file_diff_span_tests {
             .unwrap();
         conn.execute_batch(include_str!("../../migrations/0004_session_title.sql"))
             .unwrap();
+        conn.execute_batch(include_str!("../../migrations/0011_session_usage.sql"))
+            .unwrap();
         conn
     }
 
@@ -2677,6 +2887,8 @@ mod report_tests {
         conn.execute_batch(include_str!("../../migrations/0003_kanban.sql"))
             .unwrap();
         conn.execute_batch(include_str!("../../migrations/0004_session_title.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../../migrations/0011_session_usage.sql"))
             .unwrap();
         conn
     }
@@ -2821,6 +3033,10 @@ mod kanban_tests {
         conn.execute_batch(include_str!("../../migrations/0007_dispatch.sql"))
             .unwrap();
         conn.execute_batch(include_str!("../../migrations/0009_dispatch_chat.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../../migrations/0010_dispatch_loop.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../../migrations/0011_session_usage.sql"))
             .unwrap();
         conn
     }
@@ -3197,6 +3413,8 @@ mod list_query_tests {
             .unwrap();
         conn.execute_batch(include_str!("../../migrations/0004_session_title.sql"))
             .unwrap();
+        conn.execute_batch(include_str!("../../migrations/0011_session_usage.sql"))
+            .unwrap();
         conn
     }
 
@@ -3296,6 +3514,10 @@ mod dispatch_query_tests {
             .unwrap();
         conn.execute_batch(include_str!("../../migrations/0009_dispatch_chat.sql"))
             .unwrap();
+        conn.execute_batch(include_str!("../../migrations/0010_dispatch_loop.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../../migrations/0011_session_usage.sql"))
+            .unwrap();
         conn
     }
 
@@ -3330,6 +3552,7 @@ mod dispatch_query_tests {
             "Find the auth race and fix it.",
             "codex",
             "gpt-5",
+            None,
             2_000,
         )
         .unwrap();
@@ -3370,6 +3593,7 @@ mod dispatch_query_tests {
             "Run the test suite and fix failures.",
             "claude",
             "sonnet",
+            None,
             2_000,
         )
         .unwrap();
@@ -3383,7 +3607,7 @@ mod dispatch_query_tests {
             2_100,
         )
         .unwrap();
-        let retry = create_retry_run(&conn, &created.task.id, "gemini", "auto", 2_200).unwrap();
+        let retry = create_retry_run(&conn, &created.task.id, "gemini", "auto", None, 2_200).unwrap();
 
         assert_eq!(retry.attempt, 2);
         assert_eq!(retry.agent, "gemini");
@@ -3427,6 +3651,7 @@ mod dispatch_query_tests {
             "Run the suite.",
             "claude",
             "default",
+            None,
             2_000,
         )
         .unwrap();
@@ -3464,6 +3689,7 @@ mod dispatch_query_tests {
             "Run the suite.",
             "codex",
             "default",
+            None,
             2_000,
         )
         .unwrap();
@@ -3472,6 +3698,36 @@ mod dispatch_query_tests {
         assert!(!has_active_dispatch_for_project_agent(&conn, "p1", "claude").unwrap());
         finish_dispatch_run(&conn, &created.run.id, "completed", Some(0), None, 2_100).unwrap();
         assert!(!has_active_dispatch_for_project_agent(&conn, "p1", "codex").unwrap());
+    }
+
+    #[test]
+    fn parked_conversations_do_not_block_a_new_launch() {
+        let conn = in_memory_db();
+        upsert_project(&conn, "p1", "relay", "/work/relay", 1_000).unwrap();
+        let created = create_dispatch_task(
+            &conn, "p1", None, "Task", "Prompt", "claude", "default", None, 2_000,
+        )
+        .unwrap();
+        let (turn, _) = begin_dispatch_turn(&conn, &created.run.id, "Prompt", 2_001).unwrap();
+        assert!(has_active_dispatch_for_project_agent(&conn, "p1", "claude").unwrap());
+
+        for (turn_status, conversation_status) in [("completed", "idle"), ("failed", "failed")] {
+            settle_dispatch_turn(
+                &conn,
+                &created.run.id,
+                &turn.id,
+                turn_status,
+                conversation_status,
+                None,
+                None,
+                2_100,
+            )
+            .unwrap();
+            assert!(
+                !has_active_dispatch_for_project_agent(&conn, "p1", "claude").unwrap(),
+                "a {conversation_status} conversation has no live process and must not block"
+            );
+        }
     }
 
     #[test]
@@ -3486,6 +3742,7 @@ mod dispatch_query_tests {
             "Update the readme.",
             "codex",
             "default",
+            None,
             2_000,
         )
         .unwrap();
@@ -3546,6 +3803,61 @@ mod dispatch_query_tests {
     }
 
     #[test]
+    fn loop_iterations_are_claimed_once_and_stop_disables_looping() {
+        let conn = in_memory_db();
+        upsert_project(&conn, "p1", "relay", "/work/relay", 1_000).unwrap();
+        let created = create_dispatch_task(
+            &conn,
+            "p1",
+            None,
+            "Finish the feature",
+            "Finish the feature.",
+            "claude",
+            "default",
+            Some(3),
+            2_000,
+        )
+        .unwrap();
+        assert_eq!(created.run.loop_max_iterations, Some(3));
+        let (turn, _) =
+            begin_dispatch_turn(&conn, &created.run.id, "Finish the feature.", 2_001).unwrap();
+        assert_eq!(last_assistant_message_for_turn(&conn, &turn.id).unwrap(), None);
+        for (content, id) in [("Planning", "m1"), ("Done RELAY_LOOP_DONE", "m2")] {
+            upsert_dispatch_event(
+                &conn,
+                &created.run.id,
+                Some(&turn.id),
+                "assistant_message",
+                Some("assistant"),
+                content,
+                None,
+                Some(id),
+                Some("completed"),
+                DispatchEventUpdate::Replace,
+                2_002,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            last_assistant_message_for_turn(&conn, &turn.id).unwrap().as_deref(),
+            Some("Done RELAY_LOOP_DONE")
+        );
+
+        assert!(claim_dispatch_loop_iteration(&conn, &created.run.id, 1).unwrap());
+        assert!(
+            !claim_dispatch_loop_iteration(&conn, &created.run.id, 1).unwrap(),
+            "the same continuation must not be claimed twice"
+        );
+        let run = get_dispatch_run(&conn, &created.run.id).unwrap().unwrap();
+        assert_eq!(run.loop_iterations, 1);
+
+        assert!(stop_dispatch_loop(&conn, &created.run.id).unwrap());
+        assert!(!claim_dispatch_loop_iteration(&conn, &created.run.id, 2).unwrap());
+        let run = get_dispatch_run(&conn, &created.run.id).unwrap().unwrap();
+        assert_eq!(run.loop_max_iterations, None);
+    }
+
+    #[test]
     fn assistant_deltas_append_into_one_stable_message() {
         let conn = in_memory_db();
         upsert_project(&conn, "p1", "relay", "/work/relay", 1_000).unwrap();
@@ -3557,6 +3869,7 @@ mod dispatch_query_tests {
             "Explain the change.",
             "claude",
             "default",
+            None,
             2_000,
         )
         .unwrap();
@@ -3629,6 +3942,7 @@ mod dispatch_query_tests {
             "Answer quickly.",
             "codex",
             "default",
+            None,
             now,
         )
         .unwrap();
@@ -3676,6 +3990,8 @@ mod session_deletion_tests {
             include_str!("../../migrations/0007_dispatch.sql"),
             include_str!("../../migrations/0008_deleted_sessions.sql"),
             include_str!("../../migrations/0009_dispatch_chat.sql"),
+            include_str!("../../migrations/0010_dispatch_loop.sql"),
+            include_str!("../../migrations/0011_session_usage.sql"),
         ] {
             conn.execute_batch(migration).unwrap();
         }
@@ -3708,7 +4024,7 @@ mod session_deletion_tests {
         let board_id = ensure_board_for_project(&conn, "p1").unwrap();
         auto_create_card_for_session(&conn, &board_id, "s1", "Keep this task").unwrap();
         let created = create_dispatch_task(
-            &conn, "p1", None, "Task", "Prompt", "claude", "default", 1_000,
+            &conn, "p1", None, "Task", "Prompt", "claude", "default", None, 1_000,
         )
         .unwrap();
         conn.execute(

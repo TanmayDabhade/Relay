@@ -49,6 +49,8 @@ impl Runtime {
         builder
             .args(args)
             .current_dir(project_path)
+            // Not the app's own launchd PATH — see `agent_search_paths` for why.
+            .env("PATH", super::agent_path_env())
             .env("TERM", "dumb")
             .env("NO_COLOR", "1")
             .env("CLICOLOR", "0")
@@ -246,6 +248,9 @@ impl Runtime {
                 .unwrap()
                 .remove(&run_id);
             emit_run_changed(&app, &run_id, &final_status);
+            // Only after the handle is removed: a continuation needs this run to have no
+            // active turn, or `start_turn` would refuse it.
+            crate::commands::continue_dispatch_loop(&app, &run_id, &turn_id, turn_status);
         });
 
         Ok(())

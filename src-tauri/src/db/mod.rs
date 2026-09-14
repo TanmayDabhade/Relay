@@ -30,6 +30,8 @@ pub fn open(db_path: &Path) -> anyhow::Result<Connection> {
         M::up(include_str!("../../migrations/0007_dispatch.sql")),
         M::up(include_str!("../../migrations/0008_deleted_sessions.sql")),
         M::up(include_str!("../../migrations/0009_dispatch_chat.sql")),
+        M::up(include_str!("../../migrations/0010_dispatch_loop.sql")),
+        M::up(include_str!("../../migrations/0011_session_usage.sql")),
     ]);
     migrations.to_latest(&mut conn)?;
 

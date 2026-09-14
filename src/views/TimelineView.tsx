@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { listProjects, listSessions } from "../lib/tauri";
-import { formatRelativeTime, sessionDisplayName } from "../lib/format";
+import { formatCost, formatRelativeTime, sessionDisplayName } from "../lib/format";
 import { colorForProject } from "../lib/projectColor";
 import { Button } from "../components/ui/Button";
 import { Pill } from "../components/ui/Pill";
@@ -81,11 +81,18 @@ function TimelineEntry({ session, projectName, onClick }: TimelineEntryProps) {
             </Pill>
           ))}
           <span className="timeline-entry-time">
-            {formatRelativeTime(timelineTimestamp(session))}
+            {session.status === "active"
+              ? `active ${formatRelativeTime(session.last_activity_at)}`
+              : formatRelativeTime(timelineTimestamp(session))}
           </span>
         </div>
         <div className="timeline-entry-summary">
           {sessionDisplayName(session.title, session.summary)}
+        </div>
+        <div className="timeline-entry-meta">
+          <span>{session.model ?? "unknown model"}</span>
+          <span>{formatCost(session.cost_usd, session.cost_unpriced)}</span>
+          <span>{(session.prompt_tokens + session.completion_tokens).toLocaleString()} tokens</span>
         </div>
       </div>
     </button>
@@ -117,22 +124,26 @@ export function TimelineView() {
     return Array.from(tagSet).sort();
   }, [sessions]);
 
-  const sortedAndFiltered = useMemo(() => {
-    if (!sessions) return [];
-    return sessions
-      .filter((session) => {
-        if (projectFilter !== "all" && session.project_id !== projectFilter) {
-          return false;
-        }
-        if (tagFilter !== "all" && !parseTags(session.tags).includes(tagFilter)) {
-          return false;
-        }
-        if (!isWithinDatePreset(timelineTimestamp(session), datePreset)) {
-          return false;
-        }
-        return true;
-      })
-      .sort((a, b) => timelineTimestamp(b) - timelineTimestamp(a));
+  // Running sessions are pinned above the history (most recently active first) and ignore the
+  // date preset: a session that is live right now is always relevant, even if it started
+  // before "today". Project and tag filters still apply to both lists.
+  const { activeSessions, pastSessions } = useMemo(() => {
+    const matchesFilters = (session: Session) =>
+      (projectFilter === "all" || session.project_id === projectFilter) &&
+      (tagFilter === "all" || parseTags(session.tags).includes(tagFilter));
+    const matching = (sessions ?? []).filter(matchesFilters);
+    return {
+      activeSessions: matching
+        .filter((session) => session.status === "active")
+        .sort((a, b) => b.last_activity_at - a.last_activity_at),
+      pastSessions: matching
+        .filter(
+          (session) =>
+            session.status !== "active" &&
+            isWithinDatePreset(timelineTimestamp(session), datePreset),
+        )
+        .sort((a, b) => timelineTimestamp(b) - timelineTimestamp(a)),
+    };
   }, [sessions, projectFilter, tagFilter, datePreset]);
 
   return (
@@ -202,20 +213,49 @@ export function TimelineView() {
             </div>
           </div>
 
-          {sortedAndFiltered.length === 0 ? (
-            <p className="timeline-view-status">No sessions match the current filters.</p>
-          ) : (
-            <div className="timeline-list">
-              {sortedAndFiltered.map((session) => (
-                <TimelineEntry
-                  key={session.id}
-                  session={session}
-                  projectName={projectNameFor(projects, session.project_id)}
-                  onClick={() => setSelectedSessionId(session.id)}
-                />
-              ))}
-            </div>
-          )}
+          {activeSessions.length > 0 ? (
+            <section className="timeline-section" aria-labelledby="timeline-active-heading">
+              <h2 id="timeline-active-heading" className="timeline-section-heading is-active">
+                <i aria-hidden /> Active now · {activeSessions.length}
+              </h2>
+              <div className="timeline-list">
+                {activeSessions.map((session) => (
+                  <TimelineEntry
+                    key={session.id}
+                    session={session}
+                    projectName={projectNameFor(projects, session.project_id)}
+                    onClick={() => setSelectedSessionId(session.id)}
+                  />
+                ))}
+              </div>
+            </section>
+          ) : null}
+
+          <section className="timeline-section" aria-labelledby="timeline-history-heading">
+            {activeSessions.length > 0 ? (
+              <h2 id="timeline-history-heading" className="timeline-section-heading">
+                Earlier
+              </h2>
+            ) : null}
+            {pastSessions.length === 0 ? (
+              <p className="timeline-view-status">
+                {activeSessions.length > 0
+                  ? "No finished sessions match the current filters."
+                  : "No sessions match the current filters."}
+              </p>
+            ) : (
+              <div className="timeline-list">
+                {pastSessions.map((session) => (
+                  <TimelineEntry
+                    key={session.id}
+                    session={session}
+                    projectName={projectNameFor(projects, session.project_id)}
+                    onClick={() => setSelectedSessionId(session.id)}
+                  />
+                ))}
+              </div>
+            )}
+          </section>
         </>
       )}
 

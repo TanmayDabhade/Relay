@@ -1,6 +1,6 @@
 import { Pill } from "../components/ui/Pill";
 import { ProjectDot } from "../components/ui/ProjectDot";
-import { formatRelativeTime, sessionDisplayName } from "../lib/format";
+import { formatCost, formatRelativeTime, sessionDisplayName } from "../lib/format";
 import type { Session } from "../lib/types";
 import "./SessionRow.css";
 
@@ -12,9 +12,8 @@ interface SessionRowProps {
 
 /**
  * Single-session summary row: project + status + model on top, summary below, stats
- * (relative time / cost / tokens) on the right. Shared between `SessionsView` (flat list of
- * all sessions) and `ProjectDetail` (sessions scoped to one project) so this rendering logic
- * lives in exactly one place.
+ * (relative time / cost / tokens) on the right. Used by `ProjectDetail`'s
+ * Sessions tab (sessions scoped to one project); the app-wide list lives in `TimelineView`.
  */
 export function SessionRow({ session, projectName, onClick }: SessionRowProps) {
   return (
@@ -34,7 +33,7 @@ export function SessionRow({ session, projectName, onClick }: SessionRowProps) {
       </div>
       <div className="session-row-stats">
         <span>{formatRelativeTime(session.last_activity_at)}</span>
-        <span>${session.cost_usd.toFixed(2)}</span>
+        <span>{formatCost(session.cost_usd, session.cost_unpriced)}</span>
         <span>
           {session.prompt_tokens + session.completion_tokens} tokens
         </span>

@@ -3,20 +3,20 @@ import "./Sidebar.css";
 export type View =
   | "dashboard"
   | "projects"
-  | "sessions"
   | "timeline"
   | "report"
   | "connections"
+  | "settings"
   | "agent-viewer";
 
 const NAV_ITEMS: { id: View; label: string; icon: string; disabled?: boolean }[] = [
   { id: "dashboard", label: "Home", icon: "▦" },
   { id: "projects", label: "Projects", icon: "⊞" },
-  { id: "sessions", label: "Sessions", icon: "◷" },
   { id: "timeline", label: "Timeline", icon: "⋮" },
   { id: "report", label: "Reports", icon: "▥" },
   { id: "agent-viewer", label: "Agent work", icon: "▶" },
   { id: "connections", label: "Connections", icon: "⟳" },
+  { id: "settings", label: "Settings", icon: "⚙" },
 ];
 
 interface SidebarProps {

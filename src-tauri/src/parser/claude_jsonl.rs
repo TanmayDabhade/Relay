@@ -73,17 +73,36 @@ pub fn parse_line(line: &str) -> Option<ParsedRecord> {
         .and_then(Value::as_str)
         .map(String::from);
 
-    let usage = message.and_then(|m| m.get("usage")).map(|u| Usage {
-        input_tokens: u.get("input_tokens").and_then(Value::as_i64).unwrap_or(0),
-        output_tokens: u.get("output_tokens").and_then(Value::as_i64).unwrap_or(0),
-        cache_read_input_tokens: u
-            .get("cache_read_input_tokens")
-            .and_then(Value::as_i64)
-            .unwrap_or(0),
-        cache_creation_input_tokens: u
+    let usage = message.and_then(|m| m.get("usage")).map(|u| {
+        let cache_creation_input_tokens = u
             .get("cache_creation_input_tokens")
             .and_then(Value::as_i64)
-            .unwrap_or(0),
+            .unwrap_or(0);
+        Usage {
+            input_tokens: u.get("input_tokens").and_then(Value::as_i64).unwrap_or(0),
+            output_tokens: u.get("output_tokens").and_then(Value::as_i64).unwrap_or(0),
+            cache_read_input_tokens: u
+                .get("cache_read_input_tokens")
+                .and_then(Value::as_i64)
+                .unwrap_or(0),
+            cache_creation_input_tokens,
+            cache_creation_1h_input_tokens: u
+                .get("cache_creation")
+                .and_then(|c| c.get("ephemeral_1h_input_tokens"))
+                .and_then(Value::as_i64)
+                .unwrap_or(0)
+                .clamp(0, cache_creation_input_tokens.max(0)),
+            speed: u.get("speed").and_then(Value::as_str).map(String::from),
+        }
+    });
+    // Claude Code writes one JSONL line per content block of a single API response (text,
+    // then each tool_use), and every one of those lines repeats that response's full `usage`.
+    // Verified on real logs: 161 of 341 responses in one session spanned 2+ lines with
+    // identical usage. The message id + request id identify the response.
+    let usage_key = usage.as_ref().and_then(|_| {
+        let message_id = message.and_then(|m| m.get("id")).and_then(Value::as_str)?;
+        let request_id = value.get("requestId").and_then(Value::as_str).unwrap_or("");
+        Some(format!("{message_id}:{request_id}"))
     });
 
     let content = message.and_then(|m| m.get("content"));
@@ -112,6 +131,7 @@ pub fn parse_line(line: &str) -> Option<ParsedRecord> {
         timestamp,
         model,
         usage,
+        usage_key,
         tool_uses,
         text,
         ai_title,

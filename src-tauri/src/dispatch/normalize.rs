@@ -26,7 +26,8 @@ pub struct NormalizedLine {
 
 #[derive(Debug, Clone, Default)]
 pub struct NormalizeState {
-    claude_message_id: Option<String>,
+    claude_open_message_id: Option<String>,
+    claude_message_sequence: u64,
     gemini_message_id: Option<String>,
     gemini_message_sequence: u64,
     cursor_message_id: Option<String>,
@@ -179,7 +180,13 @@ fn normalize_claude_stream_event(
     let stream = value.get("event").unwrap_or(value);
     match stream.get("type").and_then(Value::as_str).unwrap_or_default() {
         "message_start" => {
-            state.claude_message_id = string_at(stream, &[&["message", "id"]]);
+            state.claude_message_sequence += 1;
+            state.claude_open_message_id = string_at(stream, &[&["message", "id"]]).or_else(|| {
+                Some(format!(
+                    "claude-message-{}",
+                    state.claude_message_sequence
+                ))
+            });
         }
         "content_block_start" => {
             let block = stream.get("content_block").unwrap_or(stream);
@@ -205,12 +212,15 @@ fn normalize_claude_stream_event(
                         Some("assistant"),
                         content,
                         None,
-                        state.claude_message_id.clone(),
+                        state.claude_open_message_id.clone(),
                         Some("running"),
                         NormalizedEventUpdate::Append,
                     ));
                 }
             }
+        }
+        "message_stop" => {
+            state.claude_open_message_id = None;
         }
         _ => {}
     }
@@ -247,12 +257,20 @@ fn normalize_claude(
                 .collect::<Vec<_>>()
                 .join("\n");
             if !content.is_empty() {
+                let stable_message_id = state
+                    .claude_open_message_id
+                    .clone()
+                    .or(message_id.clone())
+                    .unwrap_or_else(|| {
+                        state.claude_message_sequence += 1;
+                        format!("claude-message-{}", state.claude_message_sequence)
+                    });
                 output.events.push(event(
                     "assistant_message",
                     Some("assistant"),
                     content,
                     None,
-                    message_id.clone(),
+                    Some(stable_message_id),
                     Some("completed"),
                 ));
             }
@@ -271,7 +289,6 @@ fn normalize_claude(
                 }
             }
         }
-        state.claude_message_id = None;
         return;
     }
     if event_type == "user" {
@@ -324,6 +341,7 @@ fn normalize_claude(
         ));
     }
     if event_type == "result" {
+        state.claude_open_message_id = None;
         output.turn_complete = true;
     }
 }
@@ -692,6 +710,102 @@ mod tests {
         assert_eq!(completed.events[0].provider_event_id.as_deref(), Some("message-1"));
         assert_eq!(completed.events[0].state.as_deref(), Some("completed"));
         assert_eq!(completed.events[0].update, NormalizedEventUpdate::Replace);
+    }
+
+    #[test]
+    fn claude_thinking_record_preserves_open_identity_for_idless_completion() {
+        let mut state = NormalizeState::default();
+        normalize_provider_line_with_state(
+            "claude",
+            r#"{"type":"stream_event","event":{"type":"message_start","message":{"id":"stream-message"}}}"#,
+            &mut state,
+        )
+        .unwrap();
+        normalize_provider_line_with_state(
+            "claude",
+            r#"{"type":"assistant","message":{"id":"stream-message","content":[{"type":"thinking","thinking":""}]}}"#,
+            &mut state,
+        )
+        .unwrap();
+
+        let delta = normalize_provider_line_with_state(
+            "claude",
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Streaming"}}}"#,
+            &mut state,
+        )
+        .unwrap();
+        let completed = normalize_provider_line_with_state(
+            "claude",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Streaming complete"}]}}"#,
+            &mut state,
+        )
+        .unwrap();
+
+        assert_eq!(
+            delta.events[0].provider_event_id.as_deref(),
+            Some("stream-message")
+        );
+        assert_eq!(
+            completed.events[0].provider_event_id.as_deref(),
+            Some("stream-message")
+        );
+        assert_eq!(completed.events[0].update, NormalizedEventUpdate::Replace);
+    }
+
+    #[test]
+    fn claude_completion_reuses_open_identity_when_its_provider_id_differs() {
+        let mut state = NormalizeState::default();
+        normalize_provider_line_with_state(
+            "claude",
+            r#"{"type":"stream_event","event":{"type":"message_start","message":{"id":"stream-message"}}}"#,
+            &mut state,
+        )
+        .unwrap();
+        let completed = normalize_provider_line_with_state(
+            "claude",
+            r#"{"type":"assistant","message":{"id":"different-final-id","content":[{"type":"text","text":"Complete"}]}}"#,
+            &mut state,
+        )
+        .unwrap();
+
+        assert_eq!(
+            completed.events[0].provider_event_id.as_deref(),
+            Some("stream-message")
+        );
+    }
+
+    #[test]
+    fn claude_stream_without_a_provider_id_synthesizes_one_stable_identity() {
+        let mut state = NormalizeState::default();
+        normalize_provider_line_with_state(
+            "claude",
+            r#"{"type":"stream_event","event":{"type":"message_start","message":{}}}"#,
+            &mut state,
+        )
+        .unwrap();
+        let first = normalize_provider_line_with_state(
+            "claude",
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"One"}}}"#,
+            &mut state,
+        )
+        .unwrap();
+        let second = normalize_provider_line_with_state(
+            "claude",
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":" two"}}}"#,
+            &mut state,
+        )
+        .unwrap();
+        let completed = normalize_provider_line_with_state(
+            "claude",
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"One two"}]}}"#,
+            &mut state,
+        )
+        .unwrap();
+
+        let identity = first.events[0].provider_event_id.as_deref();
+        assert!(identity.is_some());
+        assert_eq!(second.events[0].provider_event_id.as_deref(), identity);
+        assert_eq!(completed.events[0].provider_event_id.as_deref(), identity);
     }
 
     #[test]

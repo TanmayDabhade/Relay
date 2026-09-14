@@ -11,6 +11,10 @@ import '@fontsource/ibm-plex-mono/600.css'
 import './styles/tokens.css'
 import './styles/global.css'
 import App from './App.tsx'
+import { applyTextSize, readStoredTextSize } from './lib/applyTextSize'
+
+// Before the first render, so the UI never paints at the default size and then jumps.
+applyTextSize(readStoredTextSize())
 
 const queryClient = new QueryClient({
   defaultOptions: {

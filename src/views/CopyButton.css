@@ -1,0 +1,20 @@
+.copy-button-shell {
+  display: inline-flex;
+  flex-shrink: 0;
+}
+
+.copy-button {
+  min-width: 7.5rem;
+}
+
+.copy-button-status {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}

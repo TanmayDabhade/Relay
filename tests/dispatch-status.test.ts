@@ -31,3 +31,15 @@ test("ongoing Relay work includes idle conversations but excludes terminal runs"
     assert.equal(isOngoingDispatch(status), false, `${status} should leave ongoing work`);
   }
 });
+
+test("costs with unpriced usage never render as a plain $0.00", () => {
+  const formatCost = (format as Record<string, unknown>).formatCost as (
+    cost: number,
+    unpriced: boolean,
+  ) => string;
+  assert.equal(typeof formatCost, "function", "formatCost must be exported");
+  assert.equal(formatCost(82.5512, false), "$82.55");
+  assert.equal(formatCost(0, false), "$0.00");
+  assert.equal(formatCost(0, true), "Not priced");
+  assert.equal(formatCost(12.3, true), "$12.30+");
+});

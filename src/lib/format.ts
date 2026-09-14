@@ -35,3 +35,12 @@ const ONGOING_DISPATCH_STATUSES = new Set<DispatchStatus>([
 export function isOngoingDispatch(status: DispatchStatus): boolean {
   return ONGOING_DISPATCH_STATUSES.has(status);
 }
+
+/**
+ * Spend for a session or group. `unpriced` means some usage is on a model Relay has no price
+ * for (e.g. Codex's GPT models), so the dollar figure is a lower bound, or absent entirely.
+ */
+export function formatCost(costUsd: number, unpriced: boolean): string {
+  if (unpriced && costUsd === 0) return "Not priced";
+  return `$${costUsd.toFixed(2)}${unpriced ? "+" : ""}`;
+}

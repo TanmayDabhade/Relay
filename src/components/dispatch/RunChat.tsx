@@ -1,6 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { listen } from "@tauri-apps/api/event";
+import { CopyResponseButton, MarkdownMessage } from "./MarkdownMessage";
+import {
+  parseLoopContinuation,
+  stripLoopContract,
+  stripLoopDoneMarker,
+} from "../../lib/loopMarkers";
 import { getDispatchConversation, resolveDispatchApproval } from "../../lib/tauri";
 import type {
   DispatchApprovalDecision,
@@ -10,6 +16,76 @@ import type {
 
 interface RunChatProps {
   runId: string;
+  /** True while the agent is mid-turn; the trailing tool group shows "Working". */
+  active?: boolean;
+}
+
+type ChatItem =
+  | { type: "event"; event: DispatchEvent }
+  | { type: "tools"; events: DispatchEvent[] };
+
+function isToolEvent(event: DispatchEvent): boolean {
+  return event.kind === "tool_call" || event.kind === "tool_result";
+}
+
+// Collapse each run of consecutive tool calls/results into one group.
+function groupEvents(events: DispatchEvent[]): ChatItem[] {
+  const items: ChatItem[] = [];
+  for (const event of events) {
+    if (event.kind === "legacy_output") continue;
+    const last = items[items.length - 1];
+    if (isToolEvent(event)) {
+      if (last?.type === "tools") last.events.push(event);
+      else items.push({ type: "tools", events: [event] });
+    } else {
+      items.push({ type: "event", event });
+    }
+  }
+  return items;
+}
+
+function durationLabel(seconds: number): string {
+  if (seconds < 60) return `${Math.max(seconds, 1)}s`;
+  const minutes = Math.floor(seconds / 60);
+  const rest = seconds % 60;
+  return rest ? `${minutes}m ${rest}s` : `${minutes}m`;
+}
+
+function WorkingLabel() {
+  return (
+    <span className="chat-working" role="status">
+      Working
+    </span>
+  );
+}
+
+function ToolGroup({ events, working }: { events: DispatchEvent[]; working: boolean }) {
+  const calls = events.filter((event) => event.kind === "tool_call").length || events.length;
+  const errors = events.filter((event) => event.state === "error").length;
+  const seconds = events[events.length - 1].created_at - events[0].created_at;
+  return (
+    <details className="chat-tool-group">
+      <summary>
+        {working ? (
+          <WorkingLabel />
+        ) : (
+          <span className="chat-tool-group-label">
+            Worked for {durationLabel(seconds)}
+          </span>
+        )}
+        <span className="chat-tool-group-meta">
+          {calls} {calls === 1 ? "step" : "steps"}
+          {errors ? ` · ${errors} failed` : ""}
+        </span>
+        <span className="chat-tool-caret" aria-hidden>›</span>
+      </summary>
+      <div className="chat-tool-group-body">
+        {events.map((event) => (
+          <ToolEvent key={event.id} event={event} />
+        ))}
+      </div>
+    </details>
+  );
 }
 
 function eventTime(epoch: number): string {
@@ -101,7 +177,7 @@ function appendLiveEvent(
   };
 }
 
-export function RunChat({ runId }: RunChatProps) {
+export function RunChat({ runId, active = false }: RunChatProps) {
   const queryClient = useQueryClient();
   const scrollRef = useRef<HTMLDivElement>(null);
   const followOutputRef = useRef(true);
@@ -136,6 +212,7 @@ export function RunChat({ runId }: RunChatProps) {
     .filter((event) => event.kind === "legacy_output")
     .map((event) => event.content)
     .join("");
+  const items = groupEvents(events);
 
   useEffect(() => {
     const host = scrollRef.current;
@@ -182,9 +259,35 @@ export function RunChat({ runId }: RunChatProps) {
         </section>
       ) : (
         <div className="chat-event-list">
-          {events.map((event) => {
+          {items.map((item, index) => {
+            const trailing = index === items.length - 1;
+            if (item.type === "tools") {
+              return (
+                <ToolGroup
+                  key={item.events[0].id}
+                  events={item.events}
+                  working={active && trailing}
+                />
+              );
+            }
+            const { event } = item;
             if (event.kind === "user_message" || event.kind === "assistant_message") {
               const user = event.kind === "user_message";
+              // Relay's own loop prompts aren't the user's words: show them as a divider.
+              const continuation = user ? parseLoopContinuation(event.content) : null;
+              if (continuation) {
+                return (
+                  <div key={event.id} className="chat-loop-divider" role="separator">
+                    <span>
+                      Loop · continuing {continuation.iteration} of {continuation.max}
+                    </span>
+                    <time>{eventTime(event.created_at)}</time>
+                  </div>
+                );
+              }
+              const prompt = user ? stripLoopContract(event.content) : null;
+              const reply = user ? null : stripLoopDoneMarker(event.content);
+              const text = prompt?.text ?? reply?.text ?? event.content;
               return (
                 <article
                   key={event.id}
@@ -192,14 +295,20 @@ export function RunChat({ runId }: RunChatProps) {
                 >
                   <header>
                     <span>{user ? "You" : "Agent"}</span>
+                    {prompt?.looping ? <span className="chat-loop-tag">loop until done</span> : null}
+                    {reply?.done ? (
+                      <span className="chat-loop-tag is-done">✓ reported done</span>
+                    ) : null}
                     <time>{eventTime(event.created_at)}</time>
                   </header>
-                  <p>{event.content}</p>
+                  {user ? <p>{text}</p> : <MarkdownMessage text={text} />}
+                  {!user && event.state !== "running" && text ? (
+                    <footer className="chat-message-actions">
+                      <CopyResponseButton text={text} />
+                    </footer>
+                  ) : null}
                 </article>
               );
-            }
-            if (event.kind === "tool_call" || event.kind === "tool_result") {
-              return <ToolEvent key={event.id} event={event} />;
             }
             if (event.kind === "approval_request") {
               return (
@@ -211,14 +320,24 @@ export function RunChat({ runId }: RunChatProps) {
                 />
               );
             }
-            if (event.kind === "legacy_output") return null;
             return (
               <div key={event.id} className={`chat-notice is-${event.kind}`}>
-                <span>{event.kind === "error" ? "Error" : event.state ?? "Update"}</span>
+                <span>
+                  {event.kind === "error"
+                    ? "Error"
+                    : event.content.startsWith("Loop ")
+                      ? "Loop"
+                      : event.state ?? "Update"}
+                </span>
                 <p>{event.content}</p>
               </div>
             );
           })}
+          {active && items[items.length - 1]?.type !== "tools" ? (
+            <div className="chat-working-row">
+              <WorkingLabel />
+            </div>
+          ) : null}
         </div>
       )}
       {approvalError ? <p className="run-action-error">{approvalError}</p> : null}

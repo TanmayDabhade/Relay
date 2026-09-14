@@ -33,9 +33,10 @@ pub fn run() {
       let app_data_dir = app.path().app_data_dir()?;
       let db_path = app_data_dir.join("relay.db");
       let conn = db::open(&db_path)?;
-      // Backfill cost_usd once at startup for sessions ingested before cost calculation
-      // existed (their cost_usd is stuck at 0 in the DB otherwise).
+      // Reprice every session against the bundled pricing table (see the function's doc).
       backfill_session_costs(&conn);
+      // Taken before the watcher starts — see `cost::rebuild::gather` for why the order matters.
+      let usage_rebuild_targets = cost::rebuild::gather(&conn);
       // OS process handles cannot survive Relay exiting. Preserve those runs in history as
       // interrupted rather than leaving a permanent "running" state after the next launch.
       if let Err(error) =
@@ -45,6 +46,11 @@ pub fn run() {
       }
       app.manage(db::Db(Mutex::new(conn)));
       app.manage(dispatch::Runtime::default());
+      // Warm the login-shell PATH probe off the main thread so the first Connections view
+      // or dispatch doesn't pay for (up to a few seconds of) shell startup.
+      std::thread::spawn(|| {
+        dispatch::agent_search_paths();
+      });
 
       // Resolved once at startup (env var, then app_data_dir/config.json), never re-read —
       // see `summarize::resolve_api_key`'s doc comment for the exact order and why this is
@@ -61,6 +67,7 @@ pub fn run() {
       app.manage(activity::ActivityCache::new());
 
       watcher::start(app.handle().clone());
+      cost::rebuild::spawn(app.handle().clone(), usage_rebuild_targets);
       spawn_idle_sweep(app.handle().clone());
 
       Ok(())
@@ -76,6 +83,7 @@ pub fn run() {
       commands::dashboard_stats,
       commands::generate_report,
       commands::export_report,
+      commands::get_transcript_markdown,
       commands::export_transcript,
       commands::reveal_in_finder,
       commands::get_file_diff_for_session_file,
@@ -96,6 +104,7 @@ pub fn run() {
       commands::list_dispatch_runs,
       commands::get_dispatch_conversation,
       commands::send_dispatch_prompt,
+      commands::stop_dispatch_loop,
       commands::interrupt_dispatch_turn,
       commands::resolve_dispatch_approval,
       commands::shutdown_dispatch_conversation,
@@ -105,30 +114,36 @@ pub fn run() {
     .expect("error while running tauri application");
 }
 
-/// Recomputes cost_usd for every session from its currently-stored token totals against the
-/// bundled pricing table. Runs once at startup, synchronously, before the DB is handed off as
-/// managed state — cheap enough at this scale that an equality check before writing isn't
-/// worth the complexity.
+/// Reprices every session against the bundled pricing table, so pricing-table updates
+/// retroactively correct history. Sessions with per-response usage rows are repriced row by
+/// row (each response at its own model and speed) and re-summed; the rest are priced from
+/// their aggregate totals. Runs once at startup, synchronously, before the DB is handed off as
+/// managed state, inside one transaction so thousands of row updates stay fast.
 fn backfill_session_costs(conn: &rusqlite::Connection) {
-    let totals = match db::queries::all_session_token_totals(conn) {
-        Ok(totals) => totals,
-        Err(e) => {
-            log::warn!("failed to load session token totals for cost backfill: {e:#}");
-            return;
+    let result = (|| -> anyhow::Result<()> {
+        let transaction = conn.unchecked_transaction()?;
+        let mut repriced_sessions = std::collections::HashSet::new();
+        for row in db::queries::all_session_usage_rows(&transaction)? {
+            let cost = cost::pricing::request_cost_usd(
+                row.model.as_deref(),
+                row.speed.as_deref(),
+                &row.tokens,
+            );
+            db::queries::update_session_usage_cost(&transaction, &row.session_id, &row.usage_key, cost)?;
+            repriced_sessions.insert(row.session_id);
         }
-    };
-
-    for t in totals {
-        let cost = cost::pricing::cost_usd(
-            t.model.as_deref(),
-            t.prompt_tokens,
-            t.completion_tokens,
-            t.cache_read_tokens,
-            t.cache_creation_tokens,
-        );
-        if let Err(e) = db::queries::update_cost(conn, &t.id, cost) {
-            log::warn!("failed to backfill cost for session {}: {e:#}", t.id);
+        for session_id in &repriced_sessions {
+            db::queries::refresh_session_totals_from_usage(&transaction, session_id)?;
         }
+        for totals in db::queries::legacy_session_token_totals(&transaction)? {
+            let cost = cost::pricing::cost_usd(totals.model.as_deref(), &totals.token_usage());
+            db::queries::update_cost(&transaction, &totals.id, cost)?;
+        }
+        transaction.commit()?;
+        Ok(())
+    })();
+    if let Err(e) = result {
+        log::warn!("failed to backfill session costs: {e:#}");
     }
 }
 

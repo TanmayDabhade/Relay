@@ -1,6 +1,6 @@
 use crate::activity;
 use crate::db::{queries, Db};
-use crate::dispatch::{self, AgentCommand, Runtime};
+use crate::dispatch::{self, looping, AgentCommand, Runtime};
 use crate::parser;
 use crate::terminal;
 use chrono::{Duration, NaiveDate, Utc};
@@ -477,6 +477,20 @@ pub fn reveal_in_finder(path: String) -> Result<(), String> {
         .map_err(|e| format!("failed to reveal {path} in Finder: {e}"))
 }
 
+/// Renders `session_id`'s raw agent log as a Markdown document without writing a file, so the
+/// frontend can copy it without leaving an unwanted export in Downloads.
+#[tauri::command]
+pub fn get_transcript_markdown(db: State<'_, Db>, session_id: String) -> Result<String, String> {
+    let session = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        queries::get_session(&conn, &session_id).map_err(|e| e.to_string())?
+    };
+    let session = session.ok_or_else(|| format!("session {session_id} not found"))?;
+
+    let transcript = parser::render_markdown(&session.raw_log_path).map_err(|e| e.to_string())?;
+    Ok(render_transcript_document(&session, &transcript))
+}
+
 /// Renders `session_id`'s raw Claude Code log as a readable Markdown transcript and writes it
 /// to the user's Downloads directory, mirroring `export_report`'s save-and-return-path
 /// contract so the frontend can reuse the same `reveal_in_finder` follow-up action.
@@ -501,11 +515,8 @@ pub fn export_transcript(db: State<'_, Db>, session_id: String) -> Result<String
         Utc::now().format("%Y-%m-%d-%H%M%S")
     );
     let path = dir.join(filename);
-    std::fs::write(
-        &path,
-        format!("{}{transcript}", render_transcript_header(&session)),
-    )
-    .map_err(|e| e.to_string())?;
+    std::fs::write(&path, render_transcript_document(&session, &transcript))
+        .map_err(|e| e.to_string())?;
 
     Ok(path.to_string_lossy().to_string())
 }
@@ -524,6 +535,10 @@ fn render_transcript_header(session: &queries::Session) -> String {
         session.status,
         session.cost_usd,
     )
+}
+
+fn render_transcript_document(session: &queries::Session, transcript: &str) -> String {
+    format!("{}{transcript}", render_transcript_header(session))
 }
 
 // --- Relay-owned agent dispatch ---
@@ -680,7 +695,9 @@ pub fn dispatch_task(
     prompt: String,
     agent: String,
     model: String,
+    loop_max_iterations: Option<i64>,
 ) -> Result<queries::CreatedDispatch, String> {
+    let loop_max_iterations = looping::validate_max_iterations(loop_max_iterations)?;
     let title = title.trim();
     let prompt = prompt.trim();
     if title.is_empty() {
@@ -700,7 +717,13 @@ pub fn dispatch_task(
             .ok_or_else(|| format!("project {project_id} was not found"))?;
         (config, project_path)
     };
-    let command = configured_command(&config, &model, prompt, None)?;
+    // The card and task keep the user's own words; only what the agent sees (and the turn
+    // transcript, so it stays truthful) carries the loop's stopping contract.
+    let agent_prompt = match loop_max_iterations {
+        Some(_) => looping::initial_prompt(prompt),
+        None => prompt.to_string(),
+    };
+    let command = configured_command(&config, &model, &agent_prompt, None)?;
 
     let created = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
@@ -709,7 +732,7 @@ pub fn dispatch_task(
             .map_err(|e| e.to_string())?
         {
             return Err(format!(
-                "{agent} already has an active Relay run in this project"
+                "{agent} is already running a turn in this project; wait for it to finish or interrupt it"
             ));
         }
         let (board, columns, cards) =
@@ -757,6 +780,7 @@ pub fn dispatch_task(
             prompt,
             &agent,
             &model,
+            loop_max_iterations,
             Utc::now().timestamp(),
         )
         .map_err(|e| e.to_string())?;
@@ -766,7 +790,7 @@ pub fn dispatch_task(
 
     let (turn, user_event) = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
-        queries::begin_dispatch_turn(&conn, &created.run.id, prompt, Utc::now().timestamp())
+        queries::begin_dispatch_turn(&conn, &created.run.id, &agent_prompt, Utc::now().timestamp())
             .map_err(|e| e.to_string())?
     };
     dispatch::emit_dispatch_event(&app, &user_event);
@@ -795,7 +819,7 @@ pub fn retry_dispatch_task(
     agent: String,
     model: String,
 ) -> Result<queries::CreatedDispatch, String> {
-    let (task, config, project_path) = {
+    let (task, config, project_path, loop_max_iterations) = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
         let task = queries::get_dispatch_task(&conn, &task_id)
             .map_err(|e| e.to_string())?
@@ -806,9 +830,11 @@ pub fn retry_dispatch_task(
         let project_path = queries::project_path(&conn, &task.project_id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("project {} was not found", task.project_id))?;
-        let active = queries::list_runs_for_task(&conn, &task_id)
-            .map_err(|e| e.to_string())?
-            .into_iter()
+        let runs = queries::list_runs_for_task(&conn, &task_id).map_err(|e| e.to_string())?;
+        // A retry is "the same task again", so it keeps the previous attempt's loop setting.
+        let loop_max_iterations = runs.last().and_then(|run| run.loop_max_iterations);
+        let active = runs
+            .iter()
             .any(|run| {
                 matches!(
                     run.status.as_str(),
@@ -824,23 +850,34 @@ pub fn retry_dispatch_task(
         if active {
             return Err("this task already has an active run".to_string());
         }
-        (task, config, project_path)
+        (task, config, project_path, loop_max_iterations)
     };
-    let command = configured_command(&config, &model, &task.prompt, None)?;
+    let agent_prompt = match loop_max_iterations {
+        Some(_) => looping::initial_prompt(&task.prompt),
+        None => task.prompt.clone(),
+    };
+    let command = configured_command(&config, &model, &agent_prompt, None)?;
     let run = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
         if queries::has_active_dispatch_for_project_agent(&conn, &task.project_id, &agent)
             .map_err(|e| e.to_string())?
         {
             return Err(format!(
-                "{agent} already has an active Relay run in this project"
+                "{agent} is already running a turn in this project; wait for it to finish or interrupt it"
             ));
         }
         if let Some(card_id) = task.card_id.as_deref() {
             queries::set_card_pending_launch_for_agent(&conn, card_id, &agent)
                 .map_err(|e| e.to_string())?;
         }
-        queries::create_retry_run(&conn, &task_id, &agent, &model, Utc::now().timestamp())
+        queries::create_retry_run(
+            &conn,
+            &task_id,
+            &agent,
+            &model,
+            loop_max_iterations,
+            Utc::now().timestamp(),
+        )
             .map_err(|e| e.to_string())?
     };
     let created = queries::CreatedDispatch { task, run };
@@ -849,7 +886,7 @@ pub fn retry_dispatch_task(
         queries::begin_dispatch_turn(
             &conn,
             &created.run.id,
-            &created.task.prompt,
+            &agent_prompt,
             Utc::now().timestamp(),
         )
         .map_err(|e| e.to_string())?
@@ -905,8 +942,6 @@ pub fn get_dispatch_conversation(
 #[tauri::command]
 pub fn send_dispatch_prompt(
     app: tauri::AppHandle,
-    db: State<'_, Db>,
-    runtime: State<'_, Runtime>,
     run_id: String,
     prompt: String,
 ) -> Result<(), String> {
@@ -914,9 +949,20 @@ pub fn send_dispatch_prompt(
     if prompt.is_empty() {
         return Err("prompt cannot be empty".to_string());
     }
+    start_follow_up_turn(&app, &run_id, prompt)
+        .map_err(|message| format!("the next turn could not start: {message}"))?;
+    emit_data_changed(&app);
+    Ok(())
+}
+
+/// Starts another turn on an existing conversation, resuming its provider session. Shared by
+/// a user's follow-up prompt and the loop's automatic continuation so both go through the
+/// same readiness check (`begin_dispatch_turn` refuses a running or shut-down conversation).
+fn start_follow_up_turn(app: &tauri::AppHandle, run_id: &str, prompt: &str) -> Result<(), String> {
+    let db = app.state::<Db>();
     let (run, config, project_path) = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
-        let run = queries::get_dispatch_run(&conn, &run_id)
+        let run = queries::get_dispatch_run(&conn, run_id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("conversation {run_id} was not found"))?;
         if run.status == "shut_down" {
@@ -941,23 +987,135 @@ pub fn send_dispatch_prompt(
     )?;
     let (turn, user_event) = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
-        queries::begin_dispatch_turn(&conn, &run_id, prompt, Utc::now().timestamp())
+        queries::begin_dispatch_turn(&conn, run_id, prompt, Utc::now().timestamp())
             .map_err(|e| e.to_string())?
     };
-    dispatch::emit_dispatch_event(&app, &user_event);
-    if let Err(error) = runtime.start_turn(
+    dispatch::emit_dispatch_event(app, &user_event);
+    if let Err(error) = app.state::<Runtime>().start_turn(
         app.clone(),
-        run_id.clone(),
+        run_id.to_string(),
         turn.id.clone(),
         run.agent,
         &project_path,
         command,
     ) {
         let message = error.to_string();
-        mark_dispatch_start_failed(&app, &run_id, &turn.id, &message);
-        return Err(format!("the next turn could not start: {message}"));
+        mark_dispatch_start_failed(app, run_id, &turn.id, &message);
+        return Err(message);
     }
-    emit_data_changed(&app);
+    Ok(())
+}
+
+/// Called by the runtime once a turn has fully settled (DB updated, active handle removed).
+/// Runs on the runtime's waiter thread, never under the DB lock: the gather step takes the
+/// lock briefly, and starting the next turn re-acquires it on its own.
+pub fn continue_dispatch_loop(app: &tauri::AppHandle, run_id: &str, turn_id: &str, turn_status: &str) {
+    let db = app.state::<Db>();
+    let gathered = {
+        let Ok(conn) = db.0.lock() else { return };
+        queries::get_dispatch_run(&conn, run_id).and_then(|run| {
+            let last = queries::last_assistant_message_for_turn(&conn, turn_id)?;
+            Ok(run.map(|run| (run, last)))
+        })
+    };
+    let (run, last_message) = match gathered {
+        Ok(Some(found)) => found,
+        Ok(None) => return,
+        Err(error) => {
+            log::warn!("could not evaluate loop for run {run_id}: {error:#}");
+            return;
+        }
+    };
+
+    match looping::decide(
+        turn_status,
+        &run.status,
+        run.loop_max_iterations,
+        run.loop_iterations,
+        last_message.as_deref(),
+    ) {
+        looping::LoopDecision::Stop => {}
+        looping::LoopDecision::Done => {
+            append_loop_notice(app, run_id, turn_id, "completed", "Loop finished: the agent reported the task is done.");
+        }
+        looping::LoopDecision::CapReached { max } => {
+            append_loop_notice(
+                app,
+                run_id,
+                turn_id,
+                "warning",
+                &format!("Loop stopped after {max} continuation(s) without the agent reporting the task done."),
+            );
+        }
+        looping::LoopDecision::Continue { iteration, max } => {
+            let claimed = db
+                .0
+                .lock()
+                .map_err(|e| e.to_string())
+                .and_then(|conn| {
+                    queries::claim_dispatch_loop_iteration(&conn, run_id, iteration)
+                        .map_err(|e| e.to_string())
+                });
+            match claimed {
+                Ok(true) => {}
+                // Looping was stopped (or the step claimed) between gather and now.
+                Ok(false) => return,
+                Err(error) => {
+                    log::warn!("could not claim loop iteration for run {run_id}: {error}");
+                    return;
+                }
+            }
+            let prompt = looping::continuation_prompt(iteration, max);
+            if let Err(error) = start_follow_up_turn(app, run_id, &prompt) {
+                append_loop_notice(
+                    app,
+                    run_id,
+                    turn_id,
+                    "error",
+                    &format!("Loop could not continue: {error}"),
+                );
+            }
+            emit_data_changed(app);
+        }
+    }
+}
+
+fn append_loop_notice(app: &tauri::AppHandle, run_id: &str, turn_id: &str, state: &str, content: &str) {
+    let db = app.state::<Db>();
+    let event = match db.0.lock() {
+        Ok(conn) => queries::append_dispatch_event(
+            &conn,
+            run_id,
+            Some(turn_id),
+            if state == "error" { "error" } else { "status" },
+            None,
+            content,
+            None,
+            None,
+            Some(state),
+            Utc::now().timestamp(),
+        ),
+        Err(_) => return,
+    };
+    match event {
+        Ok(event) => dispatch::emit_dispatch_event(app, &event),
+        Err(error) => log::warn!("could not record loop notice for run {run_id}: {error:#}"),
+    }
+}
+
+#[tauri::command]
+pub fn stop_dispatch_loop(
+    app: tauri::AppHandle,
+    db: State<'_, Db>,
+    run_id: String,
+) -> Result<(), String> {
+    let stopped = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        queries::stop_dispatch_loop(&conn, &run_id).map_err(|e| e.to_string())?
+    };
+    if stopped {
+        emit_data_changed(&app);
+    }
     Ok(())
 }
 
@@ -1232,6 +1390,41 @@ pub fn launch_or_attach_session(db: State<'_, Db>, card_id: String) -> Result<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transcript_document_includes_session_metadata_and_body() {
+        let session = queries::Session {
+            id: "session-1234".into(),
+            project_id: "project-1".into(),
+            agent: "claude".into(),
+            model: Some("claude-sonnet-4-5".into()),
+            started_at: Some(1_700_000_000),
+            ended_at: Some(1_700_000_060),
+            last_activity_at: 1_700_000_060,
+            status: "ended".into(),
+            duration_seconds: Some(60),
+            summary: Some("Fallback summary".into()),
+            title: Some("Copy button work".into()),
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            cache_read_tokens: 25,
+            cache_creation_tokens: 10,
+            cache_creation_1h_tokens: 0,
+            cost_usd: 0.125,
+            cost_unpriced: false,
+            lines_added: 12,
+            lines_removed: 3,
+            tags: Some("feature".into()),
+            raw_log_path: "/tmp/session.jsonl".into(),
+        };
+
+        let result = render_transcript_document(&session, "## User\n\nAdd a copy button.\n");
+
+        assert_eq!(
+            result,
+            "# Copy button work\n\n- Session: session-1234\n- Model: claude-sonnet-4-5\n- Status: ended\n- Cost: $0.12\n\n---\n\n## User\n\nAdd a copy button.\n",
+        );
+    }
 
     #[test]
     fn dense_daily_activity_fills_gaps_and_keeps_range_inclusive() {

@@ -26,6 +26,8 @@ use std::sync::{Mutex, OnceLock};
 struct FileContext {
     session_id: Option<String>,
     cwd: Option<String>,
+    /// From the latest `turn_context` line; token_count events don't name their model.
+    model: Option<String>,
 }
 
 fn context_cache() -> &'static Mutex<HashMap<String, FileContext>> {
@@ -78,6 +80,7 @@ pub fn parse_line(line: &str, raw_log_path: &str) -> Option<ParsedRecord> {
                 FileContext {
                     session_id: session_id.clone(),
                     cwd: cwd.clone(),
+                    model: None,
                 },
             );
             drop(cache);
@@ -91,6 +94,7 @@ pub fn parse_line(line: &str, raw_log_path: &str) -> Option<ParsedRecord> {
                 timestamp,
                 model: None,
                 usage: None,
+                usage_key: None,
                 tool_uses: Vec::new(),
                 text: None,
                 ai_title: None,
@@ -114,19 +118,29 @@ pub fn parse_line(line: &str, raw_log_path: &str) -> Option<ParsedRecord> {
                 timestamp,
                 model: None,
                 usage: None,
+                usage_key: None,
                 tool_uses: Vec::new(),
                 text,
                 ai_title: None,
             })
         }
+        "turn_context" => {
+            // Carries the model for the turns that follow; nothing else to persist.
+            if let Some(model) = payload.and_then(|p| p.get("model")).and_then(Value::as_str) {
+                if let Some(ctx) = context_cache().lock().unwrap().get_mut(raw_log_path) {
+                    ctx.model = Some(model.to_string());
+                }
+            }
+            None
+        }
         "event_msg" => {
             let ctx = cached_context(raw_log_path);
             let event_type = payload.and_then(|p| p.get("type")).and_then(Value::as_str);
 
-            let usage = if event_type == Some("token_count") {
-                extract_token_usage(payload?)
+            let (usage, usage_key) = if event_type == Some("token_count") {
+                extract_token_usage(payload?).unzip()
             } else {
-                None
+                (None, None)
             };
 
             Some(ParsedRecord {
@@ -136,8 +150,9 @@ pub fn parse_line(line: &str, raw_log_path: &str) -> Option<ParsedRecord> {
                 git_branch: None,
                 session_id: ctx.session_id,
                 timestamp,
-                model: None,
+                model: usage.as_ref().and(ctx.model),
                 usage,
+                usage_key,
                 tool_uses: Vec::new(),
                 text: None,
                 ai_title: None,
@@ -177,27 +192,36 @@ fn extract_message_text(payload: &Value) -> Option<String> {
     }
 }
 
-/// Best-effort field names for a `token_count` event's usage payload — unverified, guessed
-/// from OpenAI's usual `input_tokens`/`output_tokens`/`cached_input_tokens` naming.
-fn extract_token_usage(payload: &Value) -> Option<Usage> {
-    let info = payload.get("info").unwrap_or(payload);
-    let totals = info.get("total_token_usage").unwrap_or(info);
-
-    Some(Usage {
-        input_tokens: totals
-            .get("input_tokens")
-            .and_then(Value::as_i64)
-            .unwrap_or(0),
-        output_tokens: totals
-            .get("output_tokens")
-            .and_then(Value::as_i64)
-            .unwrap_or(0),
-        cache_read_input_tokens: totals
-            .get("cached_input_tokens")
-            .and_then(Value::as_i64)
-            .unwrap_or(0),
-        cache_creation_input_tokens: 0,
-    })
+/// Usage for one `token_count` event, verified against real rollout files (2026-08):
+///
+/// - `info.total_token_usage` is the **cumulative** session total and `info.last_token_usage`
+///   the request that just finished. Summing cumulative totals line by line (what this used to
+///   do) grows quadratically with turn count, so only `last_token_usage` is used.
+/// - OpenAI's `input_tokens` *includes* `cached_input_tokens`; the uncached share is the
+///   difference, so cached tokens aren't billed twice.
+/// - Codex re-emits an unchanged `token_count` (about 1 in 6 events, e.g. on rate-limit
+///   refreshes). The cumulative `total_tokens` identifies the request, so a repeat carries the
+///   same key and ingest stores it once.
+///
+/// Events with no `info` (rate-limit-only updates) carry no usage.
+fn extract_token_usage(payload: &Value) -> Option<(Usage, String)> {
+    let info = payload.get("info")?;
+    let last = info.get("last_token_usage")?;
+    let cumulative = info
+        .get("total_token_usage")
+        .and_then(|t| t.get("total_tokens"))
+        .and_then(Value::as_i64)?;
+    let field = |name: &str| last.get(name).and_then(Value::as_i64).unwrap_or(0).max(0);
+    let cached = field("cached_input_tokens");
+    let usage = Usage {
+        input_tokens: (field("input_tokens") - cached).max(0),
+        output_tokens: field("output_tokens"),
+        cache_read_input_tokens: cached,
+        cache_creation_input_tokens: field("cache_write_input_tokens"),
+        cache_creation_1h_input_tokens: 0,
+        speed: None,
+    };
+    Some((usage, format!("total:{cumulative}")))
 }
 
 #[cfg(test)]
@@ -240,12 +264,26 @@ mod tests {
         let meta = r#"{"timestamp":"2026-01-01T10:00:00Z","type":"session_meta","payload":{"id":"cx-9","cwd":"/tmp/proj2"}}"#;
         parse_line(meta, path).unwrap();
 
-        let event = r#"{"timestamp":"2026-01-01T10:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":50,"cached_input_tokens":10}}}}"#;
+        let turn = r#"{"timestamp":"2026-01-01T10:00:01Z","type":"turn_context","payload":{"model":"gpt-5.6-sol"}}"#;
+        assert!(parse_line(turn, path).is_none());
+
+        // Second request of a session: cumulative totals include the first request.
+        let event = r#"{"timestamp":"2026-01-01T10:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":40512,"cached_input_tokens":22016,"output_tokens":434,"total_tokens":40946},"last_token_usage":{"input_tokens":21808,"cached_input_tokens":11008,"output_tokens":184,"total_tokens":21992}}}}"#;
         let record = parse_line(event, path).expect("event_msg should parse");
         let usage = record.usage.expect("token_count event should carry usage");
-        assert_eq!(usage.input_tokens, 100);
-        assert_eq!(usage.output_tokens, 50);
-        assert_eq!(usage.cache_read_input_tokens, 10);
+        assert_eq!(usage.input_tokens, 21808 - 11008, "cached tokens are not input");
+        assert_eq!(usage.output_tokens, 184);
+        assert_eq!(usage.cache_read_input_tokens, 11008);
+        assert_eq!(record.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(record.usage_key.as_deref(), Some("total:40946"));
+
+        // A re-emitted identical event produces the same key, so it is stored once.
+        let repeat = parse_line(event, path).unwrap();
+        assert_eq!(repeat.usage_key, record.usage_key);
+
+        // Rate-limit-only updates carry no usage.
+        let limits = r#"{"timestamp":"2026-01-01T10:00:03Z","type":"event_msg","payload":{"type":"token_count","info":null}}"#;
+        assert!(parse_line(limits, path).unwrap().usage.is_none());
     }
 
     #[test]

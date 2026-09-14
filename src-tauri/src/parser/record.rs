@@ -4,10 +4,17 @@
 
 #[derive(Debug, Clone, Default)]
 pub struct Usage {
+    /// Uncached input tokens, billed at the full input rate.
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cache_read_input_tokens: i64,
+    /// All cache-write tokens, both TTLs.
     pub cache_creation_input_tokens: i64,
+    /// The 1-hour-TTL share of `cache_creation_input_tokens` (billed at 2x input rather than
+    /// the 5-minute 1.25x). Zero when the log doesn't break writes down by TTL.
+    pub cache_creation_1h_input_tokens: i64,
+    /// The API's `usage.speed` (`"standard"` / `"fast"`), when logged.
+    pub speed: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -46,6 +53,11 @@ pub struct ParsedRecord {
     pub timestamp: Option<i64>, // unix seconds
     pub model: Option<String>,
     pub usage: Option<Usage>,
+    /// Identity of the API response `usage` belongs to, when the log exposes one. Agent logs
+    /// repeat the same response's usage across several lines (Claude Code writes one line per
+    /// content block; Codex re-emits unchanged token counts), so ingest stores usage once per
+    /// key instead of summing lines. `None` falls back to additive per-line accumulation.
+    pub usage_key: Option<String>,
     pub tool_uses: Vec<ToolUse>,
     /// Prompt/response text content, if any. For `user` records: the plain-string
     /// `message.content`, when present in that shape (an array `content` — e.g. a

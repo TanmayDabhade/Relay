@@ -74,6 +74,11 @@ export function exportTranscript(sessionId: string): Promise<string> {
   return invoke("export_transcript", { sessionId });
 }
 
+/** Returns the session's transcript as Markdown without writing an export file. */
+export function getTranscriptMarkdown(sessionId: string): Promise<string> {
+  return invoke("get_transcript_markdown", { sessionId });
+}
+
 export function getFileDiffForSessionFile(sessionId: string, filePath: string): Promise<FileDiff | null> {
   return invoke("get_file_diff_for_session_file", { sessionId, filePath });
 }
@@ -145,8 +150,14 @@ export function dispatchTask(request: {
   prompt: string;
   agent: string;
   model: string;
+  /** Loop until the agent reports done, up to this many continuations; omit for one turn. */
+  loopMaxIterations?: number | null;
 }): Promise<CreatedDispatch> {
-  return invoke("dispatch_task", { ...request, cardId: request.cardId ?? null });
+  return invoke("dispatch_task", {
+    ...request,
+    cardId: request.cardId ?? null,
+    loopMaxIterations: request.loopMaxIterations ?? null,
+  });
 }
 
 export function retryDispatchTask(
@@ -171,6 +182,10 @@ export function getDispatchConversation(runId: string): Promise<DispatchConversa
 
 export function sendDispatchPrompt(runId: string, prompt: string): Promise<void> {
   return invoke("send_dispatch_prompt", { runId, prompt });
+}
+
+export function stopDispatchLoop(runId: string): Promise<void> {
+  return invoke("stop_dispatch_loop", { runId });
 }
 
 export function interruptDispatchTurn(runId: string): Promise<void> {

@@ -405,9 +405,7 @@
   min-height: 0;
   flex: 1;
   overflow: hidden;
-  background:
-    linear-gradient(90deg, transparent 2.75rem, var(--border-default) 2.75rem, var(--border-default) calc(2.75rem + 1px), transparent calc(2.75rem + 1px)),
-    var(--surface-card);
+  background: var(--surface-card);
 }
 
 .run-chat {
@@ -592,6 +590,96 @@
   border-color: color-mix(in srgb, var(--red) 40%, var(--border-default));
 }
 
+.chat-tool-group,
+.chat-working-row {
+  width: min(100%, 54rem);
+  margin-right: auto;
+  margin-left: auto;
+}
+
+.chat-tool-group > summary {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-4);
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  cursor: pointer;
+  list-style: none;
+}
+
+.chat-tool-group > summary::-webkit-details-marker {
+  display: none;
+}
+
+.chat-tool-group > summary:hover .chat-tool-group-label,
+.chat-tool-group > summary:hover .chat-tool-caret {
+  color: var(--text-secondary);
+}
+
+.chat-tool-group[open] > summary .chat-tool-caret {
+  transform: rotate(90deg);
+}
+
+.chat-tool-group-meta {
+  font-size: var(--text-xs);
+  opacity: 0.75;
+}
+
+.chat-tool-group-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: var(--space-2) 0 0 var(--space-4);
+  padding-left: var(--space-3);
+  border-left: 1px solid var(--border-default);
+}
+
+.chat-tool-group-body .chat-tool-row {
+  width: 100%;
+  border-color: transparent;
+  background: transparent;
+}
+
+.chat-tool-group-body .chat-tool-row summary {
+  min-height: 2rem;
+  padding: var(--space-1) var(--space-2);
+}
+
+.chat-tool-group-body .chat-tool-row.is-error {
+  border-color: transparent;
+}
+
+.chat-working-row {
+  padding: var(--space-1) var(--space-4);
+}
+
+.chat-working {
+  background: linear-gradient(
+      90deg,
+      var(--text-muted) 0%,
+      var(--text-muted) 35%,
+      var(--text-primary) 50%,
+      var(--text-muted) 65%,
+      var(--text-muted) 100%
+    )
+    0 0 / 250% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  font-size: var(--text-sm);
+  animation: chat-working-shimmer 1.8s linear infinite;
+}
+
+@keyframes chat-working-shimmer {
+  from {
+    background-position: 100% 0;
+  }
+  to {
+    background-position: 0% 0;
+  }
+}
+
 .chat-approval-row {
   border-left: 0.25rem solid var(--amber);
   background: var(--amber-bg);
@@ -768,8 +856,214 @@
     animation: none;
   }
 
+  .chat-working {
+    animation: none;
+    color: var(--text-secondary);
+  }
+
   .workday-run,
   .chat-tool-caret {
     transition: none;
   }
+}
+
+.run-loop-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--text-secondary);
+}
+
+.run-loop-chip button {
+  padding: 0 var(--space-2);
+  border: 1px solid var(--border-strong);
+  border-radius: 0.3125rem;
+  background: var(--surface-raised);
+  color: var(--text-primary);
+  font: inherit;
+  cursor: pointer;
+}
+
+.run-loop-chip button:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+/* Loop machinery (see src/lib/loopMarkers.ts) renders as quiet chrome, not chat text. */
+.chat-message header time {
+  margin-left: auto;
+}
+
+.chat-message header .chat-loop-tag {
+  padding: 0 var(--space-2);
+  border-radius: 999px;
+  background: var(--accent-muted);
+  color: var(--accent);
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  text-transform: none;
+}
+
+.chat-message header .chat-loop-tag.is-done {
+  background: var(--green-bg);
+  color: var(--green);
+}
+
+.chat-loop-divider {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+.chat-loop-divider::before,
+.chat-loop-divider::after {
+  content: "";
+  flex: 1;
+  border-top: 1px dashed var(--border-default);
+}
+
+.chat-loop-divider time {
+  order: 3;
+}
+
+/* Agent replies render as Markdown (MarkdownMessage.tsx). Compact spacing: this is a chat
+   bubble, not a document page. */
+.chat-markdown {
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.chat-markdown > :first-child {
+  margin-top: 0;
+}
+
+.chat-markdown > :last-child {
+  margin-bottom: 0;
+}
+
+.chat-markdown p,
+.chat-markdown ul,
+.chat-markdown ol,
+.chat-markdown pre,
+.chat-markdown blockquote,
+.chat-markdown-table {
+  margin: 0 0 var(--space-3);
+}
+
+.chat-message .chat-markdown p {
+  white-space: normal;
+}
+
+.chat-markdown h1,
+.chat-markdown h2,
+.chat-markdown h3,
+.chat-markdown h4 {
+  margin: var(--space-4) 0 var(--space-2);
+  font-size: var(--text-md);
+  font-weight: 600;
+  line-height: 1.35;
+}
+
+.chat-markdown h1 {
+  font-size: var(--text-lg);
+}
+
+.chat-markdown ul,
+.chat-markdown ol {
+  padding-left: 1.4em;
+}
+
+.chat-markdown li + li,
+.chat-markdown li > ul,
+.chat-markdown li > ol {
+  margin-top: var(--space-1);
+}
+
+.chat-markdown li > ul,
+.chat-markdown li > ol {
+  margin-bottom: 0;
+}
+
+.chat-markdown code {
+  padding: 0.05em 0.3em;
+  border-radius: 0.25rem;
+  background: var(--surface-muted);
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+}
+
+.chat-markdown pre {
+  overflow-x: auto;
+  padding: var(--space-3);
+  border: 1px solid var(--border-default);
+  border-radius: 0.375rem;
+  background: var(--surface-muted);
+}
+
+.chat-markdown pre code {
+  padding: 0;
+  background: transparent;
+}
+
+.chat-markdown blockquote {
+  padding-left: var(--space-3);
+  border-left: 0.1875rem solid var(--border-strong);
+  color: var(--text-secondary);
+}
+
+.chat-markdown a {
+  color: var(--accent);
+}
+
+.chat-markdown-table {
+  overflow-x: auto;
+}
+
+.chat-markdown table {
+  border-collapse: collapse;
+  font-size: var(--text-sm);
+}
+
+.chat-markdown th,
+.chat-markdown td {
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--border-default);
+  text-align: left;
+  vertical-align: top;
+}
+
+.chat-markdown th {
+  background: var(--surface-muted);
+  font-weight: 600;
+}
+
+/* Response actions sit under the reply, like other chat interfaces. */
+.chat-message-actions {
+  display: flex;
+  margin-top: var(--space-2);
+}
+
+.chat-copy-button {
+  display: inline-flex;
+  align-items: center;
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid transparent;
+  border-radius: 0.3125rem;
+  background: transparent;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+.chat-copy-button:hover,
+.chat-copy-button:focus-visible {
+  border-color: var(--border-default);
+  color: var(--text-primary);
+}
+
+.chat-copy-button.is-copied {
+  color: var(--green);
 }

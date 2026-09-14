@@ -40,7 +40,11 @@ export interface Session {
   completion_tokens: number;
   cache_read_tokens: number;
   cache_creation_tokens: number;
+  /** 1-hour-TTL share of `cache_creation_tokens` (billed at 2x input, vs 1.25x for 5-minute). */
+  cache_creation_1h_tokens: number;
   cost_usd: number;
+  /** Some usage is on a model with no known price, so `cost_usd` covers only the priced part. */
+  cost_unpriced: boolean;
   lines_added: number;
   lines_removed: number;
   tags: string | null;
@@ -77,6 +81,8 @@ export interface AgentUsage {
   agent: string;
   session_count: number;
   total_cost_usd: number;
+  /** Sessions with usage on a model that has no known price (not included in the total). */
+  unpriced_session_count: number;
 }
 
 export interface DiffLine {
@@ -239,6 +245,10 @@ export interface DispatchRun {
   provider_session_id: string | null;
   shutdown_at: number | null;
   created_at: number;
+  /** Null when the run isn't looping; otherwise the cap on automatic continuations. */
+  loop_max_iterations: number | null;
+  /** Automatic continuation turns Relay has sent so far. */
+  loop_iterations: number;
 }
 
 export interface CreatedDispatch {

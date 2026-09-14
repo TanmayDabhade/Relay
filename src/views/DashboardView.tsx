@@ -6,7 +6,7 @@ import { ActivityHeatmap } from "../components/ui/ActivityHeatmap";
 import { ProjectDot } from "../components/ui/ProjectDot";
 import { StatTile } from "../components/ui/StatTile";
 import { agentMeta, KNOWN_AGENT_IDS } from "../lib/agents";
-import { formatRelativeTime, isOngoingDispatch } from "../lib/format";
+import { formatCost, formatRelativeTime, isOngoingDispatch } from "../lib/format";
 import { colorForProject } from "../lib/projectColor";
 import { getDashboardStats, listDispatchTasks } from "../lib/tauri";
 import type { AgentUsage, DispatchStatus } from "../lib/types";
@@ -63,20 +63,6 @@ export function DashboardView({ onOpenAgentWork }: DashboardViewProps) {
 
   return (
     <div className="dashboard-view">
-      <header className="home-launcher">
-        <div className="home-launcher-copy">
-          <span className="home-live-label"><i aria-hidden /> Relay is ready</span>
-          <h1>Start with Relay.</h1>
-          <p>
-            Launch a coding agent here, then keep its progress, approvals, and follow-ups
-            in one place.
-          </p>
-        </div>
-        <Button className="home-launch-button" onClick={() => setShowComposer(true)}>
-          Start an agent task <span aria-hidden>→</span>
-        </Button>
-      </header>
-
       <section className="home-work-section" aria-labelledby="ongoing-work-heading">
         <div className="home-section-heading">
           <div>
@@ -87,9 +73,14 @@ export function DashboardView({ onOpenAgentWork }: DashboardViewProps) {
                 : `${ongoingEntries.length} conversation${ongoingEntries.length === 1 ? "" : "s"} in motion`}
             </span>
           </div>
-          <button className="home-text-action" onClick={() => onOpenAgentWork()}>
-            View all agent work <span aria-hidden>→</span>
-          </button>
+          <div className="home-section-actions">
+            <button className="home-text-action" onClick={() => onOpenAgentWork()}>
+              View all agent work <span aria-hidden>→</span>
+            </button>
+            <Button variant="secondary" onClick={() => setShowComposer(true)}>
+              New task
+            </Button>
+          </div>
         </div>
 
         <div className="home-work-ledger">
@@ -253,7 +244,10 @@ export function DashboardView({ onOpenAgentWork }: DashboardViewProps) {
                         <div className="dashboard-agent-stats">
                           <div className="dashboard-agent-stat">
                             <span className="dashboard-agent-stat-value">
-                              ${(usage?.total_cost_usd ?? 0).toFixed(2)}
+                              {formatCost(
+                                usage?.total_cost_usd ?? 0,
+                                (usage?.unpriced_session_count ?? 0) > 0,
+                              )}
                             </span>
                             <span className="dashboard-agent-stat-label">spend</span>
                           </div>

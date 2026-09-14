@@ -63,6 +63,7 @@ pub fn parse_line(line: &str) -> Option<ParsedRecord> {
         timestamp,
         model,
         usage: None,
+        usage_key: None,
         tool_uses: Vec::new(),
         text,
         ai_title: None,

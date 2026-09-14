@@ -70,10 +70,9 @@
   --font-sans: "Inter", -apple-system, BlinkMacSystemFont, sans-serif;
 
   /* Sizing tokens are rem, not px, and deliberately match the old hardcoded px values at
-     the browser default 16px root (e.g. --text-base: 13px === 0.8125rem). global.css sets
-     the root font-size with a `clamp()` tied to viewport width, so every spacing/type token
-     — and everything built from them — scales together as the window grows on a large
-     display, instead of staying pinned at a fixed pixel size while only the layout stretches. */
+     the default 16px root (e.g. --text-base: 13px === 0.8125rem). The root font-size is the
+     user's Settings → Text size choice (see global.css), so every spacing/type token — and
+     everything built from them — scales together with that one preference. */
   --text-xs: 0.625rem; /* 10px */
   --text-sm: 0.6875rem; /* 11px */
   --text-base: 0.8125rem; /* 13px */

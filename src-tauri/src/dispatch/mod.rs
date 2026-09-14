@@ -1,5 +1,11 @@
+use std::ffi::OsString;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
+pub mod looping;
 mod normalize;
 mod runtime;
 pub use normalize::{
@@ -129,11 +135,96 @@ pub fn find_executable_in_paths(executable: &str, search_paths: &[PathBuf]) -> O
 }
 
 pub fn resolve_executable(executable: &str) -> Option<PathBuf> {
-    let mut search_paths: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|value| std::env::split_paths(&value).collect())
-        .unwrap_or_default();
+    find_executable_in_paths(executable, agent_search_paths())
+}
 
-    if let Some(home) = dirs::home_dir() {
+const LOGIN_PATH_MARKER: &str = "__RELAY_LOGIN_PATH__";
+// Generous: this runs once, in the background at startup, and a real zsh with plugin
+// managers was measured at ~4s cold.
+const LOGIN_SHELL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The directory list used both to resolve an agent executable and as the `PATH` a spawned
+/// agent inherits. A Finder-launched app gets launchd's bare `/usr/bin:/bin:/usr/sbin:/sbin`,
+/// so without this a provider CLI starts but everything *it* shells out to — `node` for
+/// plugin hooks, `git`, `npx` MCP servers — is "command not found" (observed: every Claude
+/// `SessionEnd` hook failing under Relay). Computed once: the login-shell probe costs a
+/// shell startup, and `OnceLock` makes concurrent first callers wait rather than re-probe.
+pub fn agent_search_paths() -> &'static [PathBuf] {
+    static PATHS: OnceLock<Vec<PathBuf>> = OnceLock::new();
+    PATHS.get_or_init(|| {
+        let login = login_shell_path();
+        if login.is_none() {
+            log::warn!("could not read login shell PATH; agents get a fallback PATH");
+        }
+        let inherited = std::env::var_os("PATH");
+        merge_search_paths(login.as_deref(), inherited.as_deref(), dirs::home_dir())
+    })
+}
+
+/// `agent_search_paths` joined into a `PATH` value for a spawned agent process.
+pub fn agent_path_env() -> OsString {
+    std::env::join_paths(agent_search_paths()).unwrap_or_else(|error| {
+        log::warn!("agent PATH contained an unjoinable entry: {error}");
+        std::env::var_os("PATH").unwrap_or_default()
+    })
+}
+
+/// Asks the user's login shell for its `PATH`. Interactive (`-i`) because zsh users commonly
+/// set PATH in `.zshrc`, which a non-interactive login shell skips. rc files can print
+/// banners, so the value is fenced by markers; a shell that hangs (a prompt, a slow plugin
+/// manager) is killed after `LOGIN_SHELL_TIMEOUT` and we fall back to the static list.
+fn login_shell_path() -> Option<String> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    let mut child = Command::new(shell)
+        .args([
+            "-ilc",
+            &format!("printf '{LOGIN_PATH_MARKER}%s{LOGIN_PATH_MARKER}' \"$PATH\""),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + LOGIN_SHELL_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(25)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let mut output = String::new();
+    child.stdout.take()?.read_to_string(&mut output).ok()?;
+    extract_marked_path(&output)
+}
+
+fn extract_marked_path(output: &str) -> Option<String> {
+    let start = output.find(LOGIN_PATH_MARKER)? + LOGIN_PATH_MARKER.len();
+    let len = output[start..].find(LOGIN_PATH_MARKER)?;
+    let path = output[start..start + len].trim();
+    (!path.is_empty()).then(|| path.to_string())
+}
+
+/// Login-shell entries first (the user's own ordering wins), then the inherited PATH, then
+/// well-known install locations, deduplicated preserving first occurrence.
+fn merge_search_paths(
+    login: Option<&str>,
+    inherited: Option<&std::ffi::OsStr>,
+    home: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut search_paths: Vec<PathBuf> = Vec::new();
+    if let Some(login) = login {
+        search_paths.extend(std::env::split_paths(login));
+    }
+    if let Some(inherited) = inherited {
+        search_paths.extend(std::env::split_paths(inherited));
+    }
+
+    if let Some(home) = home {
         for relative in [
             ".local/bin",
             ".npm-global/bin",
@@ -148,9 +239,14 @@ pub fn resolve_executable(executable: &str) -> Option<PathBuf> {
         PathBuf::from("/opt/homebrew/bin"),
         PathBuf::from("/usr/local/bin"),
         PathBuf::from("/usr/bin"),
+        PathBuf::from("/bin"),
+        PathBuf::from("/usr/sbin"),
+        PathBuf::from("/sbin"),
     ]);
 
-    find_executable_in_paths(executable, &search_paths)
+    let mut seen = std::collections::HashSet::new();
+    search_paths.retain(|dir| !dir.as_os_str().is_empty() && seen.insert(dir.clone()));
+    search_paths
 }
 
 #[cfg(test)]
@@ -249,6 +345,45 @@ mod tests {
             command.args,
             vec!["exec", "resume", "thread-123", "--json", "Continue"]
         );
+    }
+
+    #[test]
+    fn login_shell_path_is_extracted_from_between_rc_file_noise() {
+        let output = format!(
+            "Welcome back!\n{LOGIN_PATH_MARKER}/usr/local/opt/node@24/bin:/usr/bin{LOGIN_PATH_MARKER}\n"
+        );
+        assert_eq!(
+            extract_marked_path(&output).as_deref(),
+            Some("/usr/local/opt/node@24/bin:/usr/bin")
+        );
+        assert_eq!(extract_marked_path("no markers here"), None);
+        assert_eq!(
+            extract_marked_path(&format!("{LOGIN_PATH_MARKER}{LOGIN_PATH_MARKER}")),
+            None
+        );
+    }
+
+    #[test]
+    fn search_paths_put_login_shell_first_and_keep_launchd_fallbacks() {
+        let merged = merge_search_paths(
+            Some("/usr/local/opt/node@24/bin:/usr/bin"),
+            Some(std::ffi::OsStr::new("/usr/bin:/bin:/usr/sbin:/sbin")),
+            Some(PathBuf::from("/Users/me")),
+        );
+        assert_eq!(merged[0], PathBuf::from("/usr/local/opt/node@24/bin"));
+        assert_eq!(merged[1], PathBuf::from("/usr/bin"));
+        assert!(merged.contains(&PathBuf::from("/Users/me/.local/bin")));
+        assert!(merged.contains(&PathBuf::from("/opt/homebrew/bin")));
+        let unique: std::collections::HashSet<_> = merged.iter().collect();
+        assert_eq!(unique.len(), merged.len(), "entries must be deduplicated");
+    }
+
+    #[test]
+    fn search_paths_without_a_login_shell_still_cover_common_installs() {
+        let merged = merge_search_paths(None, None, None);
+        for dir in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"] {
+            assert!(merged.contains(&PathBuf::from(dir)), "missing {dir}");
+        }
     }
 
     #[test]

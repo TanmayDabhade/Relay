@@ -71,16 +71,21 @@ pub fn ingest_record(
         return Ok(outcome);
     };
 
-    let delta = record
-        .usage
-        .as_ref()
-        .map(|u| TokenDelta {
+    // Per-response usage (Claude Code, Codex) is stored once per response and the session's
+    // totals are re-summed from those rows; everything else accumulates additively per line.
+    let keyed_usage = match (&record.usage, &record.usage_key) {
+        (Some(usage), Some(key)) => Some((usage, key)),
+        _ => None,
+    };
+    let delta = match (&record.usage, keyed_usage) {
+        (Some(u), None) => TokenDelta {
             prompt_tokens: u.input_tokens,
             completion_tokens: u.output_tokens,
             cache_read_tokens: u.cache_read_input_tokens,
             cache_creation_tokens: u.cache_creation_input_tokens,
-        })
-        .unwrap_or_default();
+        },
+        _ => TokenDelta::default(),
+    };
 
     let created = queries::upsert_session(
         conn,
@@ -117,18 +122,15 @@ pub fn ingest_record(
         outcome.session_updated = Some(session_id.clone());
     }
 
-    // Recompute cost_usd from the now-updated accumulated totals (not the delta just applied)
-    // so this stays consistent with `all_session_token_totals` + `update_cost`'s use for
-    // recomputing every session's cost after a pricing-table edit, without re-parsing logs.
-    if let Some(totals) = queries::session_token_totals(conn, &session_id)? {
-        let cost = pricing::cost_usd(
-            totals.model.as_deref(),
-            totals.prompt_tokens,
-            totals.completion_tokens,
-            totals.cache_read_tokens,
-            totals.cache_creation_tokens,
-        );
-        queries::update_cost(conn, &session_id, cost)?;
+    if let Some((usage, key)) = keyed_usage {
+        record_response_usage(conn, &session_id, key, record.model.as_deref(), usage)?;
+    } else if record.usage.is_some() {
+        // Recompute cost_usd from the now-updated accumulated totals (not the delta just
+        // applied) so this stays consistent with the startup repricing pass.
+        if let Some(totals) = queries::session_token_totals(conn, &session_id)? {
+            let cost = pricing::cost_usd(totals.model.as_deref(), &totals.token_usage());
+            queries::update_cost(conn, &session_id, cost)?;
+        }
     }
 
     for tool_use in &record.tool_uses {
@@ -136,6 +138,38 @@ pub fn ingest_record(
     }
 
     Ok(outcome)
+}
+
+/// Stores one API response's usage (ignored if this response was already recorded) and
+/// re-sums the session's totals. Shared by live ingest and the startup usage rebuild.
+pub fn record_response_usage(
+    conn: &Connection,
+    session_id: &str,
+    usage_key: &str,
+    model: Option<&str>,
+    usage: &super::record::Usage,
+) -> anyhow::Result<bool> {
+    let tokens = pricing::TokenUsage {
+        input: usage.input_tokens,
+        output: usage.output_tokens,
+        cache_read: usage.cache_read_input_tokens,
+        cache_write_5m: (usage.cache_creation_input_tokens - usage.cache_creation_1h_input_tokens)
+            .max(0),
+        cache_write_1h: usage.cache_creation_1h_input_tokens,
+    };
+    let cost = pricing::request_cost_usd(model, usage.speed.as_deref(), &tokens);
+    let row = queries::UsageRow {
+        session_id: session_id.to_string(),
+        usage_key: usage_key.to_string(),
+        model: model.map(str::to_string),
+        speed: usage.speed.clone(),
+        tokens,
+    };
+    let inserted = queries::insert_session_usage(conn, &row, cost)?;
+    if inserted {
+        queries::refresh_session_totals_from_usage(conn, session_id)?;
+    }
+    Ok(inserted)
 }
 
 fn ingest_tool_use(
@@ -271,6 +305,10 @@ mod tests {
         conn.execute_batch(include_str!("../../migrations/0008_deleted_sessions.sql"))
             .unwrap();
         conn.execute_batch(include_str!("../../migrations/0009_dispatch_chat.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../../migrations/0010_dispatch_loop.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../../migrations/0011_session_usage.sql"))
             .unwrap();
         conn
     }
@@ -416,11 +454,9 @@ mod tests {
             .query_row("SELECT prompt_tokens FROM sessions", [], |r| r.get(0))
             .unwrap();
         assert_eq!(
-            prompt, 296,
-            "replaying ingest_record for the same lines is expected to double-count tokens \
-             at this layer - true replay-safety comes from the watcher never re-delivering \
-             already-tailed bytes (see watcher::tail), not from ingest_record being called \
-             twice for identical input"
+            prompt, 148,
+            "Claude usage is stored once per API response (message id + request id), so \
+             re-ingesting the same lines must not change the totals"
         );
     }
 
@@ -433,14 +469,14 @@ mod tests {
             .query_row("SELECT cost_usd FROM sessions", [], |r| r.get(0))
             .unwrap();
 
-        // claude-opus-4-8 rates from resources/pricing.json: input 15.0, output 75.0,
-        // cache_write 18.75, cache_read 1.5 (USD per million tokens). Fixture token totals
-        // (asserted in ingesting_fixture_accumulates_token_totals_and_model_on_the_session):
-        // 148 input / 700 output / 21800 cache_read / 290 cache_creation.
-        let expected = (148.0 / 1e6) * 15.0
-            + (700.0 / 1e6) * 75.0
-            + (290.0 / 1e6) * 18.75
-            + (21800.0 / 1e6) * 1.5;
+        // claude-opus-4-8 rates from resources/pricing.json: input 5.0, output 25.0,
+        // 5-minute cache write 6.25, cache read 0.5 (USD per million tokens). Fixture token
+        // totals (asserted in ingesting_fixture_accumulates_token_totals_and_model_on_the_session):
+        // 148 input / 700 output / 21800 cache_read / 290 cache_creation, none of it 1-hour.
+        let expected = (148.0 / 1e6) * 5.0
+            + (700.0 / 1e6) * 25.0
+            + (290.0 / 1e6) * 6.25
+            + (21800.0 / 1e6) * 0.5;
 
         assert!(cost_usd > 0.0, "expected nonzero cost, got {cost_usd}");
         assert!(
@@ -578,6 +614,7 @@ mod tests {
             timestamp: Some(timestamp),
             model: None,
             usage: None,
+            usage_key: None,
             tool_uses: Vec::new(),
             text: Some("hello".to_string()),
             ai_title: None,

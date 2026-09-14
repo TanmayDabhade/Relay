@@ -84,6 +84,7 @@ pub fn parse_line(line: &str, raw_log_path: &str) -> Option<ParsedRecord> {
                 timestamp,
                 model: None,
                 usage: None,
+                usage_key: None,
                 tool_uses: Vec::new(),
                 text: None,
                 ai_title: None,
@@ -108,6 +109,7 @@ pub fn parse_line(line: &str, raw_log_path: &str) -> Option<ParsedRecord> {
                 timestamp,
                 model,
                 usage,
+                usage_key: None,
                 tool_uses: Vec::new(),
                 text,
                 ai_title: None,
@@ -130,11 +132,19 @@ fn cached_context(raw_log_path: &str) -> FileContext {
 /// `cachedContentTokenCount` is the closest analog to `cache_read_input_tokens`; Gemini's API
 /// has no separate cache-write count, so `cache_creation_input_tokens` is always 0 here.
 fn extract_usage_metadata(usage: &Value) -> Usage {
+    // In the Gemini API `promptTokenCount` includes `cachedContentTokenCount`; only the
+    // difference is billed at the full input rate.
+    let cached = usage
+        .get("cachedContentTokenCount")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
     Usage {
-        input_tokens: usage
+        input_tokens: (usage
             .get("promptTokenCount")
             .and_then(Value::as_i64)
-            .unwrap_or(0),
+            .unwrap_or(0)
+            - cached)
+            .max(0),
         output_tokens: usage
             .get("candidatesTokenCount")
             .and_then(Value::as_i64)
@@ -144,6 +154,7 @@ fn extract_usage_metadata(usage: &Value) -> Usage {
             .and_then(Value::as_i64)
             .unwrap_or(0),
         cache_creation_input_tokens: 0,
+        ..Usage::default()
     }
 }
 
@@ -181,7 +192,7 @@ mod tests {
         assert_eq!(record.model.as_deref(), Some("gemini-3-pro"));
         assert_eq!(record.text.as_deref(), Some("hi from gemini"));
         let usage = record.usage.expect("model turn should carry usage");
-        assert_eq!(usage.input_tokens, 40);
+        assert_eq!(usage.input_tokens, 35, "cached tokens are excluded from input");
         assert_eq!(usage.output_tokens, 20);
         assert_eq!(usage.cache_read_input_tokens, 5);
     }

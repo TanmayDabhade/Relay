@@ -4,10 +4,10 @@ import { useDataChangedEvents } from "./hooks/useDataChangedEvents";
 import { DashboardView } from "./views/DashboardView";
 import { ProjectsView } from "./views/ProjectsView";
 import { ReportView } from "./views/ReportView";
-import { SessionsView } from "./views/SessionsView";
 import { TimelineView } from "./views/TimelineView";
 import { AgentViewer } from "./views/AgentViewer";
 import { ConnectionsView } from "./views/ConnectionsView";
+import { SettingsView } from "./views/SettingsView";
 
 interface AgentViewerTarget {
   taskId: string;
@@ -36,10 +36,10 @@ function App() {
           />
         )}
         {activeView === "projects" && <ProjectsView />}
-        {activeView === "sessions" && <SessionsView />}
         {activeView === "timeline" && <TimelineView />}
         {activeView === "report" && <ReportView />}
         {activeView === "connections" && <ConnectionsView />}
+        {activeView === "settings" && <SettingsView />}
         {activeView === "agent-viewer" && (
           <AgentViewer
             initialTaskId={agentViewerTarget?.taskId}

@@ -1,0 +1,102 @@
+.settings-view {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-6);
+  max-width: 56rem;
+  margin: 0 auto;
+}
+
+.settings-header {
+  padding-bottom: var(--space-5);
+  border-bottom: 1px solid var(--border-default);
+}
+
+.settings-header h1 {
+  margin: 0;
+  font-size: var(--text-xl);
+  font-weight: 600;
+}
+
+.settings-section h2 {
+  margin: 0 0 var(--space-3);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.settings-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-5);
+  padding: var(--space-4) var(--space-5);
+  border: 1px solid var(--border-default);
+  border-radius: 0.5rem;
+  background: var(--surface-card);
+}
+
+.settings-row-label {
+  flex: 1 1 18rem;
+}
+
+.settings-row-label strong {
+  color: var(--text-primary);
+  font-size: var(--text-base);
+  font-weight: 600;
+}
+
+.settings-row-label p {
+  margin: var(--space-1) 0 0;
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  line-height: 1.5;
+}
+
+.settings-segmented {
+  display: inline-flex;
+  padding: 0.1875rem;
+  border: 1px solid var(--border-default);
+  border-radius: 0.5rem;
+  background: var(--surface-muted);
+}
+
+.settings-segmented button {
+  display: flex;
+  min-width: 5.5rem;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-1);
+  padding: var(--space-2) var(--space-3);
+  border: 0;
+  border-radius: 0.375rem;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+}
+
+.settings-segmented button span {
+  color: var(--text-primary);
+  font-weight: 600;
+  line-height: 1;
+}
+
+.settings-segmented button:hover {
+  color: var(--text-primary);
+}
+
+.settings-segmented button.is-selected {
+  background: var(--surface-card);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12);
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.settings-segmented button:focus-visible {
+  outline: 0.125rem solid var(--accent-border);
+  outline-offset: 0.0625rem;
+}

@@ -192,7 +192,10 @@ mod tests {
         assert_eq!(record.model.as_deref(), Some("gemini-3-pro"));
         assert_eq!(record.text.as_deref(), Some("hi from gemini"));
         let usage = record.usage.expect("model turn should carry usage");
-        assert_eq!(usage.input_tokens, 35, "cached tokens are excluded from input");
+        assert_eq!(
+            usage.input_tokens, 35,
+            "cached tokens are excluded from input"
+        );
         assert_eq!(usage.output_tokens, 20);
         assert_eq!(usage.cache_read_input_tokens, 5);
     }

@@ -129,7 +129,12 @@ fn backfill_session_costs(conn: &rusqlite::Connection) {
                 row.speed.as_deref(),
                 &row.tokens,
             );
-            db::queries::update_session_usage_cost(&transaction, &row.session_id, &row.usage_key, cost)?;
+            db::queries::update_session_usage_cost(
+                &transaction,
+                &row.session_id,
+                &row.usage_key,
+                cost,
+            )?;
             repriced_sessions.insert(row.session_id);
         }
         for session_id in &repriced_sessions {

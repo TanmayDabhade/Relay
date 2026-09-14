@@ -795,7 +795,15 @@ pub fn create_retry_run(
         "INSERT INTO dispatch_runs
          (id, task_id, attempt, agent, model, status, created_at, loop_max_iterations)
          VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7)",
-        params![run.id, task_id, attempt, agent, model, now, loop_max_iterations],
+        params![
+            run.id,
+            task_id,
+            attempt,
+            agent,
+            model,
+            now,
+            loop_max_iterations
+        ],
     )?;
     conn.execute(
         "UPDATE dispatch_tasks SET status = 'queued', updated_at = ?2, completed_at = NULL
@@ -1051,7 +1059,10 @@ pub fn upsert_dispatch_event(
              WHERE run_id = ?1 AND turn_id IS ?2 AND provider_event_id = ?3
              ORDER BY sequence DESC",
         )?;
-        let rows = stmt.query_map(params![run_id, turn_id, provider_event_id], row_to_dispatch_event)?;
+        let rows = stmt.query_map(
+            params![run_id, turn_id, provider_event_id],
+            row_to_dispatch_event,
+        )?;
         let matching = rows
             .filter_map(Result::ok)
             .find(|event| dispatch_event_channel(&event.kind) == dispatch_event_channel(kind));
@@ -1799,7 +1810,11 @@ pub fn update_cost(
 ) -> rusqlite::Result<()> {
     conn.execute(
         "UPDATE sessions SET cost_usd = ?2, cost_unpriced = ?3 WHERE id = ?1",
-        params![session_id, cost_usd.unwrap_or(0.0), cost_usd.is_none() as i64],
+        params![
+            session_id,
+            cost_usd.unwrap_or(0.0),
+            cost_usd.is_none() as i64
+        ],
     )?;
     Ok(())
 }
@@ -3607,7 +3622,8 @@ mod dispatch_query_tests {
             2_100,
         )
         .unwrap();
-        let retry = create_retry_run(&conn, &created.task.id, "gemini", "auto", None, 2_200).unwrap();
+        let retry =
+            create_retry_run(&conn, &created.task.id, "gemini", "auto", None, 2_200).unwrap();
 
         assert_eq!(retry.attempt, 2);
         assert_eq!(retry.agent, "gemini");
@@ -3746,8 +3762,8 @@ mod dispatch_query_tests {
             2_000,
         )
         .unwrap();
-        let (turn, _) = begin_dispatch_turn(&conn, &created.run.id, "Update the readme.", 2_001)
-            .unwrap();
+        let (turn, _) =
+            begin_dispatch_turn(&conn, &created.run.id, "Update the readme.", 2_001).unwrap();
 
         let running = upsert_dispatch_event(
             &conn,
@@ -3821,7 +3837,10 @@ mod dispatch_query_tests {
         assert_eq!(created.run.loop_max_iterations, Some(3));
         let (turn, _) =
             begin_dispatch_turn(&conn, &created.run.id, "Finish the feature.", 2_001).unwrap();
-        assert_eq!(last_assistant_message_for_turn(&conn, &turn.id).unwrap(), None);
+        assert_eq!(
+            last_assistant_message_for_turn(&conn, &turn.id).unwrap(),
+            None
+        );
         for (content, id) in [("Planning", "m1"), ("Done RELAY_LOOP_DONE", "m2")] {
             upsert_dispatch_event(
                 &conn,
@@ -3839,7 +3858,9 @@ mod dispatch_query_tests {
             .unwrap();
         }
         assert_eq!(
-            last_assistant_message_for_turn(&conn, &turn.id).unwrap().as_deref(),
+            last_assistant_message_for_turn(&conn, &turn.id)
+                .unwrap()
+                .as_deref(),
             Some("Done RELAY_LOOP_DONE")
         );
 
@@ -3873,8 +3894,8 @@ mod dispatch_query_tests {
             2_000,
         )
         .unwrap();
-        let (turn, _) = begin_dispatch_turn(&conn, &created.run.id, "Explain the change.", 2_001)
-            .unwrap();
+        let (turn, _) =
+            begin_dispatch_turn(&conn, &created.run.id, "Explain the change.", 2_001).unwrap();
 
         let first = upsert_dispatch_event(
             &conn,

@@ -790,8 +790,13 @@ pub fn dispatch_task(
 
     let (turn, user_event) = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
-        queries::begin_dispatch_turn(&conn, &created.run.id, &agent_prompt, Utc::now().timestamp())
-            .map_err(|e| e.to_string())?
+        queries::begin_dispatch_turn(
+            &conn,
+            &created.run.id,
+            &agent_prompt,
+            Utc::now().timestamp(),
+        )
+        .map_err(|e| e.to_string())?
     };
     dispatch::emit_dispatch_event(&app, &user_event);
     if let Err(error) = runtime.start_turn(
@@ -833,20 +838,18 @@ pub fn retry_dispatch_task(
         let runs = queries::list_runs_for_task(&conn, &task_id).map_err(|e| e.to_string())?;
         // A retry is "the same task again", so it keeps the previous attempt's loop setting.
         let loop_max_iterations = runs.last().and_then(|run| run.loop_max_iterations);
-        let active = runs
-            .iter()
-            .any(|run| {
-                matches!(
-                    run.status.as_str(),
-                    "queued"
-                        | "starting"
-                        | "running"
-                        | "awaiting_approval"
-                        | "interrupting"
-                        | "idle"
-                        | "failed"
-                )
-            });
+        let active = runs.iter().any(|run| {
+            matches!(
+                run.status.as_str(),
+                "queued"
+                    | "starting"
+                    | "running"
+                    | "awaiting_approval"
+                    | "interrupting"
+                    | "idle"
+                    | "failed"
+            )
+        });
         if active {
             return Err("this task already has an active run".to_string());
         }
@@ -878,7 +881,7 @@ pub fn retry_dispatch_task(
             loop_max_iterations,
             Utc::now().timestamp(),
         )
-            .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?
     };
     let created = queries::CreatedDispatch { task, run };
     let (turn, user_event) = {
@@ -1009,7 +1012,12 @@ fn start_follow_up_turn(app: &tauri::AppHandle, run_id: &str, prompt: &str) -> R
 /// Called by the runtime once a turn has fully settled (DB updated, active handle removed).
 /// Runs on the runtime's waiter thread, never under the DB lock: the gather step takes the
 /// lock briefly, and starting the next turn re-acquires it on its own.
-pub fn continue_dispatch_loop(app: &tauri::AppHandle, run_id: &str, turn_id: &str, turn_status: &str) {
+pub fn continue_dispatch_loop(
+    app: &tauri::AppHandle,
+    run_id: &str,
+    turn_id: &str,
+    turn_status: &str,
+) {
     let db = app.state::<Db>();
     let gathered = {
         let Ok(conn) = db.0.lock() else { return };
@@ -1036,7 +1044,13 @@ pub fn continue_dispatch_loop(app: &tauri::AppHandle, run_id: &str, turn_id: &st
     ) {
         looping::LoopDecision::Stop => {}
         looping::LoopDecision::Done => {
-            append_loop_notice(app, run_id, turn_id, "completed", "Loop finished: the agent reported the task is done.");
+            append_loop_notice(
+                app,
+                run_id,
+                turn_id,
+                "completed",
+                "Loop finished: the agent reported the task is done.",
+            );
         }
         looping::LoopDecision::CapReached { max } => {
             append_loop_notice(
@@ -1048,14 +1062,10 @@ pub fn continue_dispatch_loop(app: &tauri::AppHandle, run_id: &str, turn_id: &st
             );
         }
         looping::LoopDecision::Continue { iteration, max } => {
-            let claimed = db
-                .0
-                .lock()
-                .map_err(|e| e.to_string())
-                .and_then(|conn| {
-                    queries::claim_dispatch_loop_iteration(&conn, run_id, iteration)
-                        .map_err(|e| e.to_string())
-                });
+            let claimed = db.0.lock().map_err(|e| e.to_string()).and_then(|conn| {
+                queries::claim_dispatch_loop_iteration(&conn, run_id, iteration)
+                    .map_err(|e| e.to_string())
+            });
             match claimed {
                 Ok(true) => {}
                 // Looping was stopped (or the step claimed) between gather and now.
@@ -1080,7 +1090,13 @@ pub fn continue_dispatch_loop(app: &tauri::AppHandle, run_id: &str, turn_id: &st
     }
 }
 
-fn append_loop_notice(app: &tauri::AppHandle, run_id: &str, turn_id: &str, state: &str, content: &str) {
+fn append_loop_notice(
+    app: &tauri::AppHandle,
+    run_id: &str,
+    turn_id: &str,
+    state: &str,
+    content: &str,
+) {
     let db = app.state::<Db>();
     let event = match db.0.lock() {
         Ok(conn) => queries::append_dispatch_event(

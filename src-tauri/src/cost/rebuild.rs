@@ -84,7 +84,12 @@ type Response = (String, Option<String>, Usage);
 fn read_responses(target: &RebuildTarget) -> Option<Vec<Response>> {
     let path = Path::new(&target.raw_log_path);
     let contents = std::fs::read_to_string(path).ok()?;
-    Some(responses_from_log(&target.agent, &target.session_id, path, &contents))
+    Some(responses_from_log(
+        &target.agent,
+        &target.session_id,
+        path,
+        &contents,
+    ))
 }
 
 /// Every keyed usage record in a log that belongs to `session_id`, in file order.

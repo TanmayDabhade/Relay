@@ -178,15 +178,15 @@ fn normalize_claude_stream_event(
         .and_then(Value::as_str)
         .map(str::to_string);
     let stream = value.get("event").unwrap_or(value);
-    match stream.get("type").and_then(Value::as_str).unwrap_or_default() {
+    match stream
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+    {
         "message_start" => {
             state.claude_message_sequence += 1;
-            state.claude_open_message_id = string_at(stream, &[&["message", "id"]]).or_else(|| {
-                Some(format!(
-                    "claude-message-{}",
-                    state.claude_message_sequence
-                ))
-            });
+            state.claude_open_message_id = string_at(stream, &[&["message", "id"]])
+                .or_else(|| Some(format!("claude-message-{}", state.claude_message_sequence)));
         }
         "content_block_start" => {
             let block = stream.get("content_block").unwrap_or(stream);
@@ -205,7 +205,10 @@ fn normalize_claude_stream_event(
         "content_block_delta" => {
             let delta = stream.get("delta").unwrap_or(stream);
             if delta.get("type").and_then(Value::as_str) == Some("text_delta") {
-                let content = delta.get("text").and_then(Value::as_str).unwrap_or_default();
+                let content = delta
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
                 if !content.is_empty() {
                     output.events.push(event_with_update(
                         "assistant_message",
@@ -276,16 +279,16 @@ fn normalize_claude(
             }
             for block in blocks {
                 if block.get("type").and_then(Value::as_str) == Some("tool_use") {
-                        let name = block.get("name").and_then(Value::as_str).unwrap_or("Tool");
-                        let id = block.get("id").and_then(Value::as_str).map(str::to_string);
-                        output.events.push(event(
-                            "tool_call",
-                            None,
-                            name,
-                            compact_json(block),
-                            id,
-                            Some("running"),
-                        ));
+                    let name = block.get("name").and_then(Value::as_str).unwrap_or("Tool");
+                    let id = block.get("id").and_then(Value::as_str).map(str::to_string);
+                    output.events.push(event(
+                        "tool_call",
+                        None,
+                        name,
+                        compact_json(block),
+                        id,
+                        Some("running"),
+                    ));
                 }
             }
         }
@@ -467,13 +470,10 @@ fn normalize_gemini(
             if !content.is_empty() {
                 let explicit_id = string_at(value, &[&["id"], &["message_id"], &["messageId"]]);
                 let message_id = explicit_id.unwrap_or_else(|| {
-                    state
-                        .gemini_message_id
-                        .clone()
-                        .unwrap_or_else(|| {
-                            state.gemini_message_sequence += 1;
-                            format!("gemini-message-{}", state.gemini_message_sequence)
-                        })
+                    state.gemini_message_id.clone().unwrap_or_else(|| {
+                        state.gemini_message_sequence += 1;
+                        format!("gemini-message-{}", state.gemini_message_sequence)
+                    })
                 });
                 state.gemini_message_id = Some(message_id.clone());
                 let is_delta = value.get("delta").and_then(Value::as_bool) == Some(true);
@@ -688,7 +688,10 @@ mod tests {
         .unwrap();
         assert_eq!(first.events.len(), 1);
         assert_eq!(first.events[0].content, "Updated");
-        assert_eq!(first.events[0].provider_event_id.as_deref(), Some("message-1"));
+        assert_eq!(
+            first.events[0].provider_event_id.as_deref(),
+            Some("message-1")
+        );
         assert_eq!(first.events[0].state.as_deref(), Some("running"));
         assert_eq!(first.events[0].update, NormalizedEventUpdate::Append);
 
@@ -698,7 +701,10 @@ mod tests {
             &mut state,
         )
         .unwrap();
-        assert_eq!(second.events[0].provider_event_id.as_deref(), Some("message-1"));
+        assert_eq!(
+            second.events[0].provider_event_id.as_deref(),
+            Some("message-1")
+        );
         assert_eq!(second.events[0].update, NormalizedEventUpdate::Append);
 
         let completed = normalize_provider_line_with_state(
@@ -707,7 +713,10 @@ mod tests {
             &mut state,
         )
         .unwrap();
-        assert_eq!(completed.events[0].provider_event_id.as_deref(), Some("message-1"));
+        assert_eq!(
+            completed.events[0].provider_event_id.as_deref(),
+            Some("message-1")
+        );
         assert_eq!(completed.events[0].state.as_deref(), Some("completed"));
         assert_eq!(completed.events[0].update, NormalizedEventUpdate::Replace);
     }
@@ -829,7 +838,10 @@ mod tests {
             &mut state,
         )
         .unwrap();
-        assert_eq!(completed.events[0].provider_event_id.as_deref(), Some("item-1"));
+        assert_eq!(
+            completed.events[0].provider_event_id.as_deref(),
+            Some("item-1")
+        );
         assert_eq!(completed.events[0].state.as_deref(), Some("completed"));
     }
 
@@ -851,7 +863,10 @@ mod tests {
             &mut state,
         )
         .unwrap();
-        assert_eq!(second.events[0].provider_event_id.as_deref(), Some(first_id.as_str()));
+        assert_eq!(
+            second.events[0].provider_event_id.as_deref(),
+            Some(first_id.as_str())
+        );
 
         normalize_provider_line_with_state(
             "gemini",

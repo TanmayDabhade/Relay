@@ -122,11 +122,8 @@ impl Runtime {
                 if line.trim().is_empty() {
                     continue;
                 }
-                match normalize_provider_line_with_state(
-                    &output_agent,
-                    &line,
-                    &mut normalize_state,
-                ) {
+                match normalize_provider_line_with_state(&output_agent, &line, &mut normalize_state)
+                {
                     Ok(normalized) => {
                         let turn_complete = normalized.turn_complete;
                         if let Err(error) = persist_normalized_line(

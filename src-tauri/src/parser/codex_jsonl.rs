@@ -271,7 +271,11 @@ mod tests {
         let event = r#"{"timestamp":"2026-01-01T10:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":40512,"cached_input_tokens":22016,"output_tokens":434,"total_tokens":40946},"last_token_usage":{"input_tokens":21808,"cached_input_tokens":11008,"output_tokens":184,"total_tokens":21992}}}}"#;
         let record = parse_line(event, path).expect("event_msg should parse");
         let usage = record.usage.expect("token_count event should carry usage");
-        assert_eq!(usage.input_tokens, 21808 - 11008, "cached tokens are not input");
+        assert_eq!(
+            usage.input_tokens,
+            21808 - 11008,
+            "cached tokens are not input"
+        );
         assert_eq!(usage.output_tokens, 184);
         assert_eq!(usage.cache_read_input_tokens, 11008);
         assert_eq!(record.model.as_deref(), Some("gpt-5.6-sol"));

@@ -81,7 +81,10 @@ fn default_pricing() -> ModelPricing {
     pricing_table()
         .get(DEFAULT_KEY)
         .copied()
-        .unwrap_or(ModelPricing { standard: FALLBACK_DEFAULT_RATES, fast: None })
+        .unwrap_or(ModelPricing {
+            standard: FALLBACK_DEFAULT_RATES,
+            fast: None,
+        })
 }
 
 /// Longest-prefix match over every non-`_default` key in the pricing table — handles
@@ -114,7 +117,10 @@ fn pricing_for_model(model: &str) -> Option<ModelPricing> {
     // 3. Sentinel: values like `<synthetic>` are non-billable placeholders seen in real logs
     //    — treat as zero cost, do NOT fall through to `_default`.
     if model.starts_with('<') {
-        return Some(ModelPricing { standard: ZERO_RATES, fast: None });
+        return Some(ModelPricing {
+            standard: ZERO_RATES,
+            fast: None,
+        });
     }
 
     log_unknown_model_once(model);
@@ -203,12 +209,21 @@ mod tests {
     use super::*;
 
     fn usage(input: i64, output: i64, cache_read: i64, w5: i64, w1h: i64) -> TokenUsage {
-        TokenUsage { input, output, cache_read, cache_write_5m: w5, cache_write_1h: w1h }
+        TokenUsage {
+            input,
+            output,
+            cache_read,
+            cache_write_5m: w5,
+            cache_write_1h: w1h,
+        }
     }
 
     fn close(actual: Option<f64>, expected: f64) {
         let actual = actual.expect("model should be priced");
-        assert!((actual - expected).abs() < 1e-9, "expected {expected}, got {actual}");
+        assert!(
+            (actual - expected).abs() < 1e-9,
+            "expected {expected}, got {actual}"
+        );
     }
 
     #[test]
@@ -225,9 +240,15 @@ mod tests {
     #[test]
     fn fast_mode_uses_fast_rates_only_where_published() {
         let u = usage(1_000_000, 1_000_000, 0, 0, 0);
-        close(request_cost_usd(Some("claude-opus-5"), Some("fast"), &u), 10.0 + 50.0);
+        close(
+            request_cost_usd(Some("claude-opus-5"), Some("fast"), &u),
+            10.0 + 50.0,
+        );
         // No published fast rates for Sonnet 5 — standard pricing, not a guess.
-        close(request_cost_usd(Some("claude-sonnet-5"), Some("fast"), &u), 2.0 + 10.0);
+        close(
+            request_cost_usd(Some("claude-sonnet-5"), Some("fast"), &u),
+            2.0 + 10.0,
+        );
     }
 
     #[test]
@@ -244,7 +265,10 @@ mod tests {
             close(cost_usd(Some(model), &one_m_in_out), expected);
         }
         // Fable 5.1 cache reads are 0.025x input, not the usual 0.1x.
-        close(cost_usd(Some("claude-fable-5-1"), &usage(0, 0, 1_000_000, 0, 0)), 0.25);
+        close(
+            cost_usd(Some("claude-fable-5-1"), &usage(0, 0, 1_000_000, 0, 0)),
+            0.25,
+        );
     }
 
     #[test]
@@ -268,7 +292,10 @@ mod tests {
     #[test]
     fn unrecognized_claude_model_falls_back_to_default_rates() {
         // _default input rate is 3.0 per resources/pricing.json.
-        close(cost_usd(Some("claude-future-9"), &usage(1_000_000, 0, 0, 0, 0)), 3.0);
+        close(
+            cost_usd(Some("claude-future-9"), &usage(1_000_000, 0, 0, 0, 0)),
+            3.0,
+        );
     }
 
     #[test]
@@ -285,8 +312,14 @@ mod tests {
 
     #[test]
     fn zero_tokens_yields_zero_cost_regardless_of_model() {
-        assert_eq!(cost_usd(Some("claude-opus-5"), &TokenUsage::default()), Some(0.0));
-        assert_eq!(cost_usd(Some("gpt-5.6-sol"), &TokenUsage::default()), Some(0.0));
+        assert_eq!(
+            cost_usd(Some("claude-opus-5"), &TokenUsage::default()),
+            Some(0.0)
+        );
+        assert_eq!(
+            cost_usd(Some("gpt-5.6-sol"), &TokenUsage::default()),
+            Some(0.0)
+        );
         assert_eq!(cost_usd(None, &TokenUsage::default()), Some(0.0));
     }
 

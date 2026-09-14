@@ -386,10 +386,12 @@ Use the Tauri dev log to debug ingestion. Parser and watcher warnings go through
 
 ### Testing & checks
 
-Run these before opening a PR:
+Run these before opening a PR. CI (`.github/workflows/ci.yml`) runs the same checks on every pull request and push to `main`:
 
 ```bash
 # Rust (from src-tauri/)
+cargo fmt --check
+cargo clippy --all-targets
 cargo check
 cargo test                              # full suite
 cargo test --lib db::queries            # one module
@@ -469,7 +471,9 @@ Follow `export_report` and `export_transcript`: render Markdown with a pure, tes
 
 ### Pull request checklist
 
-- [ ] `cargo check` and `cargo test` pass (from `src-tauri/`)
+The same list is pre-filled in new PRs from `.github/pull_request_template.md`. Title PRs and commits as [Conventional Commits](https://www.conventionalcommits.org/) (`feat(board): ...`, `fix(watcher): ...`).
+
+- [ ] `cargo fmt --check`, `cargo clippy --all-targets`, and `cargo test` pass (from `src-tauri/`)
 - [ ] `npx tsc -b`, `npm run lint`, and `node --test tests/*.test.ts` pass
 - [ ] New parsing or pure logic has tests. Parsers are tested against fixtures, including malformed input.
 - [ ] Any schema change is a **new** migration and is registered in `db::open`

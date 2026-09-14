@@ -9,8 +9,7 @@ pub mod looping;
 mod normalize;
 mod runtime;
 pub use normalize::{
-    normalize_provider_line_with_state, NormalizeState, NormalizedEvent,
-    NormalizedEventUpdate,
+    normalize_provider_line_with_state, NormalizeState, NormalizedEvent, NormalizedEventUpdate,
 };
 pub use runtime::{emit_dispatch_event, Runtime};
 

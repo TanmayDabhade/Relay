@@ -90,18 +90,27 @@ mod tests {
 
     #[test]
     fn non_looping_runs_never_continue() {
-        assert_eq!(decide("completed", "idle", None, 0, Some("hi")), LoopDecision::Stop);
+        assert_eq!(
+            decide("completed", "idle", None, 0, Some("hi")),
+            LoopDecision::Stop
+        );
     }
 
     #[test]
     fn completed_turn_without_marker_continues_with_the_next_iteration() {
         assert_eq!(
             decide("completed", "idle", Some(3), 0, Some("made progress")),
-            LoopDecision::Continue { iteration: 1, max: 3 }
+            LoopDecision::Continue {
+                iteration: 1,
+                max: 3
+            }
         );
         assert_eq!(
             decide("completed", "idle", Some(3), 2, None),
-            LoopDecision::Continue { iteration: 3, max: 3 }
+            LoopDecision::Continue {
+                iteration: 3,
+                max: 3
+            }
         );
     }
 

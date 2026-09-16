@@ -123,20 +123,34 @@ fn pricing_for_model(model: &str) -> Option<ModelPricing> {
         });
     }
 
-    log_unknown_model_once(model);
     // 4. A Claude model newer than this table: `_default` is a reasonable estimate. Anything
     //    else (Codex's GPT models, Gemini) has no price here — pricing it at Claude rates
     //    produced wildly wrong spend, so it is reported as unpriced instead.
-    model.starts_with("claude").then(default_pricing)
+    let estimated_at_default = model.starts_with("claude");
+    log_unknown_model_once(model, estimated_at_default);
+    estimated_at_default.then(default_pricing)
 }
 
-fn log_unknown_model_once(model: &str) {
+/// Warns once per distinct model string, so a startup backfill over hundreds of sessions
+/// doesn't flood the log. The two outcomes are worded differently on purpose: a `_default`
+/// estimate is a mild inaccuracy, whereas an unpriced model contributes no cost at all and
+/// surfaces in the UI as "Not priced". Reporting both as a `_default` fallback made unpriced
+/// Codex/Gemini sessions look like a mispricing bug rather than a missing table entry.
+fn log_unknown_model_once(model: &str, estimated_at_default: bool) {
     static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     let set = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
     let mut set = set.lock().unwrap();
-    if set.insert(model.to_string()) {
+    if !set.insert(model.to_string()) {
+        return;
+    }
+    if estimated_at_default {
         log::warn!(
-            "encountered unrecognized model string for pricing: {model:?} (falling back to _default rates)"
+            "unrecognized Claude model string for pricing: {model:?} (estimating at _default rates)"
+        );
+    } else {
+        log::warn!(
+            "no pricing entry for model {model:?}; its tokens are reported as unpriced \
+             (add rates to resources/pricing.json to cost it)"
         );
     }
 }

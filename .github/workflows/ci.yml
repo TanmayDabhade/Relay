@@ -1,7 +1,7 @@
 name: CI
 
-# The Tauri app only. `landing-page/` is an independent Next.js project with its own tooling,
-# so changes confined to it don't trigger this workflow.
+# The Tauri app only. `landing-page/` is an independent Next.js project with its own tooling
+# and its own workflow (landing-page.yml), so changes confined to it don't trigger this one.
 on:
   push:
     branches: [main]
@@ -23,7 +23,7 @@ permissions:
 
 jobs:
   frontend:
-    name: Frontend (typecheck, lint, unit tests)
+    name: Frontend (typecheck, lint, unit tests, build)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -46,6 +46,12 @@ jobs:
 
       - name: Unit tests
         run: node --test tests/*.test.ts
+
+      # `npm run build` is `tsc -b && vite build`. The typecheck above is the fast failure;
+      # this catches what only surfaces at bundle time (bad imports, asset resolution) and
+      # is never exercised by the Rust job, which stubs `dist/`.
+      - name: Build frontend
+        run: npm run build
 
   rust:
     name: Rust (fmt, clippy, tests)

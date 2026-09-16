@@ -1,0 +1,99 @@
+name: Release
+
+# Ships the desktop app. Pushing a `v*` tag builds a universal macOS bundle and attaches
+# it to a **draft** GitHub Release, so nothing reaches users until the draft is published
+# by hand. Cut a release with:
+#
+#   # bump "version" in src-tauri/tauri.conf.json first, commit it, then:
+#   git tag v0.2.0 && git push origin v0.2.0
+#
+# The landing page is not part of this — Vercel deploys that straight from `main`.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (must already exist, e.g. v0.2.0)"
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write # creating the release and uploading the bundles
+
+jobs:
+  macos:
+    name: macOS (universal)
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      # A tag whose version doesn't match the bundle's would ship a DMG that reports a
+      # different version than the release it's attached to, and the updater (if one is
+      # ever added) keys off the bundle version. Cheaper to catch here than after upload.
+      - name: Verify tag matches tauri.conf.json version
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          conf_version=$(jq -r .version src-tauri/tauri.conf.json)
+          if [ "${tag#v}" != "$conf_version" ]; then
+            echo "::error::tag $tag does not match src-tauri/tauri.conf.json version $conf_version"
+            exit 1
+          fi
+          echo "version $conf_version"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # Both halves of the universal binary.
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install dependencies
+        run: npm ci
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Code signing and notarization. All optional: with none of these secrets set the
+          # build still succeeds, but the .app is unsigned and Gatekeeper will tell users it
+          # "cannot be opened because the developer cannot be verified" until they
+          # right-click → Open. To ship a signed, notarized build, add these repo secrets:
+          #   APPLE_CERTIFICATE           base64 of a Developer ID Application .p12
+          #   APPLE_CERTIFICATE_PASSWORD  its password
+          #   APPLE_SIGNING_IDENTITY      e.g. "Developer ID Application: Name (TEAMID)"
+          #   APPLE_ID / APPLE_PASSWORD   Apple ID + an app-specific password
+          #   APPLE_TEAM_ID               the 10-character team id
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          projectPath: .
+          tagName: ${{ inputs.tag || github.ref_name }}
+          releaseName: "Relay __VERSION__"
+          releaseBody: |
+            Universal macOS build (Apple Silicon + Intel).
+
+            Download the `.dmg`, drag Relay to Applications, and launch it. Relay reads the
+            agent session logs already on your machine — nothing is uploaded anywhere.
+          # Draft so the notes can be written and the DMG smoke-tested before it's public.
+          releaseDraft: true
+          prerelease: false
+          args: --target universal-apple-darwin

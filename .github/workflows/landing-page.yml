@@ -1,0 +1,66 @@
+name: Landing page
+
+# `landing-page/` is an independent Next.js project (own package.json, lockfile, eslint
+# config), so it gets its own workflow rather than a job in ci.yml — that keeps each
+# workflow's path filter simple and stops a Tauri change from queueing a Next build.
+#
+# Vercel is the deploy authority: it builds `landing-page/` (Root Directory is set to it
+# in the project settings) on every push, production from `main` and a preview otherwise.
+# This workflow is the pre-merge check, so a type error shows up on the PR instead of only
+# in a failed production deploy.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "landing-page/**"
+      - ".github/workflows/landing-page.yml"
+  pull_request:
+    paths:
+      - "landing-page/**"
+      - ".github/workflows/landing-page.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: landing-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Typecheck, lint, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: landing-page
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: landing-page/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Lint
+        run: npm run lint
+
+      # Every route that touches Supabase is `export const dynamic = "force-dynamic"`, and
+      # `lib/supabase.ts` reads its env vars lazily inside functions, so nothing contacts
+      # Supabase at build time. These placeholders only satisfy the non-null assertions in
+      # `lib/supabase-server.ts` / `proxy.ts`; the real values live in Vercel, and no
+      # secret is needed here. If this step ever starts failing for a missing variable, a
+      # route has stopped being request-scoped — fix the route, don't add a secret here.
+      - name: Build
+        run: npm run build
+        env:
+          NEXT_PUBLIC_SUPABASE_URL: https://placeholder.supabase.co
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: placeholder-anon-key

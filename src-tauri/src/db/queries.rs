@@ -1526,6 +1526,226 @@ pub fn clear_pending_launch_for_dispatch_run(
     Ok(())
 }
 
+// --- Task workspaces (git worktree + PR shipping) ---
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskWorkspace {
+    pub task_id: String,
+    pub project_path: String,
+    pub repo_root: String,
+    pub worktree_path: String,
+    pub work_dir: String,
+    pub branch: String,
+    pub base_branch: String,
+    pub auto_ship: bool,
+    pub ship_status: String,
+    pub ship_error: Option<String>,
+    pub pr_url: Option<String>,
+    pub last_shipped_at: Option<i64>,
+    pub removed_at: Option<i64>,
+    pub created_at: i64,
+}
+
+/// A workspace together with the board card its task drives, for badging cards on a board.
+#[derive(Debug, Clone, Serialize)]
+pub struct CardShip {
+    pub card_id: String,
+    pub task_id: String,
+    pub branch: String,
+    pub ship_status: String,
+    pub pr_url: Option<String>,
+}
+
+const TASK_WORKSPACE_COLUMNS: &str =
+    "task_id, project_path, repo_root, worktree_path, work_dir, branch, base_branch, auto_ship,
+     ship_status, ship_error, pr_url, last_shipped_at, removed_at, created_at";
+
+fn row_to_task_workspace(row: &Row) -> rusqlite::Result<TaskWorkspace> {
+    Ok(TaskWorkspace {
+        task_id: row.get(0)?,
+        project_path: row.get(1)?,
+        repo_root: row.get(2)?,
+        worktree_path: row.get(3)?,
+        work_dir: row.get(4)?,
+        branch: row.get(5)?,
+        base_branch: row.get(6)?,
+        auto_ship: row.get::<_, i64>(7)? != 0,
+        ship_status: row.get(8)?,
+        ship_error: row.get(9)?,
+        pr_url: row.get(10)?,
+        last_shipped_at: row.get(11)?,
+        removed_at: row.get(12)?,
+        created_at: row.get(13)?,
+    })
+}
+
+pub fn insert_task_workspace(conn: &Connection, workspace: &TaskWorkspace) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO task_workspaces
+         (task_id, project_path, repo_root, worktree_path, work_dir, branch, base_branch,
+          auto_ship, ship_status, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', ?9)",
+        params![
+            workspace.task_id,
+            workspace.project_path,
+            workspace.repo_root,
+            workspace.worktree_path,
+            workspace.work_dir,
+            workspace.branch,
+            workspace.base_branch,
+            workspace.auto_ship as i64,
+            workspace.created_at,
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn get_task_workspace(
+    conn: &Connection,
+    task_id: &str,
+) -> rusqlite::Result<Option<TaskWorkspace>> {
+    let sql = format!("SELECT {TASK_WORKSPACE_COLUMNS} FROM task_workspaces WHERE task_id = ?1");
+    conn.query_row(&sql, params![task_id], row_to_task_workspace)
+        .optional()
+}
+
+/// Maps a session cwd that lies inside a task worktree back to the real project path, keeping
+/// any subdirectory suffix. `None` for every ordinary cwd. Compares by prefix + `/` rather than
+/// `LIKE` so `%`/`_` in a path can't act as wildcards, and case-insensitively to match
+/// `project_id_for_path` (macOS paths are case-insensitive). SQLite's `lower()` only folds
+/// ASCII, so byte lengths are unchanged and the suffix slice below stays on the same boundary.
+pub fn project_path_for_worktree_cwd(
+    conn: &Connection,
+    cwd: &str,
+) -> rusqlite::Result<Option<String>> {
+    let found: Option<(String, String)> = conn
+        .query_row(
+            "SELECT work_dir, project_path FROM task_workspaces
+             WHERE lower(?1) = lower(work_dir)
+                OR lower(substr(?1, 1, length(work_dir) + 1)) = lower(work_dir || '/')
+             ORDER BY length(work_dir) DESC LIMIT 1",
+            params![cwd],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    Ok(found.map(|(work_dir, project_path)| format!("{project_path}{}", &cwd[work_dir.len()..])))
+}
+
+/// Claims the workspace for one ship attempt. Conditional on the current status so an
+/// auto-ship and a manual "Ship" click racing on one task can't both push.
+pub fn claim_task_ship(conn: &Connection, task_id: &str) -> rusqlite::Result<bool> {
+    let changed = conn.execute(
+        "UPDATE task_workspaces SET ship_status = 'shipping', ship_error = NULL
+         WHERE task_id = ?1 AND ship_status != 'shipping'",
+        params![task_id],
+    )?;
+    Ok(changed > 0)
+}
+
+pub fn finish_task_ship(
+    conn: &Connection,
+    task_id: &str,
+    status: &str,
+    error: Option<&str>,
+    pr_url: Option<&str>,
+    now: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE task_workspaces
+         SET ship_status = ?2, ship_error = ?3, pr_url = COALESCE(?4, pr_url),
+             last_shipped_at = CASE WHEN ?2 = 'shipped' THEN ?5 ELSE last_shipped_at END
+         WHERE task_id = ?1",
+        params![task_id, status, error, pr_url, now],
+    )?;
+    Ok(())
+}
+
+/// A ship left in 'shipping' by a crash or app quit would block every later ship of the task.
+/// Called once at startup, when no ship can be in flight.
+pub fn reset_interrupted_task_ships(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE task_workspaces
+         SET ship_status = 'failed', ship_error = 'Relay closed while this task was shipping'
+         WHERE ship_status = 'shipping'",
+        [],
+    )?;
+    Ok(())
+}
+
+pub fn set_task_workspace_removed(
+    conn: &Connection,
+    task_id: &str,
+    removed_at: Option<i64>,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE task_workspaces SET removed_at = ?2 WHERE task_id = ?1",
+        params![task_id, removed_at],
+    )?;
+    Ok(())
+}
+
+pub fn list_card_ships(conn: &Connection, project_id: &str) -> rusqlite::Result<Vec<CardShip>> {
+    let mut stmt = conn.prepare(
+        "SELECT t.card_id, w.task_id, w.branch, w.ship_status, w.pr_url
+         FROM task_workspaces w
+         JOIN dispatch_tasks t ON t.id = w.task_id
+         WHERE t.project_id = ?1 AND t.card_id IS NOT NULL
+         ORDER BY w.created_at ASC",
+    )?;
+    let rows = stmt.query_map(params![project_id], |row| {
+        Ok(CardShip {
+            card_id: row.get(0)?,
+            task_id: row.get(1)?,
+            branch: row.get(2)?,
+            ship_status: row.get(3)?,
+            pr_url: row.get(4)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// The newest assistant message across every turn of a run — the agent's own account of what
+/// it did, used as the body of the pull request.
+pub fn last_assistant_message_for_run(
+    conn: &Connection,
+    run_id: &str,
+) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT content FROM dispatch_events
+         WHERE run_id = ?1 AND kind = 'assistant_message' AND content != ''
+         ORDER BY sequence DESC LIMIT 1",
+        params![run_id],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+/// The newest run of a task, which is the one a ship notice belongs to.
+pub fn latest_run_for_task(
+    conn: &Connection,
+    task_id: &str,
+) -> rusqlite::Result<Option<DispatchRun>> {
+    let sql = format!(
+        "SELECT {DISPATCH_RUN_COLUMNS} FROM dispatch_runs WHERE task_id = ?1
+         ORDER BY attempt DESC LIMIT 1"
+    );
+    conn.query_row(&sql, params![task_id], row_to_dispatch_run)
+        .optional()
+}
+
+pub fn todo_column_for_project(
+    conn: &Connection,
+    project_id: &str,
+) -> rusqlite::Result<(String, String)> {
+    let board_id = ensure_board_for_project(conn, project_id)?;
+    let column_id = conn.query_row(
+        "SELECT id FROM columns WHERE board_id = ?1 AND role = 'todo'",
+        params![board_id],
+        |row| row.get(0),
+    )?;
+    Ok((board_id, column_id))
+}
+
 // --- Read side (frontend commands) ---
 
 /// Lists projects for display. A project row can exist for a directory Relay noticed but that
@@ -3533,6 +3753,8 @@ mod dispatch_query_tests {
             .unwrap();
         conn.execute_batch(include_str!("../../migrations/0011_session_usage.sql"))
             .unwrap();
+        conn.execute_batch(include_str!("../../migrations/0012_task_workspaces.sql"))
+            .unwrap();
         conn
     }
 
@@ -4013,6 +4235,7 @@ mod session_deletion_tests {
             include_str!("../../migrations/0009_dispatch_chat.sql"),
             include_str!("../../migrations/0010_dispatch_loop.sql"),
             include_str!("../../migrations/0011_session_usage.sql"),
+            include_str!("../../migrations/0012_task_workspaces.sql"),
         ] {
             conn.execute_batch(migration).unwrap();
         }
@@ -4082,5 +4305,146 @@ mod session_deletion_tests {
             )
             .unwrap();
         assert_eq!(run_link, None);
+    }
+}
+
+#[cfg(test)]
+mod task_workspace_tests {
+    use super::*;
+
+    fn in_memory_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        for migration in [
+            include_str!("../../migrations/0001_init.sql"),
+            include_str!("../../migrations/0002_file_diff_content.sql"),
+            include_str!("../../migrations/0003_kanban.sql"),
+            include_str!("../../migrations/0004_session_title.sql"),
+            include_str!("../../migrations/0005_plan.sql"),
+            include_str!("../../migrations/0006_card_pending_launch.sql"),
+            include_str!("../../migrations/0007_dispatch.sql"),
+            include_str!("../../migrations/0008_deleted_sessions.sql"),
+            include_str!("../../migrations/0009_dispatch_chat.sql"),
+            include_str!("../../migrations/0010_dispatch_loop.sql"),
+            include_str!("../../migrations/0011_session_usage.sql"),
+            include_str!("../../migrations/0012_task_workspaces.sql"),
+        ] {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn
+    }
+
+    fn seed(conn: &Connection) -> CreatedDispatch {
+        upsert_project(conn, "p1", "relay", "/work/relay", 1_000).unwrap();
+        let (board_id, todo_id) = todo_column_for_project(conn, "p1").unwrap();
+        let card = create_card(conn, &board_id, &todo_id, "Add dark mode", None).unwrap();
+        let created = create_dispatch_task(
+            conn,
+            "p1",
+            Some(&card.id),
+            "Add dark mode",
+            "Add a dark theme",
+            "claude",
+            "default",
+            None,
+            1_000,
+        )
+        .unwrap();
+        insert_task_workspace(
+            conn,
+            &TaskWorkspace {
+                task_id: created.task.id.clone(),
+                project_path: "/work/relay".into(),
+                repo_root: "/work/relay".into(),
+                worktree_path: "/data/worktrees/relay-abc".into(),
+                work_dir: "/data/worktrees/relay-abc".into(),
+                branch: "relay/add-dark-mode-abc".into(),
+                base_branch: "main".into(),
+                auto_ship: true,
+                ship_status: "pending".into(),
+                ship_error: None,
+                pr_url: None,
+                last_shipped_at: None,
+                removed_at: None,
+                created_at: 1_000,
+            },
+        )
+        .unwrap();
+        created
+    }
+
+    #[test]
+    fn worktree_cwds_map_back_to_the_real_project_path() {
+        let conn = in_memory_db();
+        seed(&conn);
+        let map = |cwd: &str| project_path_for_worktree_cwd(&conn, cwd).unwrap();
+        assert_eq!(
+            map("/data/worktrees/relay-abc").as_deref(),
+            Some("/work/relay")
+        );
+        assert_eq!(
+            map("/data/worktrees/relay-abc/src").as_deref(),
+            Some("/work/relay/src")
+        );
+        // A sibling folder sharing the prefix is not inside the worktree.
+        assert_eq!(map("/data/worktrees/relay-abcdef"), None);
+        assert_eq!(
+            map("/DATA/Worktrees/relay-abc/src").as_deref(),
+            Some("/work/relay/src")
+        );
+        assert_eq!(map("/work/relay"), None);
+    }
+
+    #[test]
+    fn a_ship_can_only_be_claimed_once_until_it_finishes() {
+        let conn = in_memory_db();
+        let created = seed(&conn);
+        let task_id = &created.task.id;
+        assert!(claim_task_ship(&conn, task_id).unwrap());
+        assert!(!claim_task_ship(&conn, task_id).unwrap());
+
+        finish_task_ship(
+            &conn,
+            task_id,
+            "shipped",
+            None,
+            Some("https://gh/pull/1"),
+            2_000,
+        )
+        .unwrap();
+        let shipped = get_task_workspace(&conn, task_id).unwrap().unwrap();
+        assert_eq!(shipped.ship_status, "shipped");
+        assert_eq!(shipped.pr_url.as_deref(), Some("https://gh/pull/1"));
+        assert_eq!(shipped.last_shipped_at, Some(2_000));
+
+        // A later ship that reports no new URL keeps the PR it already has.
+        assert!(claim_task_ship(&conn, task_id).unwrap());
+        finish_task_ship(&conn, task_id, "failed", Some("push rejected"), None, 3_000).unwrap();
+        let failed = get_task_workspace(&conn, task_id).unwrap().unwrap();
+        assert_eq!(failed.pr_url.as_deref(), Some("https://gh/pull/1"));
+        assert_eq!(failed.ship_error.as_deref(), Some("push rejected"));
+        assert_eq!(failed.last_shipped_at, Some(2_000));
+    }
+
+    #[test]
+    fn interrupted_ships_are_released_at_startup() {
+        let conn = in_memory_db();
+        let created = seed(&conn);
+        assert!(claim_task_ship(&conn, &created.task.id).unwrap());
+        reset_interrupted_task_ships(&conn).unwrap();
+        let workspace = get_task_workspace(&conn, &created.task.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(workspace.ship_status, "failed");
+        assert!(claim_task_ship(&conn, &created.task.id).unwrap());
+    }
+
+    #[test]
+    fn card_ships_badge_the_card_their_task_drives() {
+        let conn = in_memory_db();
+        let created = seed(&conn);
+        let ships = list_card_ships(&conn, "p1").unwrap();
+        assert_eq!(ships.len(), 1);
+        assert_eq!(Some(ships[0].card_id.clone()), created.task.card_id);
+        assert_eq!(ships[0].branch, "relay/add-dark-mode-abc");
     }
 }

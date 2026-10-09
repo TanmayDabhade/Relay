@@ -6,11 +6,13 @@ import {
   deleteCard,
   getBoard,
   linkSessionToCard,
+  listCardShips,
   listSessions,
   moveCard,
   updateCard,
 } from "../../lib/tauri";
-import type { Card } from "../../lib/types";
+import type { Card, CardShip } from "../../lib/types";
+import { PlannerModal } from "../assist/PlannerModal";
 import { BoardColumn } from "./BoardColumn";
 import { CardModal } from "./CardModal";
 import { DispatchModal } from "../dispatch/DispatchModal";
@@ -27,6 +29,7 @@ export function ProjectBoard({ projectId }: ProjectBoardProps) {
   const [selectedCardId, setSelectedCardId] = useState<string | null>(null);
   const [dispatchCardId, setDispatchCardId] = useState<string | null>(null);
   const [isAddingColumn, setIsAddingColumn] = useState(false);
+  const [showPlanner, setShowPlanner] = useState(false);
   const [newColumnName, setNewColumnName] = useState("");
 
   const { data: sessions } = useQuery({ queryKey: ["sessions"], queryFn: listSessions });
@@ -35,6 +38,16 @@ export function ProjectBoard({ projectId }: ProjectBoardProps) {
     queryKey: ["board", projectId],
     queryFn: () => getBoard(projectId),
   });
+
+  const { data: ships } = useQuery({
+    queryKey: ["card-ships", projectId],
+    queryFn: () => listCardShips(projectId),
+  });
+  // A card retried as a new task keeps the newest ship (rows arrive oldest first).
+  const shipsByCardId = useMemo(
+    () => new Map<string, CardShip>((ships ?? []).map((ship) => [ship.card_id, ship])),
+    [ships],
+  );
 
   const sessionsById = useMemo(
     () => new Map((sessions ?? []).map((s) => [s.id, s])),
@@ -58,6 +71,11 @@ export function ProjectBoard({ projectId }: ProjectBoardProps) {
 
   return (
     <div className="project-board">
+      <div className="project-board-toolbar">
+        <button className="project-board-plan" onClick={() => setShowPlanner(true)}>
+          ✦ Plan with AI
+        </button>
+      </div>
       <div className="project-board-columns">
         {boardData.columns.map((column) => (
           <BoardColumn
@@ -65,6 +83,7 @@ export function ProjectBoard({ projectId }: ProjectBoardProps) {
             column={column}
             cards={boardData.cards.filter((c) => c.column_id === column.id)}
             sessionsById={sessionsById}
+            shipsByCardId={shipsByCardId}
             onCardClick={(card) => setSelectedCardId(card.id)}
             onCardDrop={(cardId, columnId) => {
               const card = boardData.cards.find((c) => c.id === cardId);
@@ -123,6 +142,7 @@ export function ProjectBoard({ projectId }: ProjectBoardProps) {
       {selectedCard ? (
         <CardModal
           card={selectedCard}
+          projectId={projectId}
           linkableSessions={linkableSessions}
           linkedSession={selectedCard.session_id ? sessionsById.get(selectedCard.session_id) ?? null : null}
           onClose={() => setSelectedCardId(null)}
@@ -138,6 +158,10 @@ export function ProjectBoard({ projectId }: ProjectBoardProps) {
             void linkSessionToCard(selectedCard.id, sessionId);
           }}
         />
+      ) : null}
+
+      {showPlanner ? (
+        <PlannerModal projectId={projectId} onClose={() => setShowPlanner(false)} />
       ) : null}
 
       {dispatchCardId ? (

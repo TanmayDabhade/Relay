@@ -319,3 +319,49 @@ export type DispatchApprovalDecision =
   | "allowed_once"
   | "allowed_for_session"
   | "denied";
+
+export type ShipStatus = "pending" | "shipping" | "shipped" | "no_changes" | "failed";
+
+/** A PR-bound task's isolated git worktree and where its pull request stands. */
+export interface TaskWorkspace {
+  task_id: string;
+  project_path: string;
+  repo_root: string;
+  worktree_path: string;
+  /** Where the agent runs: the worktree plus the project's subdirectory within its repo. */
+  work_dir: string;
+  branch: string;
+  base_branch: string;
+  auto_ship: boolean;
+  ship_status: ShipStatus;
+  ship_error: string | null;
+  pr_url: string | null;
+  last_shipped_at: number | null;
+  /** Set once the worktree folder is cleaned up (the branch and PR remain). */
+  removed_at: number | null;
+  created_at: number;
+}
+
+export interface CardShip {
+  card_id: string;
+  task_id: string;
+  branch: string;
+  ship_status: ShipStatus;
+  pr_url: string | null;
+}
+
+export interface TaskDraft {
+  title: string;
+  prompt: string;
+}
+
+export interface PlannedTask {
+  title: string;
+  prompt: string;
+  rationale: string;
+}
+
+export interface Plan {
+  summary: string;
+  tasks: PlannedTask[];
+}

@@ -1,11 +1,13 @@
 import { useState } from "react";
 import { Modal } from "../ui/Modal";
+import { DraftWithAI } from "../assist/DraftWithAI";
 import { agentMeta } from "../../lib/agents";
 import type { Card, Session } from "../../lib/types";
 import "./CardModal.css";
 
 interface CardModalProps {
   card: Card;
+  projectId: string;
   /** Sessions belonging to this card's project that no other card is linked to yet — the
    * candidate list for "link to session." Empty once every session on the project is spoken
    * for. */
@@ -19,6 +21,7 @@ interface CardModalProps {
 
 export function CardModal({
   card,
+  projectId,
   linkableSessions,
   linkedSession,
   onClose,
@@ -44,9 +47,20 @@ export function CardModal({
           className="card-modal-description"
           value={description}
           onChange={(e) => setDescription(e.target.value)}
-          placeholder="Description (optional)"
-          rows={4}
+          placeholder="Description — this is the prompt the agent gets when the card is dispatched"
+          rows={description.length > 200 ? 10 : 4}
         />
+        {!card.session_id ? (
+          <DraftWithAI
+            projectId={projectId}
+            rough={description || title}
+            currentTitle={title}
+            onDraft={(draft) => {
+              setTitle(draft.title);
+              setDescription(draft.prompt);
+            }}
+          />
+        ) : null}
 
         {linkedSession ? (
           <div className="card-modal-session">

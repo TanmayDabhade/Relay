@@ -2,12 +2,32 @@ import { useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { dispatchTask, listAgentConnections, listProjects } from "../../lib/tauri";
 import type { Card, CreatedDispatch } from "../../lib/types";
+import { DraftWithAI } from "../assist/DraftWithAI";
 import { Button } from "../ui/Button";
 import { Modal } from "../ui/Modal";
 import "./DispatchModal.css";
 
 /** Mirrors `looping::MAX_LOOP_ITERATIONS` in the backend, which rejects anything larger. */
 const MAX_LOOP_ITERATIONS = 50;
+/** Remembers the last "Open PR when done" choice per viewer; a convenience, so failures to
+ * read or write storage just fall back to the default (on). */
+const OPEN_PR_KEY = "relay.dispatch.openPr";
+
+function loadOpenPr(): boolean {
+  try {
+    return localStorage.getItem(OPEN_PR_KEY) !== "false";
+  } catch {
+    return true;
+  }
+}
+
+function saveOpenPr(value: boolean) {
+  try {
+    localStorage.setItem(OPEN_PR_KEY, String(value));
+  } catch {
+    // Storage unavailable; the toggle still works for this dispatch.
+  }
+}
 
 interface DispatchModalProps {
   projectId?: string;
@@ -45,6 +65,7 @@ export function DispatchModal({ projectId, card, onClose, onDispatched }: Dispat
   const [prompt, setPrompt] = useState(card?.description ?? card?.title ?? "");
   const [loopEnabled, setLoopEnabled] = useState(false);
   const [loopMax, setLoopMax] = useState(5);
+  const [openPr, setOpenPr] = useState(loadOpenPr);
   const loopMaxValid = Number.isInteger(loopMax) && loopMax >= 1 && loopMax <= MAX_LOOP_ITERATIONS;
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -63,6 +84,7 @@ export function DispatchModal({ projectId, card, onClose, onDispatched }: Dispat
         agent: selectedConnection.agent,
         model,
         loopMaxIterations: loopEnabled ? loopMax : null,
+        openPr,
       });
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: ["board", selectedProjectId] }),
@@ -114,12 +136,23 @@ export function DispatchModal({ projectId, card, onClose, onDispatched }: Dispat
         </label>
 
         <label className="dispatch-field">
-          <span>Instructions</span>
+          <span className="dispatch-field-label-row">
+            Instructions
+            <DraftWithAI
+              projectId={selectedProjectId}
+              rough={prompt || title}
+              currentTitle={title}
+              onDraft={(draft) => {
+                setTitle(draft.title);
+                setPrompt(draft.prompt);
+              }}
+            />
+          </span>
           <textarea
             value={prompt}
             onChange={(event) => setPrompt(event.target.value)}
-            rows={7}
-            placeholder="Describe the outcome you want the agent to produce…"
+            rows={9}
+            placeholder="Describe the outcome you want, then optionally let ✦ Draft with AI make it precise…"
           />
         </label>
 
@@ -160,6 +193,28 @@ export function DispatchModal({ projectId, card, onClose, onDispatched }: Dispat
             </label>
           </div>
         ) : null}
+
+        <div className="dispatch-loop">
+          <label className="dispatch-loop-toggle">
+            <input
+              type="checkbox"
+              checked={openPr}
+              onChange={(event) => {
+                setOpenPr(event.target.checked);
+                saveOpenPr(event.target.checked);
+              }}
+            />
+            <span>
+              <strong>Open a PR when done</strong>
+              <small>
+                The agent works on its own <code>relay/…</code> branch in a separate git worktree,
+                so your checkout and other runs aren't touched. When it finishes, Relay commits,
+                pushes, and opens a pull request with <code>gh</code>. It starts from your last
+                commit; uncommitted local edits aren't included.
+              </small>
+            </span>
+          </label>
+        </div>
 
         <div className="dispatch-loop">
           <label className="dispatch-loop-toggle">

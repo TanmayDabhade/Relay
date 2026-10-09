@@ -37,7 +37,7 @@ cargo test --lib db::queries                 # tests in one module
 cargo check                                  # fast type-check without building
 ```
 
-Rust test coverage lives inline as `#[cfg(test)] mod tests` in: `commands.rs`, `tags.rs`, `watcher/tail.rs`, `cost/pricing.rs`, `activity.rs`, `db/queries.rs`, `summarize/prompts.rs`, and each `parser/*.rs` file. Fixtures for parser tests are under `src-tauri/tests/fixtures/`.
+Rust test coverage lives inline as `#[cfg(test)] mod tests` in: `commands.rs`, `tags.rs`, `ship/git.rs` (drives a real throwaway local git repo, no network), `assist/`, `watcher/tail.rs`, `cost/pricing.rs`, `activity.rs`, `db/queries.rs`, `summarize/prompts.rs`, and each `parser/*.rs` file. Fixtures for parser tests are under `src-tauri/tests/fixtures/`.
 
 There is no JS/TS test runner configured — verification for frontend changes is `tsc -b` (typecheck only; do not run the full `npm run build` or `npm run tauri dev` yourself, see "Agent operating rules" above) plus asking the user to exercise it manually.
 
@@ -71,6 +71,14 @@ A tokio interval (every `SWEEP_INTERVAL_SECS`) finalizes sessions idle longer th
 ### Terminal attach (macOS only, `src-tauri/src/terminal.rs`)
 
 `launch_or_attach_session` drives Terminal.app via AppleScript (`resources/attach_session.applescript`) to find an existing `claude` tab for a card's project and paste its prompt in, or open a new window. The prompt is delivered via clipboard paste (not simulated keystrokes) because a typed multi-line prompt would submit early at the first newline in Claude Code's interactive input. Requires macOS Accessibility + Automation permissions.
+
+### Shipping dispatched tasks as PRs (`src-tauri/src/ship/`)
+
+A task dispatched with "Open a PR when done" (`dispatch_task`'s `open_pr`) runs in its own `git worktree` under `<app_data_dir>/worktrees/` on a `relay/<slug>-<id>` branch, recorded in `task_workspaces` (migration 0012). Every turn, follow-up, and retry of that task uses the worktree's `work_dir` as cwd, never the project checkout. When a non-looping turn completes, or a loop reports done (`commands::continue_dispatch_loop`), `ship::spawn_ship` commits what the agent left, pushes, and runs `gh pr create`. Later turns push onto the same branch, which updates the same PR. Shipping follows the same gather/compute/write lock discipline as the idle sweep. Ingest maps any session cwd inside a worktree back to the real project (`queries::project_path_for_worktree_cwd`), so worktrees never appear as projects. Shutting a conversation down removes a clean worktree (`ship::spawn_cleanup`), and a retry recreates it on the same branch.
+
+### Planner & task-draft assistants (`src-tauri/src/assist/`)
+
+`plan_tasks` / `draft_task` run the user's local `claude` CLI once, headless and read-only (`--tools Read,Glob,Grep`), in the project folder, and return `--json-schema` structured output. `--no-session-persistence` keeps the call from writing a session log the watcher would ingest. `--safe-mode --strict-mcp-config` skips user plugins and MCP servers; on a heavily customized install that measured about 300× cheaper. Planned tasks become Todo cards via `create_planned_cards`, and the card description is the prompt a dispatch sends.
 
 ### Reports
 

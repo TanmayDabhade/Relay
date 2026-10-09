@@ -137,3 +137,10 @@
 .dispatch-loop-max {
   flex: 0 0 9rem;
 }
+
+.dispatch-field-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}

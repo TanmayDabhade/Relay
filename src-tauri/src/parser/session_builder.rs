@@ -49,6 +49,9 @@ pub fn ingest_record(
     let Some(cwd) = record.cwd.clone() else {
         return Ok(outcome);
     };
+    // A PR-bound dispatched task runs in a git worktree under Relay's data dir; its session
+    // belongs to the real project, not to a phantom project named after the worktree folder.
+    let cwd = queries::project_path_for_worktree_cwd(conn, &cwd)?.unwrap_or(cwd);
     // No timestamp means we can't place this in time (real logs have such lines, e.g.
     // some records preceding the first user/attachment record) — skip persisting.
     let Some(timestamp) = record.timestamp else {
@@ -309,6 +312,8 @@ mod tests {
         conn.execute_batch(include_str!("../../migrations/0010_dispatch_loop.sql"))
             .unwrap();
         conn.execute_batch(include_str!("../../migrations/0011_session_usage.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../../migrations/0012_task_workspaces.sql"))
             .unwrap();
         conn
     }
@@ -619,6 +624,47 @@ mod tests {
             text: Some("hello".to_string()),
             ai_title: None,
         }
+    }
+
+    #[test]
+    fn sessions_in_a_task_worktree_belong_to_the_real_project() {
+        let conn = in_memory_db();
+        let real_id = project_id_for_path("/work/app");
+        queries::upsert_project(&conn, &real_id, "app", "/work/app", 1).unwrap();
+        let created = queries::create_dispatch_task(
+            &conn, &real_id, None, "t", "p", "claude", "default", None, 1,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO task_workspaces (task_id, project_path, repo_root, worktree_path,
+               work_dir, branch, base_branch, created_at)
+             VALUES (?1, '/work/app', '/work/app', '/data/wt/app-1', '/data/wt/app-1',
+               'relay/t-1', 'main', 1)",
+            rusqlite::params![created.task.id],
+        )
+        .unwrap();
+
+        let outcome = ingest_record(
+            &conn,
+            RAW_LOG_PATH,
+            synthetic_record("/data/wt/app-1", "wt-session", 1_700_000_000),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.project_touched,
+            Some(project_id_for_path("/work/app"))
+        );
+        let paths: Vec<String> = conn
+            .prepare("SELECT path FROM projects")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            !paths.iter().any(|p| p.starts_with("/data/wt")),
+            "a worktree must never become its own project: {paths:?}"
+        );
     }
 
     #[test]

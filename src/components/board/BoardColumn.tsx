@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { BoardColumn as BoardColumnType, Card, Session } from "../../lib/types";
+import type { BoardColumn as BoardColumnType, Card, CardShip, Session } from "../../lib/types";
 import { CardTile } from "./CardTile";
 import "./BoardColumn.css";
 
@@ -7,6 +7,7 @@ interface BoardColumnProps {
   column: BoardColumnType;
   cards: Card[];
   sessionsById: Map<string, Session>;
+  shipsByCardId?: Map<string, CardShip>;
   onCardClick: (card: Card) => void;
   onCardDrop: (cardId: string, columnId: string) => void;
   onAddCard: (columnId: string, title: string) => void;
@@ -19,7 +20,15 @@ function allowsManualAdd(role: string | null): boolean {
   return role === null || role === "todo";
 }
 
-export function BoardColumn({ column, cards, sessionsById, onCardClick, onCardDrop, onAddCard }: BoardColumnProps) {
+export function BoardColumn({
+  column,
+  cards,
+  sessionsById,
+  shipsByCardId,
+  onCardClick,
+  onCardDrop,
+  onAddCard,
+}: BoardColumnProps) {
   const [isDragOver, setIsDragOver] = useState(false);
   const [isAdding, setIsAdding] = useState(false);
   const [newTitle, setNewTitle] = useState("");
@@ -60,6 +69,7 @@ export function BoardColumn({ column, cards, sessionsById, onCardClick, onCardDr
             key={card.id}
             card={card}
             linkedSession={card.session_id ? sessionsById.get(card.session_id) ?? null : null}
+            ship={shipsByCardId?.get(card.id) ?? null}
             onClick={() => onCardClick(card)}
             onDragStart={() => {}}
           />

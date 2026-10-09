@@ -11,11 +11,15 @@ import type {
   DispatchConversation,
   DispatchTaskWithRun,
   FileDiff,
+  CardShip,
   GitInsights,
+  Plan,
   ProjectSummary,
   ReportData,
   Session,
   SessionDetail,
+  TaskDraft,
+  TaskWorkspace,
 } from "./types";
 
 export function listProjects(): Promise<ProjectSummary[]> {
@@ -152,11 +156,14 @@ export function dispatchTask(request: {
   model: string;
   /** Loop until the agent reports done, up to this many continuations; omit for one turn. */
   loopMaxIterations?: number | null;
+  /** Run in an isolated git worktree and commit, push, and open a PR when the task finishes. */
+  openPr?: boolean;
 }): Promise<CreatedDispatch> {
   return invoke("dispatch_task", {
     ...request,
     cardId: request.cardId ?? null,
     loopMaxIterations: request.loopMaxIterations ?? null,
+    openPr: request.openPr ?? false,
   });
 }
 
@@ -202,4 +209,42 @@ export function resolveDispatchApproval(
 
 export function shutdownDispatchConversation(runId: string): Promise<void> {
   return invoke("shutdown_dispatch_conversation", { runId });
+}
+
+export function getTaskWorkspace(taskId: string): Promise<TaskWorkspace | null> {
+  return invoke("get_task_workspace", { taskId });
+}
+
+export function listCardShips(projectId: string): Promise<CardShip[]> {
+  return invoke("list_card_ships", { projectId });
+}
+
+/** Commits, pushes, and opens (or updates) the task's PR now. Resolves once the ship has
+ * started; the outcome arrives as a `data-changed` event and a notice in the conversation. */
+export function shipTask(taskId: string): Promise<void> {
+  return invoke("ship_task", { taskId });
+}
+
+/** Turns a rough note into a precise agent task by running the local claude CLI read-only in
+ * the project. Takes tens of seconds. */
+export function draftTask(
+  projectId: string,
+  rough: string,
+  currentTitle?: string,
+): Promise<TaskDraft> {
+  return invoke("draft_task", { projectId, rough, currentTitle: currentTitle ?? null });
+}
+
+/** Breaks a goal into ordered, dispatchable tasks after reading the project. Takes a minute
+ * or more on larger repos. */
+export function planTasks(projectId: string, goal: string): Promise<Plan> {
+  return invoke("plan_tasks", { projectId, goal });
+}
+
+/** Adds approved plan tasks to the project's Todo column, in order. */
+export function createPlannedCards(
+  projectId: string,
+  tasks: { title: string; prompt: string }[],
+): Promise<Card[]> {
+  return invoke("create_planned_cards", { projectId, tasks });
 }

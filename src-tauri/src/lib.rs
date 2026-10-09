@@ -1,9 +1,11 @@
 mod activity;
+mod assist;
 mod commands;
 mod cost;
 mod db;
 mod dispatch;
 mod parser;
+mod ship;
 mod summarize;
 mod tags;
 mod terminal;
@@ -43,6 +45,10 @@ pub fn run() {
         db::queries::mark_incomplete_dispatch_runs_interrupted(&conn, chrono::Utc::now().timestamp())
       {
         log::warn!("failed to mark prior dispatched runs interrupted: {error:#}");
+      }
+      // Same reasoning for a git push/PR that was in flight when Relay exited.
+      if let Err(error) = db::queries::reset_interrupted_task_ships(&conn) {
+        log::warn!("failed to reset interrupted task ships: {error:#}");
       }
       app.manage(db::Db(Mutex::new(conn)));
       app.manage(dispatch::Runtime::default());
@@ -108,6 +114,12 @@ pub fn run() {
       commands::interrupt_dispatch_turn,
       commands::resolve_dispatch_approval,
       commands::shutdown_dispatch_conversation,
+      commands::get_task_workspace,
+      commands::list_card_ships,
+      commands::ship_task,
+      commands::draft_task,
+      commands::plan_tasks,
+      commands::create_planned_cards,
       commands::open_url,
     ])
     .run(tauri::generate_context!())

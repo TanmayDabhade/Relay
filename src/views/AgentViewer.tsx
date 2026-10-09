@@ -15,6 +15,7 @@ import type { DispatchRun, DispatchStatus } from "../lib/types";
 import { Button } from "../components/ui/Button";
 import { DispatchModal } from "../components/dispatch/DispatchModal";
 import { RunChat } from "../components/dispatch/RunChat";
+import { ShipPanel } from "../components/dispatch/ShipPanel";
 import "./AgentViewer.css";
 
 const TURN_IN_FLIGHT_STATUSES: DispatchStatus[] = [
@@ -387,6 +388,8 @@ export function AgentViewer({
                   </span>
                 ) : null}
               </div>
+
+              <ShipPanel taskId={selectedEntry.id} busy={hasActiveTurn} />
 
               <div className="run-console">
                 <RunChat runId={selectedRun.id} active={hasActiveTurn} />

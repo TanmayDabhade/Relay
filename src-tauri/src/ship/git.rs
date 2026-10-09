@@ -67,6 +67,19 @@ fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
     run("git", dir, args)
 }
 
+/// Runs a git command with every hook disabled. Used for the commit and push Relay makes on
+/// the agent's behalf: hooks can live in tracked files the agent can edit (husky's `.husky/`,
+/// or any `core.hooksPath` inside the repo), so running them would execute agent-written code
+/// with the user's full privileges, outside the approval prompts that gate the agent's own
+/// commands. `core.hooksPath=/dev/null` covers every hook; `--no-verify` is belt-and-braces
+/// for pre-commit/commit-msg/pre-push. The repo's checks still run in CI on the PR.
+fn git_without_hooks(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
+    let mut full = vec!["-c", "core.hooksPath=/dev/null"];
+    full.extend_from_slice(args);
+    full.push("--no-verify");
+    run("git", dir, &full)
+}
+
 fn gh(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
     run("gh", dir, args)
 }
@@ -313,7 +326,7 @@ pub fn commit_all(worktree: &Path, message: &str) -> anyhow::Result<bool> {
         return Ok(false);
     }
     git(worktree, &["add", "-A"])?;
-    git(worktree, &["commit", "-m", message])?;
+    git_without_hooks(worktree, &["commit", "-m", message])?;
     Ok(true)
 }
 
@@ -346,7 +359,7 @@ pub fn ship(workspace: &TaskWorkspace, context: &ShipContext) -> anyhow::Result<
         remotes.lines().any(|r| r.trim() == "origin"),
         "the repository has no `origin` remote to push to"
     );
-    git(worktree, &["push", "-u", "origin", &workspace.branch])?;
+    git_without_hooks(worktree, &["push", "-u", "origin", &workspace.branch])?;
 
     if workspace.pr_url.is_some() {
         return Ok(ShipOutcome {
@@ -552,10 +565,32 @@ mod tests {
         assert!(!commit_all(worktree, "nothing").unwrap());
         assert_eq!(commits_ahead(worktree, "main").unwrap(), 0);
 
+        // A tracked hooks dir (husky-style) the agent could have edited: Relay's commit must
+        // not run it. The hook would both fail the commit and leave a marker file.
+        let hooks = Path::new(&ws.worktree_path).join(".githooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let marker = base.join("hook-ran");
+        let hook = hooks.join("pre-commit");
+        std::fs::write(
+            &hook,
+            format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        g(worktree, &["config", "core.hooksPath", ".githooks"]);
+
         std::fs::write(Path::new(&ws.work_dir).join("hello.txt"), "hello\n").unwrap();
         // Dirty worktrees are never removed.
         assert!(!remove_worktree(&ws).unwrap());
         assert!(commit_all(worktree, "feat: add a greeting").unwrap());
+        assert!(
+            !marker.exists(),
+            "Relay's commit must never run repository hooks"
+        );
         assert_eq!(commits_ahead(worktree, "main").unwrap(), 1);
         // The main checkout is untouched.
         assert!(!project.join("hello.txt").exists());

@@ -248,3 +248,15 @@ export function createPlannedCards(
 ): Promise<Card[]> {
   return invoke("create_planned_cards", { projectId, tasks });
 }
+
+/** Clones a GitHub repo (a URL or `owner/name`) with `gh` and registers it as a project.
+ * Rejects with a readable message if gh is missing, unauthenticated, or can't reach the repo. */
+export function cloneProject(repo: string): Promise<ProjectSummary> {
+  return invoke("clone_project", { repo });
+}
+
+/** Registers an existing local checkout as a project. The folder must be a git repo whose
+ * GitHub remote gh can access. */
+export function addExistingProject(path: string): Promise<ProjectSummary> {
+  return invoke("add_existing_project", { path });
+}

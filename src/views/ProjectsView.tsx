@@ -1,5 +1,7 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { AddProjectModal } from "../components/projects/AddProjectModal";
+import { Button } from "../components/ui/Button";
 import { listProjects } from "../lib/tauri";
 import { ProjectCard } from "./ProjectCard";
 import { ProjectDetail } from "./ProjectDetail";
@@ -7,11 +9,22 @@ import "./ProjectsView.css";
 
 export function ProjectsView() {
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
+  const [isAdding, setIsAdding] = useState(false);
 
   const { data, isLoading, isError } = useQuery({
     queryKey: ["projects"],
     queryFn: listProjects,
   });
+
+  const addModal = isAdding ? (
+    <AddProjectModal
+      onClose={() => setIsAdding(false)}
+      onAdded={(project) => {
+        setIsAdding(false);
+        setSelectedProjectId(project.id);
+      }}
+    />
+  ) : null;
 
   if (isLoading) {
     return <p className="projects-view-status">Loading projects…</p>;
@@ -27,10 +40,14 @@ export function ProjectsView() {
 
   if (!data || data.length === 0) {
     return (
-      <p className="projects-view-status">
-        No projects yet — start a Claude Code session in any repo and it will
-        appear here.
-      </p>
+      <div className="projects-view-empty">
+        <p className="projects-view-status">
+          No projects yet. A project is a GitHub repo you can reach with <code>gh</code>: clone
+          one from a link, or add a folder you've already checked out.
+        </p>
+        <Button onClick={() => setIsAdding(true)}>Add project</Button>
+        {addModal}
+      </div>
     );
   }
 
@@ -49,6 +66,9 @@ export function ProjectsView() {
 
   return (
     <>
+      <div className="projects-view-header">
+        <Button onClick={() => setIsAdding(true)}>Add project</Button>
+      </div>
       <div className="projects-view-grid">
         {data.map((project) => (
           <ProjectCard
@@ -58,6 +78,7 @@ export function ProjectsView() {
           />
         ))}
       </div>
+      {addModal}
     </>
   );
 }

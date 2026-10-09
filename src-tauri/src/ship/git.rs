@@ -53,6 +53,14 @@ fn run(program: &str, dir: &Path, args: &[&str]) -> anyhow::Result<String> {
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GH_PROMPT_DISABLED", "1")
         .env("NO_COLOR", "1")
+        // Environment-scope config outranks every config file, and is inherited by the git
+        // processes `gh` spawns. Both keys execute arbitrary commands and can be pointed at
+        // agent-written files, so they are off for everything Relay runs (see `worktree_git`).
+        .env("GIT_CONFIG_COUNT", "2")
+        .env("GIT_CONFIG_KEY_0", "core.fsmonitor")
+        .env("GIT_CONFIG_VALUE_0", "false")
+        .env("GIT_CONFIG_KEY_1", "core.hooksPath")
+        .env("GIT_CONFIG_VALUE_1", "/dev/null")
         .output()?;
     if output.status.success() {
         return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
@@ -67,17 +75,58 @@ fn git(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
     run("git", dir, args)
 }
 
-/// Runs a git command with every hook disabled. Used for the commit and push Relay makes on
-/// the agent's behalf: hooks can live in tracked files the agent can edit (husky's `.husky/`,
-/// or any `core.hooksPath` inside the repo), so running them would execute agent-written code
-/// with the user's full privileges, outside the approval prompts that gate the agent's own
-/// commands. `core.hooksPath=/dev/null` covers every hook; `--no-verify` is belt-and-braces
-/// for pre-commit/commit-msg/pre-push. The repo's checks still run in CI on the PR.
-fn git_without_hooks(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
-    let mut full = vec!["-c", "core.hooksPath=/dev/null"];
+/// The worktree's admin directory (`<common>/worktrees/<name>`), found through git's own
+/// registry in the main repository rather than the worktree's `.git` file. That file sits
+/// inside the agent's working folder, so an agent could repoint it at a repository it made up
+/// whose config runs commands (`core.fsmonitor`, `core.sshCommand`, filter drivers…). The
+/// registry lives in the user's checkout's `.git`, outside anything the agent works in.
+fn trusted_git_dir(workspace: &TaskWorkspace) -> anyhow::Result<PathBuf> {
+    let common = git(
+        Path::new(&workspace.repo_root),
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    let worktree = Path::new(&workspace.worktree_path).canonicalize()?;
+    for entry in std::fs::read_dir(Path::new(&common).join("worktrees"))? {
+        let admin = entry?.path();
+        // `gitdir` records the absolute path of the worktree's `.git` file. Compare its parent
+        // (the worktree folder) rather than resolving the agent-writable `.git` entry itself.
+        let Ok(recorded) = std::fs::read_to_string(admin.join("gitdir")) else {
+            continue;
+        };
+        let recorded_worktree = Path::new(recorded.trim()).parent().map(Path::canonicalize);
+        if let Some(Ok(recorded_worktree)) = recorded_worktree {
+            if recorded_worktree == worktree {
+                return Ok(admin);
+            }
+        }
+    }
+    anyhow::bail!(
+        "git has no record of the worktree at {}; it may have been moved or tampered with",
+        workspace.worktree_path
+    )
+}
+
+/// Runs git inside a task's worktree with the repository pinned to `trusted_git_dir`, so
+/// nothing the agent wrote in its folder decides which repository or config git uses.
+fn worktree_git(workspace: &TaskWorkspace, args: &[&str]) -> anyhow::Result<String> {
+    let git_dir = trusted_git_dir(workspace)?;
+    let git_dir_arg = format!("--git-dir={}", git_dir.display());
+    let work_tree_arg = format!("--work-tree={}", workspace.worktree_path);
+    let mut full = vec![git_dir_arg.as_str(), work_tree_arg.as_str()];
     full.extend_from_slice(args);
+    run("git", Path::new(&workspace.worktree_path), &full)
+}
+
+/// `worktree_git` for the commit and push Relay makes on the agent's behalf, with hooks off:
+/// hooks can live in tracked files the agent can edit (husky's `.husky/`, or any
+/// `core.hooksPath` inside the repo), so running them would execute agent-written code with
+/// the user's full privileges, outside the approval prompts that gate the agent's own
+/// commands. `run` already forces `core.hooksPath=/dev/null`; `--no-verify` is belt-and-braces.
+/// The repo's checks still run in CI on the PR.
+fn worktree_git_without_hooks(workspace: &TaskWorkspace, args: &[&str]) -> anyhow::Result<String> {
+    let mut full = args.to_vec();
     full.push("--no-verify");
-    run("git", dir, &full)
+    worktree_git(workspace, &full)
 }
 
 fn gh(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
@@ -248,18 +297,13 @@ pub fn prepare_workspace(
             anyhow::anyhow!("the project checkout is on a detached HEAD; check out a branch first")
         })?;
 
-    // `--show-toplevel` returns a resolved path; canonicalize the project path the same way
-    // so a symlinked project folder still yields the right relative subdirectory.
-    let canonical_project = project
-        .canonicalize()
-        .unwrap_or_else(|_| project.to_path_buf());
-    let canonical_root = repo_root
-        .canonicalize()
-        .unwrap_or_else(|_| repo_root.clone());
-    let relative = canonical_project
-        .strip_prefix(&canonical_root)
-        .map(Path::to_path_buf)
-        .unwrap_or_default();
+    // The project's subdirectory within its repo, as git itself sees it. Comparing path
+    // strings instead breaks on symlinks and on macOS's case-insensitive paths, and a silent
+    // fallback to the repo root would run the agent in the wrong folder.
+    // `--show-prefix` ends in `/` ("web/"); trimmed so `work_dir` never carries a trailing
+    // slash, which would defeat the exact-match cwd mapping at ingest.
+    let prefix = git(project, &["rev-parse", "--show-prefix"])?;
+    let relative = PathBuf::from(prefix.trim_end_matches('/'));
 
     let repo_name = repo_root
         .file_name()
@@ -316,23 +360,23 @@ pub fn ensure_worktree(workspace: &TaskWorkspace) -> anyhow::Result<bool> {
     Ok(true)
 }
 
-fn is_dirty(dir: &Path) -> anyhow::Result<bool> {
-    Ok(!git(dir, &["status", "--porcelain"])?.is_empty())
+fn is_dirty(workspace: &TaskWorkspace) -> anyhow::Result<bool> {
+    Ok(!worktree_git(workspace, &["status", "--porcelain"])?.is_empty())
 }
 
 /// Commits whatever the agent left uncommitted. Returns whether a commit was made.
-pub fn commit_all(worktree: &Path, message: &str) -> anyhow::Result<bool> {
-    if !is_dirty(worktree)? {
+pub fn commit_all(workspace: &TaskWorkspace, message: &str) -> anyhow::Result<bool> {
+    if !is_dirty(workspace)? {
         return Ok(false);
     }
-    git(worktree, &["add", "-A"])?;
-    git_without_hooks(worktree, &["commit", "-m", message])?;
+    worktree_git(workspace, &["add", "-A"])?;
+    worktree_git_without_hooks(workspace, &["commit", "-m", message])?;
     Ok(true)
 }
 
-pub fn commits_ahead(worktree: &Path, base: &str) -> anyhow::Result<i64> {
-    let range = format!("{base}..HEAD");
-    let count = git(worktree, &["rev-list", "--count", &range])?;
+pub fn commits_ahead(workspace: &TaskWorkspace) -> anyhow::Result<i64> {
+    let range = format!("{}..HEAD", workspace.base_branch);
+    let count = worktree_git(workspace, &["rev-list", "--count", &range])?;
     Ok(count.parse().unwrap_or(0))
 }
 
@@ -345,8 +389,8 @@ pub fn ship(workspace: &TaskWorkspace, context: &ShipContext) -> anyhow::Result<
         "the task's worktree at {} no longer exists",
         workspace.worktree_path
     );
-    let committed = commit_all(worktree, &commit_message(context))?;
-    if commits_ahead(worktree, &workspace.base_branch)? == 0 {
+    let committed = commit_all(workspace, &commit_message(context))?;
+    if commits_ahead(workspace)? == 0 {
         return Ok(ShipOutcome {
             status: ShipStatus::NoChanges,
             pr_url: workspace.pr_url.clone(),
@@ -354,12 +398,12 @@ pub fn ship(workspace: &TaskWorkspace, context: &ShipContext) -> anyhow::Result<
         });
     }
 
-    let remotes = git(worktree, &["remote"])?;
+    let remotes = worktree_git(workspace, &["remote"])?;
     anyhow::ensure!(
         remotes.lines().any(|r| r.trim() == "origin"),
         "the repository has no `origin` remote to push to"
     );
-    git_without_hooks(worktree, &["push", "-u", "origin", &workspace.branch])?;
+    worktree_git_without_hooks(workspace, &["push", "-u", "origin", &workspace.branch])?;
 
     if workspace.pr_url.is_some() {
         return Ok(ShipOutcome {
@@ -370,8 +414,12 @@ pub fn ship(workspace: &TaskWorkspace, context: &ShipContext) -> anyhow::Result<
     }
     let title = conventional_title(context.title, context.prompt);
     let body = pr_body(context, &workspace.branch);
+    // gh runs git internally to find the repo; run it from the user's own checkout (same
+    // repository, same remotes) rather than the agent's folder. `--head` names the branch, so
+    // gh never needs the worktree.
+    let repo_root = Path::new(&workspace.repo_root);
     let created = gh(
-        worktree,
+        repo_root,
         &[
             "pr",
             "create",
@@ -390,7 +438,7 @@ pub fn ship(workspace: &TaskWorkspace, context: &ShipContext) -> anyhow::Result<
         // Most often "a pull request already exists" (opened by hand, or a previous ship that
         // pushed but crashed before recording the URL) — adopt it rather than failing.
         Err(create_error) => match gh(
-            worktree,
+            repo_root,
             &[
                 "pr",
                 "view",
@@ -420,7 +468,7 @@ pub fn remove_worktree(workspace: &TaskWorkspace) -> anyhow::Result<bool> {
     if !worktree.is_dir() {
         return Ok(true);
     }
-    if is_dirty(worktree)? {
+    if is_dirty(workspace)? {
         return Ok(false);
     }
     git(
@@ -562,8 +610,8 @@ mod tests {
         assert!(Path::new(&ws.work_dir).join("README.md").is_file());
 
         let worktree = Path::new(&ws.worktree_path);
-        assert!(!commit_all(worktree, "nothing").unwrap());
-        assert_eq!(commits_ahead(worktree, "main").unwrap(), 0);
+        assert!(!commit_all(&ws, "nothing").unwrap());
+        assert_eq!(commits_ahead(&ws).unwrap(), 0);
 
         // A tracked hooks dir (husky-style) the agent could have edited: Relay's commit must
         // not run it. The hook would both fail the commit and leave a marker file.
@@ -586,12 +634,45 @@ mod tests {
         std::fs::write(Path::new(&ws.work_dir).join("hello.txt"), "hello\n").unwrap();
         // Dirty worktrees are never removed.
         assert!(!remove_worktree(&ws).unwrap());
-        assert!(commit_all(worktree, "feat: add a greeting").unwrap());
+        // The agent repoints the worktree's `.git` file at a repository it made up, whose
+        // config runs a command on `git status`. Relay must keep using the real repository.
+        let fake = base.join("fake");
+        std::fs::create_dir_all(&fake).unwrap();
+        g(&fake, &["init", "-q"]);
+        let fsmonitor_marker = base.join("fsmonitor-ran");
+        g(
+            &fake,
+            &[
+                "config",
+                "core.fsmonitor",
+                &format!("touch '{}'", fsmonitor_marker.display()),
+            ],
+        );
+        let dot_git = worktree.join(".git");
+        let real_dot_git = std::fs::read_to_string(&dot_git).unwrap();
+        std::fs::write(
+            &dot_git,
+            format!("gitdir: {}\n", fake.join(".git").display()),
+        )
+        .unwrap();
+
+        assert!(commit_all(&ws, "feat: add a greeting").unwrap());
+        assert!(
+            !fsmonitor_marker.exists(),
+            "Relay must never use a repository the agent pointed .git at"
+        );
+        // The commit landed on the task's real branch, not in the fake repo.
+        let log = g(
+            Path::new(&ws.repo_root),
+            &["log", "-1", "--format=%s", &ws.branch],
+        );
+        assert_eq!(log, "feat: add a greeting");
+        std::fs::write(&dot_git, real_dot_git).unwrap();
         assert!(
             !marker.exists(),
             "Relay's commit must never run repository hooks"
         );
-        assert_eq!(commits_ahead(worktree, "main").unwrap(), 1);
+        assert_eq!(commits_ahead(&ws).unwrap(), 1);
         // The main checkout is untouched.
         assert!(!project.join("hello.txt").exists());
 

@@ -1611,7 +1611,9 @@ pub fn get_task_workspace(
 
 /// Maps a session cwd that lies inside a task worktree back to the real project path, keeping
 /// any subdirectory suffix. `None` for every ordinary cwd. Compares by prefix + `/` rather than
-/// `LIKE` so `%`/`_` in a path can't act as wildcards.
+/// `LIKE` so `%`/`_` in a path can't act as wildcards, and case-insensitively to match
+/// `project_id_for_path` (macOS paths are case-insensitive). SQLite's `lower()` only folds
+/// ASCII, so byte lengths are unchanged and the suffix slice below stays on the same boundary.
 pub fn project_path_for_worktree_cwd(
     conn: &Connection,
     cwd: &str,
@@ -1619,7 +1621,8 @@ pub fn project_path_for_worktree_cwd(
     let found: Option<(String, String)> = conn
         .query_row(
             "SELECT work_dir, project_path FROM task_workspaces
-             WHERE ?1 = work_dir OR substr(?1, 1, length(work_dir) + 1) = work_dir || '/'
+             WHERE lower(?1) = lower(work_dir)
+                OR lower(substr(?1, 1, length(work_dir) + 1)) = lower(work_dir || '/')
              ORDER BY length(work_dir) DESC LIMIT 1",
             params![cwd],
             |row| Ok((row.get(0)?, row.get(1)?)),
@@ -4384,6 +4387,10 @@ mod task_workspace_tests {
         );
         // A sibling folder sharing the prefix is not inside the worktree.
         assert_eq!(map("/data/worktrees/relay-abcdef"), None);
+        assert_eq!(
+            map("/DATA/Worktrees/relay-abc/src").as_deref(),
+            Some("/work/relay/src")
+        );
         assert_eq!(map("/work/relay"), None);
     }
 

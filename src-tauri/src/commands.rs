@@ -38,7 +38,11 @@ pub async fn clone_project(
          https://github.com/owner/name or just owner/name"
             .to_string()
     })?;
-    let parent = match parent_dir.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+    let parent = match parent_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
         Some(custom) => {
             let custom = std::path::PathBuf::from(custom);
             if !custom.is_absolute() || !custom.is_dir() {
@@ -109,7 +113,8 @@ pub async fn add_existing_project(
 fn verified_github_repo(folder: &std::path::Path) -> anyhow::Result<String> {
     match ship::git::check_folder_github(folder) {
         ship::git::GithubCheck::Verified(repo) => Ok(repo),
-        ship::git::GithubCheck::NotGithub(reason) | ship::git::GithubCheck::Inconclusive(reason) => {
+        ship::git::GithubCheck::NotGithub(reason)
+        | ship::git::GithubCheck::Inconclusive(reason) => {
             anyhow::bail!(
                 "{} can't be added as a project: {reason}. Relay only lists GitHub repositories \
                  your `gh` can access (check `gh auth status`).",
@@ -410,8 +415,8 @@ pub fn dashboard_stats(
         .expect("midnight is always a valid time")
         .and_utc()
         .timestamp();
-    let counts_by_day =
-        queries::daily_activity_counts(&conn, since_epoch, project_id).map_err(|e| e.to_string())?;
+    let counts_by_day = queries::daily_activity_counts(&conn, since_epoch, project_id)
+        .map_err(|e| e.to_string())?;
 
     let daily_activity = dense_daily_activity(window_start, today, &counts_by_day);
 
@@ -483,8 +488,7 @@ fn build_report(
         totals: queries::report_totals(conn, since_epoch, project_id).map_err(|e| e.to_string())?,
         by_project: queries::report_by_project(conn, since_epoch, project_id)
             .map_err(|e| e.to_string())?,
-        by_tag: queries::report_by_tag(conn, since_epoch, project_id)
-            .map_err(|e| e.to_string())?,
+        by_tag: queries::report_by_tag(conn, since_epoch, project_id).map_err(|e| e.to_string())?,
         by_agent: queries::agent_usage_since(conn, since_epoch, project_id)
             .map_err(|e| e.to_string())?,
     })

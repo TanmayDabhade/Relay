@@ -631,22 +631,25 @@ pub fn check_folder_github(folder: &Path) -> GithubCheck {
     let neutral = std::env::temp_dir();
     let mut inconclusive = None;
     for candidate in &candidates {
-        match gh(&neutral, &["repo", "view", candidate, "--json", "nameWithOwner"]) {
+        match gh(
+            &neutral,
+            &["repo", "view", candidate, "--json", "nameWithOwner"],
+        ) {
             Ok(stdout) => match parse_repo_view_json(&stdout) {
                 Some(repo) => return GithubCheck::Verified(repo),
                 None => inconclusive = Some(format!("unexpected `gh repo view` output: {stdout}")),
             },
             // GitHub answers this for a repo that doesn't exist *or* that this user can't see.
-            Err(error) if error.to_string().contains("Could not resolve to a Repository") => {}
+            Err(error)
+                if error
+                    .to_string()
+                    .contains("Could not resolve to a Repository") => {}
             Err(error) => inconclusive = Some(format!("{error:#}")),
         }
     }
     match inconclusive {
         Some(reason) => GithubCheck::Inconclusive(reason),
-        None => GithubCheck::NotGithub(format!(
-            "gh can't access {}",
-            candidates.join(" or ")
-        )),
+        None => GithubCheck::NotGithub(format!("gh can't access {}", candidates.join(" or "))),
     }
 }
 
@@ -662,7 +665,14 @@ pub fn clone_github_repo(repo: &str, dest: &Path) -> anyhow::Result<()> {
     let dest = dest.to_string_lossy();
     gh(
         parent,
-        &["repo", "clone", repo, &dest, "--", "--no-recurse-submodules"],
+        &[
+            "repo",
+            "clone",
+            repo,
+            &dest,
+            "--",
+            "--no-recurse-submodules",
+        ],
     )?;
     Ok(())
 }
@@ -850,11 +860,21 @@ local\tremote.evil.url=ext::sh -c touch% /tmp/pwned";
         let repo = base.join("repo");
         std::fs::create_dir_all(repo.join("sub")).unwrap();
         git(&repo, &["init", "-q"]).unwrap();
-        assert_eq!(check_folder_github(&repo), GithubCheck::NotGithub("no GitHub remote".into()));
-        git(&repo, &["remote", "add", "origin", "https://gitlab.com/o/n"]).unwrap();
+        assert_eq!(
+            check_folder_github(&repo),
+            GithubCheck::NotGithub("no GitHub remote".into())
+        );
+        git(
+            &repo,
+            &["remote", "add", "origin", "https://gitlab.com/o/n"],
+        )
+        .unwrap();
         git(&repo, &["remote", "add", "gh", "git@github.com:o/n.git"]).unwrap();
         // Read from a subdirectory too: a project can be a folder inside its repo.
-        assert_eq!(local_github_remotes(&repo.join("sub")), Some(vec!["o/n".to_string()]));
+        assert_eq!(
+            local_github_remotes(&repo.join("sub")),
+            Some(vec!["o/n".to_string()])
+        );
         // `plain` may sit inside some enclosing checkout on a dev machine, so only assert
         // it doesn't crash and isn't misread as `o/n`.
         assert_ne!(local_github_remotes(&plain), Some(vec!["o/n".to_string()]));

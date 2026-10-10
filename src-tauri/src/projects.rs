@@ -294,9 +294,16 @@ mod tests {
             "TanmayDabhade/Relay",
             "  TanmayDabhade/Relay\n",
         ] {
-            assert_eq!(pair(input).as_deref(), Some("TanmayDabhade/Relay"), "{input}");
+            assert_eq!(
+                pair(input).as_deref(),
+                Some("TanmayDabhade/Relay"),
+                "{input}"
+            );
         }
-        assert_eq!(pair("o/my.repo_name-2").as_deref(), Some("o/my.repo_name-2"));
+        assert_eq!(
+            pair("o/my.repo_name-2").as_deref(),
+            Some("o/my.repo_name-2")
+        );
     }
 
     #[test]
@@ -355,7 +362,10 @@ mod tests {
         std::fs::create_dir_all(base.join("taken")).unwrap();
         std::fs::write(base.join("taken/notes.txt"), "mine").unwrap();
         let error = plan_clone_target(&base, "o", "taken").unwrap_err();
-        assert!(error.to_string().contains("not a checkout of o/taken"), "{error}");
+        assert!(
+            error.to_string().contains("not a checkout of o/taken"),
+            "{error}"
+        );
         std::fs::write(base.join("file"), "x").unwrap();
         assert!(plan_clone_target(&base, "o", "file").is_err());
 
@@ -372,7 +382,10 @@ mod tests {
         let same = base.join("same");
         std::fs::create_dir_all(&same).unwrap();
         run(&same, &["init", "-q"]);
-        run(&same, &["remote", "add", "origin", "git@github.com:O/Same.git"]);
+        run(
+            &same,
+            &["remote", "add", "origin", "git@github.com:O/Same.git"],
+        );
         assert_eq!(
             plan_clone_target(&base, "o", "same").unwrap(),
             CloneTarget::AlreadyCloned(same.clone())
@@ -393,22 +406,38 @@ mod tests {
         ] {
             conn.execute_batch(sql).unwrap();
         }
-        let added = register_project(&conn, Path::new("/Users/me/RelayProjects/app/"), "me/app", 10)
-            .unwrap();
+        let added = register_project(
+            &conn,
+            Path::new("/Users/me/RelayProjects/app/"),
+            "me/app",
+            10,
+        )
+        .unwrap();
         assert_eq!(added.path, "/Users/me/RelayProjects/app");
         assert_eq!(added.name, "app");
-        assert_eq!(added.id, parser::project_id_for_path("/Users/me/RelayProjects/app"));
+        assert_eq!(
+            added.id,
+            parser::project_id_for_path("/Users/me/RelayProjects/app")
+        );
         let listed = queries::list_projects(&conn).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].github_repo.as_deref(), Some("me/app"));
         let boards: i64 = conn
-            .query_row("SELECT COUNT(*) FROM boards WHERE project_id = ?1", [&added.id], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT COUNT(*) FROM boards WHERE project_id = ?1",
+                [&added.id],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(boards, 1);
         // Registering again is idempotent.
-        register_project(&conn, Path::new("/Users/me/RelayProjects/app"), "me/app", 20).unwrap();
+        register_project(
+            &conn,
+            Path::new("/Users/me/RelayProjects/app"),
+            "me/app",
+            20,
+        )
+        .unwrap();
         assert_eq!(queries::list_projects(&conn).unwrap().len(), 1);
     }
 }

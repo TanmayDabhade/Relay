@@ -3275,22 +3275,43 @@ mod report_tests {
         seed_session(&conn, "s2", "p2", "codex", 2000, 4.0, Some("[\"feature\"]"));
         insert_file_changed(&conn, "s2", "a.rs", "edit", 1, 0, 2000, None, None).unwrap();
 
-        assert_eq!(report_totals(&conn, 1000, None).unwrap().total_cost_usd, 5.0);
+        assert_eq!(
+            report_totals(&conn, 1000, None).unwrap().total_cost_usd,
+            5.0
+        );
         let p1 = report_totals(&conn, 1000, Some("p1")).unwrap();
         assert_eq!((p1.session_count, p1.total_cost_usd), (1, 1.0));
-        assert_eq!(report_by_project(&conn, 1000, Some("p2")).unwrap()[0].project_name, "two");
+        assert_eq!(
+            report_by_project(&conn, 1000, Some("p2")).unwrap()[0].project_name,
+            "two"
+        );
         assert_eq!(report_by_project(&conn, 1000, Some("p2")).unwrap().len(), 1);
         let tags = report_by_tag(&conn, 1000, Some("p1")).unwrap();
-        assert_eq!(tags.iter().map(|t| t.tag.as_str()).collect::<Vec<_>>(), vec!["bugfix"]);
+        assert_eq!(
+            tags.iter().map(|t| t.tag.as_str()).collect::<Vec<_>>(),
+            vec!["bugfix"]
+        );
         let agents = agent_usage_since(&conn, 1000, Some("p2")).unwrap();
-        assert_eq!(agents.iter().map(|a| a.agent.as_str()).collect::<Vec<_>>(), vec!["codex"]);
+        assert_eq!(
+            agents.iter().map(|a| a.agent.as_str()).collect::<Vec<_>>(),
+            vec!["codex"]
+        );
         assert_eq!(agent_usage(&conn, Some("p1")).unwrap().len(), 1);
         assert_eq!(agent_usage(&conn, None).unwrap().len(), 2);
 
         // Heatmap: p2's day has its session start plus its file edit; p1 only its start.
-        let all: i64 = daily_activity_counts(&conn, 0, None).unwrap().values().sum();
-        let p1: i64 = daily_activity_counts(&conn, 0, Some("p1")).unwrap().values().sum();
-        let p2: i64 = daily_activity_counts(&conn, 0, Some("p2")).unwrap().values().sum();
+        let all: i64 = daily_activity_counts(&conn, 0, None)
+            .unwrap()
+            .values()
+            .sum();
+        let p1: i64 = daily_activity_counts(&conn, 0, Some("p1"))
+            .unwrap()
+            .values()
+            .sum();
+        let p2: i64 = daily_activity_counts(&conn, 0, Some("p2"))
+            .unwrap()
+            .values()
+            .sum();
         assert_eq!((all, p1, p2), (3, 1, 2));
         assert_eq!(project_name(&conn, "p2").unwrap().as_deref(), Some("two"));
         assert_eq!(project_name(&conn, "nope").unwrap(), None);
@@ -3815,8 +3836,13 @@ mod list_query_tests {
             created_at,
         )
         .unwrap();
-        set_project_github(conn, project_id, Some(&format!("o/{project_id}")), created_at)
-            .unwrap();
+        set_project_github(
+            conn,
+            project_id,
+            Some(&format!("o/{project_id}")),
+            created_at,
+        )
+        .unwrap();
         for sid in session_ids {
             conn.execute(
                 "INSERT INTO sessions (id, project_id, agent, started_at, last_activity_at, status, cost_usd, raw_log_path)
@@ -3894,7 +3920,10 @@ mod list_query_tests {
 
         // Losing access hides it again.
         assert!(set_project_github(&conn, "cloned", None, 5000).unwrap());
-        assert_eq!(ids(&list_projects(&conn).unwrap(), |p| p.id.clone()), set(&["active"]));
+        assert_eq!(
+            ids(&list_projects(&conn).unwrap(), |p| p.id.clone()),
+            set(&["active"])
+        );
     }
 
     #[test]

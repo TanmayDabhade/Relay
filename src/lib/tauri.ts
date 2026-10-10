@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  AddedProject,
   AgentConnection,
   BoardColumn,
   BoardData,
@@ -24,6 +25,18 @@ import type {
 
 export function listProjects(): Promise<ProjectSummary[]> {
   return invoke("list_projects");
+}
+
+/** Clones a pasted GitHub link (or `owner/name`) with `gh` into `parentDir` (default
+ * `~/RelayProjects`) and registers it as a project. Can take a while for large repos. */
+export function cloneProject(url: string, parentDir?: string): Promise<AddedProject> {
+  return invoke("clone_project", { url, parentDir: parentDir ?? null });
+}
+
+/** Registers a folder already on disk as a project, once `gh` confirms it's a GitHub
+ * repository the user can access. */
+export function addExistingProject(path: string): Promise<AddedProject> {
+  return invoke("add_existing_project", { path });
 }
 
 export function listSessions(): Promise<Session[]> {

@@ -19,6 +19,9 @@ pub struct ProjectSummary {
     /// meaningful. Lets the UI show one badge per agent instead of assuming every project is
     /// Claude-only.
     pub agents: Vec<String>,
+    /// `owner/name` of the GitHub repository `gh` confirmed this folder belongs to. Always set
+    /// for listed projects — `list_projects` only returns verified ones.
+    pub github_repo: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1748,19 +1751,21 @@ pub fn todo_column_for_project(
 
 // --- Read side (frontend commands) ---
 
-/// Lists projects for display. A project row can exist for a directory Relay noticed but that
-/// never actually ran a session (e.g. a bare `.claude` dir with no activity yet); the inner
-/// `JOIN sessions` excludes those — a directory with 0 sessions and $0 spent isn't something
-/// the user should see listed.
+/// Lists projects for display: only folders `projects::spawn_github_verifier` (or an explicit
+/// clone/add) confirmed are GitHub repositories the user's `gh` can access. Every other cwd an
+/// agent ran in keeps its row (its sessions still need a project) but is not listed. A verified
+/// project with no sessions yet — one the user just cloned or added — is listed, hence the
+/// `LEFT JOIN`.
 pub fn list_projects(conn: &Connection) -> rusqlite::Result<Vec<ProjectSummary>> {
     let sql = "SELECT p.id, p.name, p.path, p.lang, p.stack, p.created_at, p.last_active,
                 COUNT(s.id) as session_count,
                 COALESCE(SUM(s.cost_usd), 0.0) as total_cost_usd,
-                GROUP_CONCAT(DISTINCT s.agent) as agents
+                GROUP_CONCAT(DISTINCT s.agent) as agents,
+                p.github_repo
          FROM projects p
-         JOIN sessions s ON s.project_id = p.id
+         LEFT JOIN sessions s ON s.project_id = p.id
+         WHERE p.github_repo IS NOT NULL
          GROUP BY p.id
-         HAVING COUNT(s.id) > 0
          ORDER BY p.last_active DESC";
     let mut stmt = conn.prepare(sql)?;
     let rows = stmt.query_map([], |row| {
@@ -1778,9 +1783,85 @@ pub fn list_projects(conn: &Connection) -> rusqlite::Result<Vec<ProjectSummary>>
             agents: agents
                 .map(|s| s.split(',').map(String::from).collect())
                 .unwrap_or_default(),
+            github_repo: row.get(10)?,
         })
     })?;
     rows.collect()
+}
+
+/// A project row the GitHub verifier should (re-)check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectGithubCheck {
+    pub id: String,
+    pub path: String,
+    pub github_repo: Option<String>,
+}
+
+/// Projects never checked, or whose last check is older than its TTL: verified projects are
+/// re-checked rarely (access is rarely lost), unverified ones more often (the user may have
+/// just added a remote or run `gh auth login`). Most recently active first, so the projects
+/// the user cares about appear first on a cold start with many folders to check.
+pub fn projects_needing_github_check(
+    conn: &Connection,
+    now: i64,
+    verified_ttl_secs: i64,
+    unverified_ttl_secs: i64,
+) -> rusqlite::Result<Vec<ProjectGithubCheck>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, path, github_repo FROM projects
+         WHERE github_checked_at IS NULL
+            OR (github_repo IS NOT NULL AND github_checked_at < ?1 - ?2)
+            OR (github_repo IS NULL AND github_checked_at < ?1 - ?3)
+         ORDER BY last_active DESC",
+    )?;
+    let rows = stmt.query_map(
+        params![now, verified_ttl_secs, unverified_ttl_secs],
+        |row| {
+            Ok(ProjectGithubCheck {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                github_repo: row.get(2)?,
+            })
+        },
+    )?;
+    rows.collect()
+}
+
+/// Records a finished check: sets (or, with `None`, clears) the project's GitHub repository.
+/// Returns whether the stored repository changed, i.e. whether the project list did.
+pub fn set_project_github(
+    conn: &Connection,
+    project_id: &str,
+    github_repo: Option<&str>,
+    checked_at: i64,
+) -> rusqlite::Result<bool> {
+    let changed = conn.execute(
+        "UPDATE projects SET github_repo = ?2, github_checked_at = ?3
+         WHERE id = ?1 AND github_repo IS NOT ?2",
+        params![project_id, github_repo, checked_at],
+    )? > 0;
+    if !changed {
+        conn.execute(
+            "UPDATE projects SET github_checked_at = ?2 WHERE id = ?1",
+            params![project_id, checked_at],
+        )?;
+    }
+    Ok(changed)
+}
+
+/// Records a check that couldn't decide either way (gh missing, logged out, offline): keeps
+/// whatever repository was stored and only moves `github_checked_at`, so an offline moment
+/// never hides a project that was verified before.
+pub fn touch_project_github_check(
+    conn: &Connection,
+    project_id: &str,
+    checked_at: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE projects SET github_checked_at = ?2 WHERE id = ?1",
+        params![project_id, checked_at],
+    )?;
+    Ok(())
 }
 
 /// Lists every session for display, most-recently-active first.
@@ -3650,10 +3731,12 @@ mod list_query_tests {
             .unwrap();
         conn.execute_batch(include_str!("../../migrations/0011_session_usage.sql"))
             .unwrap();
+        conn.execute_batch(include_str!("../../migrations/0013_project_github.sql"))
+            .unwrap();
         conn
     }
 
-    /// Insert a project plus one session per id in `session_ids`.
+    /// Insert a verified project plus one session per id in `session_ids`.
     fn seed(conn: &Connection, project_id: &str, created_at: i64, session_ids: &[&str]) {
         upsert_project(
             conn,
@@ -3663,6 +3746,8 @@ mod list_query_tests {
             created_at,
         )
         .unwrap();
+        set_project_github(conn, project_id, Some(&format!("o/{project_id}")), created_at)
+            .unwrap();
         for sid in session_ids {
             conn.execute(
                 "INSERT INTO sessions (id, project_id, agent, started_at, last_activity_at, status, cost_usd, raw_log_path)
@@ -3714,14 +3799,66 @@ mod list_query_tests {
     }
 
     #[test]
-    fn a_project_with_no_sessions_is_not_listed() {
+    fn only_github_verified_projects_are_listed_even_without_sessions() {
         let conn = in_memory_db();
-        // A directory Relay noticed but that never ran a session.
-        upsert_project(&conn, "empty", "empty", "/empty", 1000).unwrap();
         seed(&conn, "active", 2000, &["s1"]);
+        // A cwd an agent ran in that was never verified (or isn't on GitHub): not listed,
+        // but its sessions are kept.
+        upsert_project(&conn, "plain", "plain", "/plain", 3000).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, project_id, agent, started_at, last_activity_at, status, raw_log_path)
+             VALUES ('s2', 'plain', 'claude', 3000, 3000, 'active', '')",
+            [],
+        )
+        .unwrap();
+        // Just cloned: verified, no sessions yet. Listed.
+        upsert_project(&conn, "cloned", "cloned", "/cloned", 4000).unwrap();
+        set_project_github(&conn, "cloned", Some("o/cloned"), 4000).unwrap();
 
         let projects = list_projects(&conn).unwrap();
-        assert_eq!(ids(&projects, |p| p.id.clone()), set(&["active"]));
+        assert_eq!(ids(&projects, |p| p.id.clone()), set(&["active", "cloned"]));
+        let cloned = projects.iter().find(|p| p.id == "cloned").unwrap();
+        assert_eq!(cloned.session_count, 0);
+        assert!(cloned.agents.is_empty());
+        assert_eq!(cloned.github_repo.as_deref(), Some("o/cloned"));
+        assert_eq!(list_sessions(&conn).unwrap().len(), 2);
+
+        // Losing access hides it again.
+        assert!(set_project_github(&conn, "cloned", None, 5000).unwrap());
+        assert_eq!(ids(&list_projects(&conn).unwrap(), |p| p.id.clone()), set(&["active"]));
+    }
+
+    #[test]
+    fn github_checks_target_unchecked_and_stale_projects_and_report_changes() {
+        let conn = in_memory_db();
+        upsert_project(&conn, "new", "new", "/new", 1000).unwrap();
+        upsert_project(&conn, "verified", "verified", "/verified", 2000).unwrap();
+        upsert_project(&conn, "plain", "plain", "/plain", 3000).unwrap();
+        // Checked at t=10000: one verified, one not on GitHub.
+        assert!(set_project_github(&conn, "verified", Some("o/verified"), 10_000).unwrap());
+        assert!(!set_project_github(&conn, "plain", None, 10_000).unwrap());
+
+        let due = |now| {
+            projects_needing_github_check(&conn, now, 1000, 100)
+                .unwrap()
+                .into_iter()
+                .map(|p| p.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(due(10_050), vec!["new"]);
+        // The unverified TTL lapses first; most recently active comes first.
+        assert_eq!(due(10_200), vec!["plain", "new"]);
+        assert_eq!(due(11_500), vec!["plain", "verified", "new"]);
+
+        // Re-confirming the same repository is not a change, but still counts as a check.
+        assert!(!set_project_github(&conn, "verified", Some("o/verified"), 20_000).unwrap());
+        // An inconclusive check keeps the repository and only moves the timestamp.
+        touch_project_github_check(&conn, "plain", 20_000).unwrap();
+        assert_eq!(due(20_050), vec!["new"]);
+        let verified = projects_needing_github_check(&conn, 50_000, 1000, 100).unwrap();
+        let verified = verified.iter().find(|p| p.id == "verified").unwrap();
+        assert_eq!(verified.github_repo.as_deref(), Some("o/verified"));
+        assert_eq!(verified.path, "/verified");
     }
 }
 

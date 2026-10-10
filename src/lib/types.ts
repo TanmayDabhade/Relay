@@ -10,6 +10,17 @@ export interface ProjectSummary {
   total_cost_usd: number;
   /** Every distinct agent with at least one session in this project. */
   agents: string[];
+  /** `owner/name` of the GitHub repository `gh` confirmed this folder belongs to. Listed
+   * projects are always verified, so this is set for every project `listProjects` returns. */
+  github_repo: string | null;
+}
+
+/** A project the user just cloned or added (`cloneProject` / `addExistingProject`). */
+export interface AddedProject {
+  id: string;
+  name: string;
+  path: string;
+  github_repo: string;
 }
 
 export interface FileChanged {

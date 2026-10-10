@@ -3,6 +3,7 @@ use crate::assist;
 use crate::db::{queries, Db};
 use crate::dispatch::{self, looping, AgentCommand, Runtime};
 use crate::parser;
+use crate::projects;
 use crate::ship::{self, ShipTrigger};
 use crate::terminal;
 use chrono::{Duration, NaiveDate, Utc};
@@ -18,6 +19,104 @@ const HEATMAP_DAYS: i64 = 365;
 pub fn list_projects(db: State<'_, Db>) -> Result<Vec<queries::ProjectSummary>, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     queries::list_projects(&conn).map_err(|e| e.to_string())
+}
+
+/// Clones a pasted GitHub link (or `owner/name`) with `gh` into `parent_dir` (default
+/// `~/RelayProjects`, created if missing) and registers it as a project. A destination that
+/// already holds a checkout of the same repository is registered as-is; anything else there is
+/// an error, never overwritten. Async + `spawn_blocking`: the clone can take minutes and must
+/// neither block the UI thread nor hold the DB lock, which is only taken for the final write.
+#[tauri::command]
+pub async fn clone_project(
+    app: tauri::AppHandle,
+    db: State<'_, Db>,
+    url: String,
+    parent_dir: Option<String>,
+) -> Result<projects::AddedProject, String> {
+    let (owner, name) = projects::parse_github_repo(&url).ok_or_else(|| {
+        "that doesn't look like a GitHub repository — paste a link like \
+         https://github.com/owner/name or just owner/name"
+            .to_string()
+    })?;
+    let parent = match parent_dir.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+        Some(custom) => {
+            let custom = std::path::PathBuf::from(custom);
+            if !custom.is_absolute() || !custom.is_dir() {
+                return Err(format!("{} is not an existing folder", custom.display()));
+            }
+            custom
+        }
+        None => {
+            let default = projects::default_clone_parent()
+                .ok_or("couldn't find your home folder to clone into")?;
+            std::fs::create_dir_all(&default).map_err(|e| e.to_string())?;
+            default
+        }
+    };
+    let (dest, github_repo) = tauri::async_runtime::spawn_blocking(move || {
+        let dest = match projects::plan_clone_target(&parent, &owner, &name)? {
+            projects::CloneTarget::Clone(dest) => {
+                ship::git::clone_github_repo(&format!("{owner}/{name}"), &dest)?;
+                dest
+            }
+            projects::CloneTarget::AlreadyCloned(dest) => dest,
+        };
+        let repo = verified_github_repo(&dest)?;
+        anyhow::Ok((dest, repo))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| format!("{e:#}"))?;
+    let added = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        projects::register_project(&conn, &dest, &github_repo, Utc::now().timestamp())
+            .map_err(|e| format!("{e:#}"))?
+    };
+    emit_data_changed(&app);
+    Ok(added)
+}
+
+/// Registers a folder already on disk as a project, once `gh` confirms it's a GitHub
+/// repository the user can access.
+#[tauri::command]
+pub async fn add_existing_project(
+    app: tauri::AppHandle,
+    db: State<'_, Db>,
+    path: String,
+) -> Result<projects::AddedProject, String> {
+    let path = path.trim().to_string();
+    let (folder, github_repo) = tauri::async_runtime::spawn_blocking(move || {
+        let folder = std::path::Path::new(&path)
+            .canonicalize()
+            .map_err(|_| anyhow::anyhow!("{path} doesn't exist"))?;
+        anyhow::ensure!(folder.is_dir(), "{path} is not a folder");
+        let repo = verified_github_repo(&folder)?;
+        anyhow::Ok((folder, repo))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| format!("{e:#}"))?;
+    let added = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        projects::register_project(&conn, &folder, &github_repo, Utc::now().timestamp())
+            .map_err(|e| format!("{e:#}"))?
+    };
+    emit_data_changed(&app);
+    Ok(added)
+}
+
+/// The folder's GitHub repository, or an error saying why it can't be added. Blocking.
+fn verified_github_repo(folder: &std::path::Path) -> anyhow::Result<String> {
+    match ship::git::check_folder_github(folder) {
+        ship::git::GithubCheck::Verified(repo) => Ok(repo),
+        ship::git::GithubCheck::NotGithub(reason) | ship::git::GithubCheck::Inconclusive(reason) => {
+            anyhow::bail!(
+                "{} can't be added as a project: {reason}. Relay only lists GitHub repositories \
+                 your `gh` can access (check `gh auth status`).",
+                folder.display()
+            )
+        }
+    }
 }
 
 #[tauri::command]

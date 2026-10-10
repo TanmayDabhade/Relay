@@ -542,6 +542,131 @@ pub fn ship(workspace: &TaskWorkspace, context: &ShipContext) -> anyhow::Result<
     })
 }
 
+/// Outcome of checking whether a folder is a GitHub repository `gh` can access.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GithubCheck {
+    /// `gh` can see it; `owner/name` as GitHub spells it.
+    Verified(String),
+    /// Definitively not: the folder is gone, isn't a git checkout, has no GitHub remote, or
+    /// GitHub says the repository doesn't exist for this user.
+    NotGithub(String),
+    /// Couldn't tell — git or gh missing, gh logged out, offline. Callers keep whatever they
+    /// recorded before rather than hiding a project over a transient failure.
+    Inconclusive(String),
+}
+
+/// `owner/name` of every GitHub remote in a repository's own config (`git config --show-scope
+/// --list` output), `origin` first, then the rest in config order, deduplicated. Remote names
+/// may contain dots (`remote.<name>.url`), so the name is everything between the two.
+pub fn github_remote_candidates(listing: &str) -> Vec<String> {
+    let mut remotes: Vec<(String, String)> = Vec::new();
+    for line in listing.lines() {
+        let Some((scope, entry)) = line.split_once('\t') else {
+            continue;
+        };
+        if scope != "local" && scope != "worktree" {
+            continue;
+        }
+        let Some((key, value)) = entry.split_once('=') else {
+            continue;
+        };
+        let Some(remote) = key
+            .strip_prefix("remote.")
+            .and_then(|rest| rest.strip_suffix(".url"))
+        else {
+            continue;
+        };
+        if let Some((owner, name)) = crate::projects::parse_github_repo(value) {
+            remotes.push((remote.to_string(), format!("{owner}/{name}")));
+        }
+    }
+    remotes.sort_by_key(|(remote, _)| remote != "origin");
+    let mut seen = Vec::<String>::new();
+    for (_, repo) in remotes {
+        if !seen.iter().any(|s| s.eq_ignore_ascii_case(&repo)) {
+            seen.push(repo);
+        }
+    }
+    seen
+}
+
+/// GitHub remotes of a local folder, read from its config only — no network, and nothing that
+/// could run a program (reading config never does; `run` force-disables fsmonitor). `None`
+/// when the folder isn't inside a git checkout.
+pub fn local_github_remotes(folder: &Path) -> Option<Vec<String>> {
+    git(folder, &["rev-parse", "--is-inside-work-tree"]).ok()?;
+    let listing = git(folder, &["config", "--show-scope", "--list"]).ok()?;
+    Some(github_remote_candidates(&listing))
+}
+
+/// `nameWithOwner` from `gh repo view --json nameWithOwner` output, validated so nothing odd
+/// GitHub (or a shim on PATH) prints is stored as a repository name.
+pub fn parse_repo_view_json(stdout: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).ok()?;
+    let full = value.get("nameWithOwner")?.as_str()?;
+    let (owner, name) = crate::projects::parse_bare_repo(full)?;
+    Some(format!("{owner}/{name}"))
+}
+
+/// Whether `folder` is a git checkout of a GitHub repository the user's `gh` can access.
+///
+/// The folder is user-chosen or an agent's cwd, so its `.git/config` may be agent-written.
+/// Nothing here runs git *operations* in it: the remotes are read from config, and `gh` is
+/// asked about `owner/name` explicitly from a neutral directory, so gh never runs git in the
+/// folder either (and its config can't redirect what gh talks to). Never panics; every failure
+/// becomes a `NotGithub`/`Inconclusive` with a reason.
+pub fn check_folder_github(folder: &Path) -> GithubCheck {
+    if !folder.is_dir() {
+        return GithubCheck::NotGithub("folder no longer exists".into());
+    }
+    if dispatch::resolve_executable("git").is_none() {
+        return GithubCheck::Inconclusive("`git` was not found on PATH".into());
+    }
+    let Some(candidates) = local_github_remotes(folder) else {
+        return GithubCheck::NotGithub("not a git checkout".into());
+    };
+    if candidates.is_empty() {
+        return GithubCheck::NotGithub("no GitHub remote".into());
+    }
+    let neutral = std::env::temp_dir();
+    let mut inconclusive = None;
+    for candidate in &candidates {
+        match gh(&neutral, &["repo", "view", candidate, "--json", "nameWithOwner"]) {
+            Ok(stdout) => match parse_repo_view_json(&stdout) {
+                Some(repo) => return GithubCheck::Verified(repo),
+                None => inconclusive = Some(format!("unexpected `gh repo view` output: {stdout}")),
+            },
+            // GitHub answers this for a repo that doesn't exist *or* that this user can't see.
+            Err(error) if error.to_string().contains("Could not resolve to a Repository") => {}
+            Err(error) => inconclusive = Some(format!("{error:#}")),
+        }
+    }
+    match inconclusive {
+        Some(reason) => GithubCheck::Inconclusive(reason),
+        None => GithubCheck::NotGithub(format!(
+            "gh can't access {}",
+            candidates.join(" or ")
+        )),
+    }
+}
+
+/// `gh repo clone owner/name <dest>` without submodules (their URLs come from the cloned
+/// repo's `.gitmodules`, i.e. from whoever controls it). `repo` must already be validated
+/// `owner/name` (see `projects::parse_github_repo`) and `dest` absolute, so neither can be
+/// read as an option. Runs from `dest`'s parent; blocking, may take a while.
+pub fn clone_github_repo(repo: &str, dest: &Path) -> anyhow::Result<()> {
+    anyhow::ensure!(dest.is_absolute(), "clone destination must be absolute");
+    let parent = dest
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("clone destination has no parent folder"))?;
+    let dest = dest.to_string_lossy();
+    gh(
+        parent,
+        &["repo", "clone", repo, &dest, "--", "--no-recurse-submodules"],
+    )?;
+    Ok(())
+}
+
 /// Removes a task's worktree once its work is safely on the branch. Leaves it in place (and
 /// returns `false`) when it still holds uncommitted changes, so nothing is ever discarded.
 /// The branch itself is kept: it backs the PR.
@@ -677,6 +802,63 @@ command\tcore.pager=less";
         assert!(error.to_string().contains("diff.x.textconv"));
         let spoofed_lfs = "local\tfilter.lfs.process=sh -c evil";
         assert_eq!(unsafe_repo_config(spoofed_lfs), vec!["filter.lfs.process"]);
+    }
+
+    #[test]
+    fn github_remotes_come_from_repo_config_with_origin_first() {
+        let listing = "\
+global\tremote.origin.url=https://github.com/global/ignored
+local\tremote.upstream.url=git@github.com:Up/Stream.git
+local\tremote.origin.url=https://github.com/me/fork.git
+local\tremote.gitlab.url=https://gitlab.com/me/fork
+local\tremote.my.dotted.url=github.com/me/dotted
+local\tremote.dupe.url=git@github.com:ME/FORK
+local\tremote.origin.fetch=+refs/heads/*:refs/remotes/origin/*
+local\tremote.evil.url=ext::sh -c touch% /tmp/pwned";
+        assert_eq!(
+            github_remote_candidates(listing),
+            vec!["me/fork", "Up/Stream", "me/dotted"]
+        );
+        assert!(github_remote_candidates("local\tuser.name=me").is_empty());
+    }
+
+    #[test]
+    fn repo_view_json_yields_a_validated_name_with_owner() {
+        assert_eq!(
+            parse_repo_view_json("{\"nameWithOwner\":\"TanmayDabhade/Relay\"}\n").as_deref(),
+            Some("TanmayDabhade/Relay")
+        );
+        assert_eq!(parse_repo_view_json("{\"name\":\"Relay\"}"), None);
+        assert_eq!(parse_repo_view_json("not json"), None);
+        assert_eq!(parse_repo_view_json("{\"nameWithOwner\":\"-x/y\"}"), None);
+        assert_eq!(parse_repo_view_json("{\"nameWithOwner\":\"a/b/c\"}"), None);
+    }
+
+    #[test]
+    fn folder_checks_settle_locally_without_gh_when_there_is_no_github_remote() {
+        let base = std::env::temp_dir().join(format!(
+            "relay-gh-check-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let plain = base.join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        assert!(matches!(
+            check_folder_github(&base.join("missing")),
+            GithubCheck::NotGithub(_)
+        ));
+        let repo = base.join("repo");
+        std::fs::create_dir_all(repo.join("sub")).unwrap();
+        git(&repo, &["init", "-q"]).unwrap();
+        assert_eq!(check_folder_github(&repo), GithubCheck::NotGithub("no GitHub remote".into()));
+        git(&repo, &["remote", "add", "origin", "https://gitlab.com/o/n"]).unwrap();
+        git(&repo, &["remote", "add", "gh", "git@github.com:o/n.git"]).unwrap();
+        // Read from a subdirectory too: a project can be a folder inside its repo.
+        assert_eq!(local_github_remotes(&repo.join("sub")), Some(vec!["o/n".to_string()]));
+        // `plain` may sit inside some enclosing checkout on a dev machine, so only assert
+        // it doesn't crash and isn't misread as `o/n`.
+        assert_ne!(local_github_remotes(&plain), Some(vec!["o/n".to_string()]));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

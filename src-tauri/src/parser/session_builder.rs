@@ -272,8 +272,10 @@ fn diff_counts(old: &str, new: &str) -> (i64, i64) {
 }
 
 /// Stable id derived from the real filesystem path (never the dash-encoded log directory
-/// name, which is ambiguous when the real path itself contains hyphens).
-fn project_id_for_path(path: &str) -> String {
+/// name, which is ambiguous when the real path itself contains hyphens). Also used when the
+/// user clones or adds a project (`projects::register_project`), so its later sessions land on
+/// the same row.
+pub fn project_id_for_path(path: &str) -> String {
     let mut hasher = DefaultHasher::new();
     path.to_lowercase().hash(&mut hasher);
     format!("{:016x}", hasher.finish())

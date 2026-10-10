@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Button } from "../components/ui/Button";
 import { StatTile } from "../components/ui/StatTile";
+import { useActiveProject } from "../hooks/useActiveProject";
 import { agentMeta } from "../lib/agents";
 import { formatCost } from "../lib/format";
 import { exportReport, generateReport, revealInFinder } from "../lib/tauri";
@@ -19,19 +20,20 @@ const RANGE_OPTIONS: { days: number; label: string }[] = [
  * that state leaking into the always-live Dashboard. */
 export function ReportView() {
   const [rangeDays, setRangeDays] = useState(30);
+  const { activeProjectId, activeProject } = useActiveProject();
   const [exportState, setExportState] = useState<
     { status: "idle" } | { status: "saving" } | { status: "saved"; path: string } | { status: "error"; message: string }
   >({ status: "idle" });
 
   const { data, isLoading, isError } = useQuery({
-    queryKey: ["report", rangeDays],
-    queryFn: () => generateReport(rangeDays),
+    queryKey: ["report", rangeDays, activeProjectId],
+    queryFn: () => generateReport(rangeDays, activeProjectId),
   });
 
   async function handleExport() {
     setExportState({ status: "saving" });
     try {
-      const path = await exportReport(rangeDays);
+      const path = await exportReport(rangeDays, activeProjectId);
       setExportState({ status: "saved", path });
     } catch (e) {
       setExportState({ status: "error", message: String(e) });
@@ -41,7 +43,14 @@ export function ReportView() {
   return (
     <div className="report-view">
       <div className="report-view-topbar">
-        <h1 className="view-topbar-title">Reports</h1>
+        <div>
+          <h1 className="view-topbar-title">Reports</h1>
+          <p className="report-view-scope">
+            {activeProject
+              ? `${activeProject.name} only. Choose "All projects" in the sidebar for everything.`
+              : "All projects"}
+          </p>
+        </div>
         <div className="report-range-picker">
           {RANGE_OPTIONS.map((opt) => (
             <button

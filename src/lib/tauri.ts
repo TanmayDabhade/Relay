@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  AddedProject,
   AgentConnection,
   BoardColumn,
   BoardData,
@@ -26,6 +27,18 @@ export function listProjects(): Promise<ProjectSummary[]> {
   return invoke("list_projects");
 }
 
+/** Clones a pasted GitHub link (or `owner/name`) with `gh` into `parentDir` (default
+ * `~/RelayProjects`) and registers it as a project. Can take a while for large repos. */
+export function cloneProject(url: string, parentDir?: string): Promise<AddedProject> {
+  return invoke("clone_project", { url, parentDir: parentDir ?? null });
+}
+
+/** Registers a folder already on disk as a project, once `gh` confirms it's a GitHub
+ * repository the user can access. */
+export function addExistingProject(path: string): Promise<AddedProject> {
+  return invoke("add_existing_project", { path });
+}
+
 export function listSessions(): Promise<Session[]> {
   return invoke("list_sessions");
 }
@@ -50,18 +63,20 @@ export function getProjectGitInsights(projectPath: string): Promise<GitInsights>
   return invoke("project_git_insights", { projectPath });
 }
 
-export function getDashboardStats(): Promise<DashboardStats> {
-  return invoke("dashboard_stats");
+/** `projectId` scopes every number to one project; `null` covers all projects. */
+export function getDashboardStats(projectId: string | null): Promise<DashboardStats> {
+  return invoke("dashboard_stats", { projectId });
 }
 
-export function generateReport(rangeDays: number): Promise<ReportData> {
-  return invoke("generate_report", { rangeDays });
+/** `projectId` scopes the report to one project; `null` reports on all projects. */
+export function generateReport(rangeDays: number, projectId: string | null): Promise<ReportData> {
+  return invoke("generate_report", { rangeDays, projectId });
 }
 
 /** Writes the report as Markdown to the user's Downloads folder and resolves to the
  * absolute path it was saved at, for a "Reveal in Finder" follow-up action. */
-export function exportReport(rangeDays: number): Promise<string> {
-  return invoke("export_report", { rangeDays });
+export function exportReport(rangeDays: number, projectId: string | null): Promise<string> {
+  return invoke("export_report", { rangeDays, projectId });
 }
 
 export function revealInFinder(path: string): Promise<void> {

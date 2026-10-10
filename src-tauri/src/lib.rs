@@ -5,6 +5,7 @@ mod cost;
 mod db;
 mod dispatch;
 mod parser;
+mod projects;
 mod ship;
 mod summarize;
 mod tags;
@@ -72,6 +73,8 @@ pub fn run() {
       app.manage(summarize::HttpClient(reqwest::Client::new()));
       app.manage(activity::ActivityCache::new());
 
+      // Before the watcher, so its first ingest wakes find the verifier already listening.
+      projects::spawn_github_verifier(app.handle().clone());
       watcher::start(app.handle().clone());
       cost::rebuild::spawn(app.handle().clone(), usage_rebuild_targets);
       spawn_idle_sweep(app.handle().clone());
@@ -80,6 +83,8 @@ pub fn run() {
     })
     .invoke_handler(tauri::generate_handler![
       commands::list_projects,
+      commands::clone_project,
+      commands::add_existing_project,
       commands::list_sessions,
       commands::get_session_detail,
       commands::delete_session,

@@ -3,6 +3,7 @@ use crate::assist;
 use crate::db::{queries, Db};
 use crate::dispatch::{self, looping, AgentCommand, Runtime};
 use crate::parser;
+use crate::projects;
 use crate::ship::{self, ShipTrigger};
 use crate::terminal;
 use chrono::{Duration, NaiveDate, Utc};
@@ -18,6 +19,109 @@ const HEATMAP_DAYS: i64 = 365;
 pub fn list_projects(db: State<'_, Db>) -> Result<Vec<queries::ProjectSummary>, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     queries::list_projects(&conn).map_err(|e| e.to_string())
+}
+
+/// Clones a pasted GitHub link (or `owner/name`) with `gh` into `parent_dir` (default
+/// `~/RelayProjects`, created if missing) and registers it as a project. A destination that
+/// already holds a checkout of the same repository is registered as-is; anything else there is
+/// an error, never overwritten. Async + `spawn_blocking`: the clone can take minutes and must
+/// neither block the UI thread nor hold the DB lock, which is only taken for the final write.
+#[tauri::command]
+pub async fn clone_project(
+    app: tauri::AppHandle,
+    db: State<'_, Db>,
+    url: String,
+    parent_dir: Option<String>,
+) -> Result<projects::AddedProject, String> {
+    let (owner, name) = projects::parse_github_repo(&url).ok_or_else(|| {
+        "that doesn't look like a GitHub repository — paste a link like \
+         https://github.com/owner/name or just owner/name"
+            .to_string()
+    })?;
+    let parent = match parent_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
+        Some(custom) => {
+            let custom = std::path::PathBuf::from(custom);
+            if !custom.is_absolute() || !custom.is_dir() {
+                return Err(format!("{} is not an existing folder", custom.display()));
+            }
+            custom
+        }
+        None => {
+            let default = projects::default_clone_parent()
+                .ok_or("couldn't find your home folder to clone into")?;
+            std::fs::create_dir_all(&default).map_err(|e| e.to_string())?;
+            default
+        }
+    };
+    let (dest, github_repo) = tauri::async_runtime::spawn_blocking(move || {
+        let dest = match projects::plan_clone_target(&parent, &owner, &name)? {
+            projects::CloneTarget::Clone(dest) => {
+                ship::git::clone_github_repo(&format!("{owner}/{name}"), &dest)?;
+                dest
+            }
+            projects::CloneTarget::AlreadyCloned(dest) => dest,
+        };
+        let repo = verified_github_repo(&dest)?;
+        anyhow::Ok((dest, repo))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| format!("{e:#}"))?;
+    let added = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        projects::register_project(&conn, &dest, &github_repo, Utc::now().timestamp())
+            .map_err(|e| format!("{e:#}"))?
+    };
+    emit_data_changed(&app);
+    Ok(added)
+}
+
+/// Registers a folder already on disk as a project, once `gh` confirms it's a GitHub
+/// repository the user can access.
+#[tauri::command]
+pub async fn add_existing_project(
+    app: tauri::AppHandle,
+    db: State<'_, Db>,
+    path: String,
+) -> Result<projects::AddedProject, String> {
+    let path = path.trim().to_string();
+    let (folder, github_repo) = tauri::async_runtime::spawn_blocking(move || {
+        let folder = std::path::Path::new(&path)
+            .canonicalize()
+            .map_err(|_| anyhow::anyhow!("{path} doesn't exist"))?;
+        anyhow::ensure!(folder.is_dir(), "{path} is not a folder");
+        let repo = verified_github_repo(&folder)?;
+        anyhow::Ok((folder, repo))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| format!("{e:#}"))?;
+    let added = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        projects::register_project(&conn, &folder, &github_repo, Utc::now().timestamp())
+            .map_err(|e| format!("{e:#}"))?
+    };
+    emit_data_changed(&app);
+    Ok(added)
+}
+
+/// The folder's GitHub repository, or an error saying why it can't be added. Blocking.
+fn verified_github_repo(folder: &std::path::Path) -> anyhow::Result<String> {
+    match ship::git::check_folder_github(folder) {
+        ship::git::GithubCheck::Verified(repo) => Ok(repo),
+        ship::git::GithubCheck::NotGithub(reason)
+        | ship::git::GithubCheck::Inconclusive(reason) => {
+            anyhow::bail!(
+                "{} can't be added as a project: {reason}. Relay only lists GitHub repositories \
+                 your `gh` can access (check `gh auth status`).",
+                folder.display()
+            )
+        }
+    }
 }
 
 #[tauri::command]
@@ -273,12 +377,20 @@ pub struct DashboardStats {
 const TOP_PROJECTS_LIMIT: usize = 5;
 
 #[tauri::command]
-pub fn dashboard_stats(db: State<'_, Db>) -> Result<DashboardStats, String> {
+pub fn dashboard_stats(
+    db: State<'_, Db>,
+    project_id: Option<String>,
+) -> Result<DashboardStats, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
+    // `Some` scopes every number to the active workspace project.
+    let project_id = project_id.as_deref();
 
     // Headline numbers (total_cost_usd/total_sessions/total_projects/top_projects) all derive
     // from this one list.
     let mut projects = queries::list_projects(&conn).map_err(|e| e.to_string())?;
+    if let Some(project_id) = project_id {
+        projects.retain(|project| project.id == project_id);
+    }
     let total_cost_usd: f64 = projects.iter().map(|p| p.total_cost_usd).sum();
     let total_sessions: i64 = projects.iter().map(|p| p.session_count).sum();
     let total_projects = projects.len() as i64;
@@ -292,8 +404,9 @@ pub fn dashboard_stats(db: State<'_, Db>) -> Result<DashboardStats, String> {
     });
     projects.truncate(TOP_PROJECTS_LIMIT);
 
-    let agent_usage = queries::agent_usage(&conn).map_err(|e| e.to_string())?;
-    let active_session = queries::most_recent_active_session(&conn).map_err(|e| e.to_string())?;
+    let agent_usage = queries::agent_usage(&conn, project_id).map_err(|e| e.to_string())?;
+    let active_session =
+        queries::most_recent_active_session(&conn, project_id).map_err(|e| e.to_string())?;
 
     let today = Utc::now().date_naive();
     let window_start = today - Duration::days(HEATMAP_DAYS - 1);
@@ -302,8 +415,8 @@ pub fn dashboard_stats(db: State<'_, Db>) -> Result<DashboardStats, String> {
         .expect("midnight is always a valid time")
         .and_utc()
         .timestamp();
-    let counts_by_day =
-        queries::daily_activity_counts(&conn, since_epoch).map_err(|e| e.to_string())?;
+    let counts_by_day = queries::daily_activity_counts(&conn, since_epoch, project_id)
+        .map_err(|e| e.to_string())?;
 
     let daily_activity = dense_daily_activity(window_start, today, &counts_by_day);
 
@@ -347,29 +460,48 @@ fn dense_daily_activity(
 pub struct ReportData {
     pub range_days: i64,
     pub since_epoch: i64,
+    /// The project the report is scoped to, or `None` for an all-projects report.
+    pub project_name: Option<String>,
     pub totals: queries::ReportTotals,
     pub by_project: Vec<queries::ReportProjectRow>,
     pub by_tag: Vec<queries::ReportTagRow>,
     pub by_agent: Vec<queries::AgentUsage>,
 }
 
-fn build_report(conn: &rusqlite::Connection, range_days: i64) -> Result<ReportData, String> {
+/// `project_id` scopes the report to one project (the active workspace project); `None`
+/// reports on every project.
+fn build_report(
+    conn: &rusqlite::Connection,
+    range_days: i64,
+    project_id: Option<&str>,
+) -> Result<ReportData, String> {
     let since_epoch = (Utc::now() - Duration::days(range_days)).timestamp();
+    let project_name = match project_id {
+        Some(id) => queries::project_name(conn, id).map_err(|e| e.to_string())?,
+        None => None,
+    };
 
     Ok(ReportData {
         range_days,
         since_epoch,
-        totals: queries::report_totals(conn, since_epoch).map_err(|e| e.to_string())?,
-        by_project: queries::report_by_project(conn, since_epoch).map_err(|e| e.to_string())?,
-        by_tag: queries::report_by_tag(conn, since_epoch).map_err(|e| e.to_string())?,
-        by_agent: queries::agent_usage_since(conn, since_epoch).map_err(|e| e.to_string())?,
+        project_name,
+        totals: queries::report_totals(conn, since_epoch, project_id).map_err(|e| e.to_string())?,
+        by_project: queries::report_by_project(conn, since_epoch, project_id)
+            .map_err(|e| e.to_string())?,
+        by_tag: queries::report_by_tag(conn, since_epoch, project_id).map_err(|e| e.to_string())?,
+        by_agent: queries::agent_usage_since(conn, since_epoch, project_id)
+            .map_err(|e| e.to_string())?,
     })
 }
 
 #[tauri::command]
-pub fn generate_report(db: State<'_, Db>, range_days: i64) -> Result<ReportData, String> {
+pub fn generate_report(
+    db: State<'_, Db>,
+    range_days: i64,
+    project_id: Option<String>,
+) -> Result<ReportData, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
-    build_report(&conn, range_days)
+    build_report(&conn, range_days, project_id.as_deref())
 }
 
 /// Renders the same data `generate_report` returns as a standalone Markdown document, writes
@@ -379,10 +511,14 @@ pub fn generate_report(db: State<'_, Db>, range_days: i64) -> Result<ReportData,
 /// locked-down sandbox) rather than the app-data directory, since the whole point is for the
 /// user to find this file and hand it to someone else.
 #[tauri::command]
-pub fn export_report(db: State<'_, Db>, range_days: i64) -> Result<String, String> {
+pub fn export_report(
+    db: State<'_, Db>,
+    range_days: i64,
+    project_id: Option<String>,
+) -> Result<String, String> {
     let report = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
-        build_report(&conn, range_days)?
+        build_report(&conn, range_days, project_id.as_deref())?
     };
 
     let dir = dirs::download_dir()
@@ -399,10 +535,16 @@ pub fn export_report(db: State<'_, Db>, range_days: i64) -> Result<String, Strin
 
 fn render_report_markdown(report: &ReportData) -> String {
     let mut out = String::new();
-    out.push_str(&format!(
-        "# Relay spend report — last {} days\n\n",
-        report.range_days
-    ));
+    match &report.project_name {
+        Some(project) => out.push_str(&format!(
+            "# Relay spend report — {project}, last {} days\n\n",
+            report.range_days
+        )),
+        None => out.push_str(&format!(
+            "# Relay spend report — last {} days\n\n",
+            report.range_days
+        )),
+    }
     out.push_str(&format!(
         "Generated {}\n\n",
         Utc::now().format("%Y-%m-%d %H:%M UTC")

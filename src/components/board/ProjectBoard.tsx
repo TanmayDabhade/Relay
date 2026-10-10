@@ -22,9 +22,9 @@ interface ProjectBoardProps {
   projectId: string;
 }
 
-/** Kanban board for a single project — the columns/cards half of what used to be the
- * standalone `BoardView`, minus its project picker, so it can be embedded directly in
- * `ProjectDetail`. */
+/** Kanban board for a single project, rendered by the Workspace (`WorkspaceView`) for the
+ * active project. Dispatch, planner and draft flows all go through `projectId`; the backend
+ * resolves the project's folder from it. */
 export function ProjectBoard({ projectId }: ProjectBoardProps) {
   const [selectedCardId, setSelectedCardId] = useState<string | null>(null);
   const [dispatchCardId, setDispatchCardId] = useState<string | null>(null);

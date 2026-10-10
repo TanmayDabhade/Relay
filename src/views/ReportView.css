@@ -12,6 +12,12 @@
   gap: var(--space-3);
 }
 
+.report-view-scope {
+  margin: var(--space-1) 0 0;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
 .report-range-picker {
   display: inline-flex;
   border: 1px solid var(--border-default);

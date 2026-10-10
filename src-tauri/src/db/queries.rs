@@ -19,6 +19,9 @@ pub struct ProjectSummary {
     /// meaningful. Lets the UI show one badge per agent instead of assuming every project is
     /// Claude-only.
     pub agents: Vec<String>,
+    /// `owner/name` of the GitHub repository `gh` confirmed this folder belongs to. Always set
+    /// for listed projects — `list_projects` only returns verified ones.
+    pub github_repo: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1466,6 +1469,15 @@ pub fn project_path(conn: &Connection, project_id: &str) -> rusqlite::Result<Opt
     .optional()
 }
 
+pub fn project_name(conn: &Connection, project_id: &str) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT name FROM projects WHERE id = ?1",
+        params![project_id],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
 /// Keeps a dispatched task's board card aligned with the lifecycle Relay owns even when an
 /// agent does not expose an ingestible native session log. If an ingested session is linked,
 /// the existing session-based sync remains compatible because both target the same role.
@@ -1748,19 +1760,21 @@ pub fn todo_column_for_project(
 
 // --- Read side (frontend commands) ---
 
-/// Lists projects for display. A project row can exist for a directory Relay noticed but that
-/// never actually ran a session (e.g. a bare `.claude` dir with no activity yet); the inner
-/// `JOIN sessions` excludes those — a directory with 0 sessions and $0 spent isn't something
-/// the user should see listed.
+/// Lists projects for display: only folders `projects::spawn_github_verifier` (or an explicit
+/// clone/add) confirmed are GitHub repositories the user's `gh` can access. Every other cwd an
+/// agent ran in keeps its row (its sessions still need a project) but is not listed. A verified
+/// project with no sessions yet — one the user just cloned or added — is listed, hence the
+/// `LEFT JOIN`.
 pub fn list_projects(conn: &Connection) -> rusqlite::Result<Vec<ProjectSummary>> {
     let sql = "SELECT p.id, p.name, p.path, p.lang, p.stack, p.created_at, p.last_active,
                 COUNT(s.id) as session_count,
                 COALESCE(SUM(s.cost_usd), 0.0) as total_cost_usd,
-                GROUP_CONCAT(DISTINCT s.agent) as agents
+                GROUP_CONCAT(DISTINCT s.agent) as agents,
+                p.github_repo
          FROM projects p
-         JOIN sessions s ON s.project_id = p.id
+         LEFT JOIN sessions s ON s.project_id = p.id
+         WHERE p.github_repo IS NOT NULL
          GROUP BY p.id
-         HAVING COUNT(s.id) > 0
          ORDER BY p.last_active DESC";
     let mut stmt = conn.prepare(sql)?;
     let rows = stmt.query_map([], |row| {
@@ -1778,9 +1792,85 @@ pub fn list_projects(conn: &Connection) -> rusqlite::Result<Vec<ProjectSummary>>
             agents: agents
                 .map(|s| s.split(',').map(String::from).collect())
                 .unwrap_or_default(),
+            github_repo: row.get(10)?,
         })
     })?;
     rows.collect()
+}
+
+/// A project row the GitHub verifier should (re-)check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectGithubCheck {
+    pub id: String,
+    pub path: String,
+    pub github_repo: Option<String>,
+}
+
+/// Projects never checked, or whose last check is older than its TTL: verified projects are
+/// re-checked rarely (access is rarely lost), unverified ones more often (the user may have
+/// just added a remote or run `gh auth login`). Most recently active first, so the projects
+/// the user cares about appear first on a cold start with many folders to check.
+pub fn projects_needing_github_check(
+    conn: &Connection,
+    now: i64,
+    verified_ttl_secs: i64,
+    unverified_ttl_secs: i64,
+) -> rusqlite::Result<Vec<ProjectGithubCheck>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, path, github_repo FROM projects
+         WHERE github_checked_at IS NULL
+            OR (github_repo IS NOT NULL AND github_checked_at < ?1 - ?2)
+            OR (github_repo IS NULL AND github_checked_at < ?1 - ?3)
+         ORDER BY last_active DESC",
+    )?;
+    let rows = stmt.query_map(
+        params![now, verified_ttl_secs, unverified_ttl_secs],
+        |row| {
+            Ok(ProjectGithubCheck {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                github_repo: row.get(2)?,
+            })
+        },
+    )?;
+    rows.collect()
+}
+
+/// Records a finished check: sets (or, with `None`, clears) the project's GitHub repository.
+/// Returns whether the stored repository changed, i.e. whether the project list did.
+pub fn set_project_github(
+    conn: &Connection,
+    project_id: &str,
+    github_repo: Option<&str>,
+    checked_at: i64,
+) -> rusqlite::Result<bool> {
+    let changed = conn.execute(
+        "UPDATE projects SET github_repo = ?2, github_checked_at = ?3
+         WHERE id = ?1 AND github_repo IS NOT ?2",
+        params![project_id, github_repo, checked_at],
+    )? > 0;
+    if !changed {
+        conn.execute(
+            "UPDATE projects SET github_checked_at = ?2 WHERE id = ?1",
+            params![project_id, checked_at],
+        )?;
+    }
+    Ok(changed)
+}
+
+/// Records a check that couldn't decide either way (gh missing, logged out, offline): keeps
+/// whatever repository was stored and only moves `github_checked_at`, so an offline moment
+/// never hides a project that was verified before.
+pub fn touch_project_github_check(
+    conn: &Connection,
+    project_id: &str,
+    checked_at: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE projects SET github_checked_at = ?2 WHERE id = ?1",
+        params![project_id, checked_at],
+    )?;
+    Ok(())
 }
 
 /// Lists every session for display, most-recently-active first.
@@ -2202,15 +2292,21 @@ pub fn sessions_needing_usage_rebuild(
 /// watchers have actually ingested sessions — Claude Code, Codex, Gemini, and Cursor all write
 /// their own `agent` value via `upsert_session` (see `parser/{claude_jsonl,codex_jsonl,
 /// gemini_log,cursor_jsonl}.rs`).
-pub fn agent_usage(conn: &Connection) -> rusqlite::Result<Vec<AgentUsage>> {
+///
+/// `project_id` scopes it to one project (the active workspace project); `None` is every project.
+pub fn agent_usage(
+    conn: &Connection,
+    project_id: Option<&str>,
+) -> rusqlite::Result<Vec<AgentUsage>> {
     let mut stmt = conn.prepare(
         "SELECT agent, COUNT(*) as session_count, COALESCE(SUM(cost_usd), 0.0) as total_cost_usd,
                 COALESCE(SUM(cost_unpriced), 0)
          FROM sessions
+         WHERE ?1 IS NULL OR project_id = ?1
          GROUP BY agent
          ORDER BY total_cost_usd DESC",
     )?;
-    let rows = stmt.query_map([], |row| {
+    let rows = stmt.query_map(params![project_id], |row| {
         Ok(AgentUsage {
             agent: row.get(0)?,
             session_count: row.get(1)?,
@@ -2228,6 +2324,9 @@ pub fn agent_usage(conn: &Connection) -> rusqlite::Result<Vec<AgentUsage>> {
 // `started_at` is nullable, so windowing on it would silently drop sessions that never got a
 // `started_at` recorded. "Report window" therefore means "sessions with activity in this
 // window," not "sessions started in this window."
+//
+// Each takes `project_id` to scope the report to the active workspace project; `None` reports
+// on every project.
 
 /// Headline totals for the report window: overall spend, session count, and raw token
 /// totals across every ingested agent. `avg_cost_per_session` is left for the caller to
@@ -2243,14 +2342,18 @@ pub struct ReportTotals {
     pub cache_creation_tokens: i64,
 }
 
-pub fn report_totals(conn: &Connection, since_epoch: i64) -> rusqlite::Result<ReportTotals> {
+pub fn report_totals(
+    conn: &Connection,
+    since_epoch: i64,
+    project_id: Option<&str>,
+) -> rusqlite::Result<ReportTotals> {
     conn.query_row(
         "SELECT COALESCE(SUM(cost_usd), 0.0), COUNT(*),
                 COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0),
                 COALESCE(SUM(cache_read_tokens), 0), COALESCE(SUM(cache_creation_tokens), 0)
          FROM sessions
-         WHERE last_activity_at >= ?1",
-        params![since_epoch],
+         WHERE last_activity_at >= ?1 AND (?2 IS NULL OR project_id = ?2)",
+        params![since_epoch, project_id],
         |row| {
             Ok(ReportTotals {
                 total_cost_usd: row.get(0)?,
@@ -2279,15 +2382,16 @@ pub struct ReportProjectRow {
 pub fn report_by_project(
     conn: &Connection,
     since_epoch: i64,
+    project_id: Option<&str>,
 ) -> rusqlite::Result<Vec<ReportProjectRow>> {
     let mut stmt = conn.prepare(
         "SELECT p.id, p.name, COUNT(s.id), COALESCE(SUM(s.cost_usd), 0.0)
          FROM sessions s JOIN projects p ON p.id = s.project_id
-         WHERE s.last_activity_at >= ?1
+         WHERE s.last_activity_at >= ?1 AND (?2 IS NULL OR s.project_id = ?2)
          GROUP BY p.id
          ORDER BY 4 DESC",
     )?;
-    let rows = stmt.query_map(params![since_epoch], |row| {
+    let rows = stmt.query_map(params![since_epoch, project_id], |row| {
         Ok(ReportProjectRow {
             project_id: row.get(0)?,
             project_name: row.get(1)?,
@@ -2301,16 +2405,20 @@ pub fn report_by_project(
 /// Same shape as `agent_usage` but windowed to the report period — kept as a separate query
 /// rather than adding a `since` parameter to `agent_usage` itself, since the Dashboard's
 /// all-time call site has no window to pass.
-pub fn agent_usage_since(conn: &Connection, since_epoch: i64) -> rusqlite::Result<Vec<AgentUsage>> {
+pub fn agent_usage_since(
+    conn: &Connection,
+    since_epoch: i64,
+    project_id: Option<&str>,
+) -> rusqlite::Result<Vec<AgentUsage>> {
     let mut stmt = conn.prepare(
         "SELECT agent, COUNT(*) as session_count, COALESCE(SUM(cost_usd), 0.0) as total_cost_usd,
                 COALESCE(SUM(cost_unpriced), 0)
          FROM sessions
-         WHERE last_activity_at >= ?1
+         WHERE last_activity_at >= ?1 AND (?2 IS NULL OR project_id = ?2)
          GROUP BY agent
          ORDER BY total_cost_usd DESC",
     )?;
-    let rows = stmt.query_map(params![since_epoch], |row| {
+    let rows = stmt.query_map(params![since_epoch, project_id], |row| {
         Ok(AgentUsage {
             agent: row.get(0)?,
             session_count: row.get(1)?,
@@ -2335,11 +2443,16 @@ pub struct ReportTagRow {
     pub total_cost_usd: f64,
 }
 
-pub fn report_by_tag(conn: &Connection, since_epoch: i64) -> rusqlite::Result<Vec<ReportTagRow>> {
+pub fn report_by_tag(
+    conn: &Connection,
+    since_epoch: i64,
+    project_id: Option<&str>,
+) -> rusqlite::Result<Vec<ReportTagRow>> {
     let mut stmt = conn.prepare(
-        "SELECT tags, cost_usd FROM sessions WHERE last_activity_at >= ?1 AND tags IS NOT NULL",
+        "SELECT tags, cost_usd FROM sessions
+         WHERE last_activity_at >= ?1 AND tags IS NOT NULL AND (?2 IS NULL OR project_id = ?2)",
     )?;
-    let rows = stmt.query_map(params![since_epoch], |row| {
+    let rows = stmt.query_map(params![since_epoch, project_id], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
     })?;
 
@@ -2388,15 +2501,16 @@ pub struct ActiveSessionSummary {
 
 pub fn most_recent_active_session(
     conn: &Connection,
+    project_id: Option<&str>,
 ) -> rusqlite::Result<Option<ActiveSessionSummary>> {
     conn.query_row(
         "SELECT s.id, s.title, s.summary, s.project_id, p.name
          FROM sessions s
          JOIN projects p ON p.id = s.project_id
-         WHERE s.status = 'active'
+         WHERE s.status = 'active' AND (?1 IS NULL OR s.project_id = ?1)
          ORDER BY s.last_activity_at DESC
          LIMIT 1",
-        [],
+        params![project_id],
         |row| {
             Ok(ActiveSessionSummary {
                 session_id: row.get(0)?,
@@ -2434,25 +2548,31 @@ pub fn most_recent_active_session_id_for_project(
 /// activity) — the caller fills in zero-activity days when building a fixed-length window,
 /// since walking 365 dense days here would mean serializing hundreds of zero rows out of SQL
 /// for no reason.
+///
+/// `project_id` scopes both kinds of event to one project; `None` counts every project.
 pub fn daily_activity_counts(
     conn: &Connection,
     since_epoch: i64,
+    project_id: Option<&str>,
 ) -> rusqlite::Result<HashMap<String, i64>> {
     let mut stmt = conn.prepare(
         "SELECT d, SUM(c) FROM (
             SELECT date(started_at, 'unixepoch') AS d, COUNT(*) AS c
             FROM sessions
             WHERE started_at IS NOT NULL AND started_at >= ?1
+              AND (?2 IS NULL OR project_id = ?2)
             GROUP BY d
             UNION ALL
-            SELECT date(occurred_at, 'unixepoch') AS d, COUNT(*) AS c
-            FROM files_changed
-            WHERE occurred_at >= ?1
+            SELECT date(f.occurred_at, 'unixepoch') AS d, COUNT(*) AS c
+            FROM files_changed f
+            WHERE f.occurred_at >= ?1
+              AND (?2 IS NULL
+                   OR f.session_id IN (SELECT id FROM sessions WHERE project_id = ?2))
             GROUP BY d
          )
          GROUP BY d",
     )?;
-    let rows = stmt.query_map(params![since_epoch], |row| {
+    let rows = stmt.query_map(params![since_epoch, project_id], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
     })?;
     rows.collect()
@@ -3147,13 +3267,64 @@ mod report_tests {
     }
 
     #[test]
+    fn report_and_dashboard_queries_scope_to_one_project_when_asked() {
+        let conn = in_memory_db();
+        upsert_project(&conn, "p1", "one", "/one", 1000).unwrap();
+        upsert_project(&conn, "p2", "two", "/two", 1000).unwrap();
+        seed_session(&conn, "s1", "p1", "claude", 2000, 1.0, Some("[\"bugfix\"]"));
+        seed_session(&conn, "s2", "p2", "codex", 2000, 4.0, Some("[\"feature\"]"));
+        insert_file_changed(&conn, "s2", "a.rs", "edit", 1, 0, 2000, None, None).unwrap();
+
+        assert_eq!(
+            report_totals(&conn, 1000, None).unwrap().total_cost_usd,
+            5.0
+        );
+        let p1 = report_totals(&conn, 1000, Some("p1")).unwrap();
+        assert_eq!((p1.session_count, p1.total_cost_usd), (1, 1.0));
+        assert_eq!(
+            report_by_project(&conn, 1000, Some("p2")).unwrap()[0].project_name,
+            "two"
+        );
+        assert_eq!(report_by_project(&conn, 1000, Some("p2")).unwrap().len(), 1);
+        let tags = report_by_tag(&conn, 1000, Some("p1")).unwrap();
+        assert_eq!(
+            tags.iter().map(|t| t.tag.as_str()).collect::<Vec<_>>(),
+            vec!["bugfix"]
+        );
+        let agents = agent_usage_since(&conn, 1000, Some("p2")).unwrap();
+        assert_eq!(
+            agents.iter().map(|a| a.agent.as_str()).collect::<Vec<_>>(),
+            vec!["codex"]
+        );
+        assert_eq!(agent_usage(&conn, Some("p1")).unwrap().len(), 1);
+        assert_eq!(agent_usage(&conn, None).unwrap().len(), 2);
+
+        // Heatmap: p2's day has its session start plus its file edit; p1 only its start.
+        let all: i64 = daily_activity_counts(&conn, 0, None)
+            .unwrap()
+            .values()
+            .sum();
+        let p1: i64 = daily_activity_counts(&conn, 0, Some("p1"))
+            .unwrap()
+            .values()
+            .sum();
+        let p2: i64 = daily_activity_counts(&conn, 0, Some("p2"))
+            .unwrap()
+            .values()
+            .sum();
+        assert_eq!((all, p1, p2), (3, 1, 2));
+        assert_eq!(project_name(&conn, "p2").unwrap().as_deref(), Some("two"));
+        assert_eq!(project_name(&conn, "nope").unwrap(), None);
+    }
+
+    #[test]
     fn report_totals_sums_only_sessions_inside_the_window() {
         let conn = in_memory_db();
         upsert_project(&conn, "p1", "fixture", "/fixture", 1000).unwrap();
         seed_session(&conn, "s1", "p1", "claude", 2000, 1.50, None);
         seed_session(&conn, "s2", "p1", "claude", 500, 9.00, None); // before the window
 
-        let totals = report_totals(&conn, 1000).unwrap();
+        let totals = report_totals(&conn, 1000, None).unwrap();
         assert_eq!(totals.session_count, 1);
         assert_eq!(totals.total_cost_usd, 1.50);
     }
@@ -3167,7 +3338,7 @@ mod report_tests {
         seed_session(&conn, "s2", "p2", "claude", 2100, 5.0, None);
         // p1 has no sessions at all inside (or outside) the window.
 
-        let rows = report_by_project(&conn, 1000).unwrap();
+        let rows = report_by_project(&conn, 1000, None).unwrap();
         assert_eq!(
             rows.len(),
             1,
@@ -3202,7 +3373,7 @@ mod report_tests {
         );
         seed_session(&conn, "s3", "p1", "claude", 2000, 100.0, None); // untagged, must be skipped
 
-        let rows = report_by_tag(&conn, 1000).unwrap();
+        let rows = report_by_tag(&conn, 1000, None).unwrap();
         let feature = rows.iter().find(|r| r.tag == "feature").unwrap();
         let bugfix = rows.iter().find(|r| r.tag == "bugfix").unwrap();
         assert_eq!(feature.session_count, 2);
@@ -3226,7 +3397,7 @@ mod report_tests {
         );
         seed_session(&conn, "s2", "p1", "claude", 2000, 1.0, Some(r#"["docs"]"#));
 
-        let rows = report_by_tag(&conn, 1000).unwrap();
+        let rows = report_by_tag(&conn, 1000, None).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].tag, "docs");
     }
@@ -3238,7 +3409,7 @@ mod report_tests {
         seed_session(&conn, "s1", "p1", "claude", 2000, 3.0, None);
         seed_session(&conn, "s2", "p1", "codex", 500, 7.0, None); // before the window
 
-        let rows = agent_usage_since(&conn, 1000).unwrap();
+        let rows = agent_usage_since(&conn, 1000, None).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].agent, "claude");
         assert_eq!(rows[0].total_cost_usd, 3.0);
@@ -3650,16 +3821,25 @@ mod list_query_tests {
             .unwrap();
         conn.execute_batch(include_str!("../../migrations/0011_session_usage.sql"))
             .unwrap();
+        conn.execute_batch(include_str!("../../migrations/0013_project_github.sql"))
+            .unwrap();
         conn
     }
 
-    /// Insert a project plus one session per id in `session_ids`.
+    /// Insert a verified project plus one session per id in `session_ids`.
     fn seed(conn: &Connection, project_id: &str, created_at: i64, session_ids: &[&str]) {
         upsert_project(
             conn,
             project_id,
             project_id,
             &format!("/{project_id}"),
+            created_at,
+        )
+        .unwrap();
+        set_project_github(
+            conn,
+            project_id,
+            Some(&format!("o/{project_id}")),
             created_at,
         )
         .unwrap();
@@ -3714,14 +3894,69 @@ mod list_query_tests {
     }
 
     #[test]
-    fn a_project_with_no_sessions_is_not_listed() {
+    fn only_github_verified_projects_are_listed_even_without_sessions() {
         let conn = in_memory_db();
-        // A directory Relay noticed but that never ran a session.
-        upsert_project(&conn, "empty", "empty", "/empty", 1000).unwrap();
         seed(&conn, "active", 2000, &["s1"]);
+        // A cwd an agent ran in that was never verified (or isn't on GitHub): not listed,
+        // but its sessions are kept.
+        upsert_project(&conn, "plain", "plain", "/plain", 3000).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, project_id, agent, started_at, last_activity_at, status, raw_log_path)
+             VALUES ('s2', 'plain', 'claude', 3000, 3000, 'active', '')",
+            [],
+        )
+        .unwrap();
+        // Just cloned: verified, no sessions yet. Listed.
+        upsert_project(&conn, "cloned", "cloned", "/cloned", 4000).unwrap();
+        set_project_github(&conn, "cloned", Some("o/cloned"), 4000).unwrap();
 
         let projects = list_projects(&conn).unwrap();
-        assert_eq!(ids(&projects, |p| p.id.clone()), set(&["active"]));
+        assert_eq!(ids(&projects, |p| p.id.clone()), set(&["active", "cloned"]));
+        let cloned = projects.iter().find(|p| p.id == "cloned").unwrap();
+        assert_eq!(cloned.session_count, 0);
+        assert!(cloned.agents.is_empty());
+        assert_eq!(cloned.github_repo.as_deref(), Some("o/cloned"));
+        assert_eq!(list_sessions(&conn).unwrap().len(), 2);
+
+        // Losing access hides it again.
+        assert!(set_project_github(&conn, "cloned", None, 5000).unwrap());
+        assert_eq!(
+            ids(&list_projects(&conn).unwrap(), |p| p.id.clone()),
+            set(&["active"])
+        );
+    }
+
+    #[test]
+    fn github_checks_target_unchecked_and_stale_projects_and_report_changes() {
+        let conn = in_memory_db();
+        upsert_project(&conn, "new", "new", "/new", 1000).unwrap();
+        upsert_project(&conn, "verified", "verified", "/verified", 2000).unwrap();
+        upsert_project(&conn, "plain", "plain", "/plain", 3000).unwrap();
+        // Checked at t=10000: one verified, one not on GitHub.
+        assert!(set_project_github(&conn, "verified", Some("o/verified"), 10_000).unwrap());
+        assert!(!set_project_github(&conn, "plain", None, 10_000).unwrap());
+
+        let due = |now| {
+            projects_needing_github_check(&conn, now, 1000, 100)
+                .unwrap()
+                .into_iter()
+                .map(|p| p.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(due(10_050), vec!["new"]);
+        // The unverified TTL lapses first; most recently active comes first.
+        assert_eq!(due(10_200), vec!["plain", "new"]);
+        assert_eq!(due(11_500), vec!["plain", "verified", "new"]);
+
+        // Re-confirming the same repository is not a change, but still counts as a check.
+        assert!(!set_project_github(&conn, "verified", Some("o/verified"), 20_000).unwrap());
+        // An inconclusive check keeps the repository and only moves the timestamp.
+        touch_project_github_check(&conn, "plain", 20_000).unwrap();
+        assert_eq!(due(20_050), vec!["new"]);
+        let verified = projects_needing_github_check(&conn, 50_000, 1000, 100).unwrap();
+        let verified = verified.iter().find(|p| p.id == "verified").unwrap();
+        assert_eq!(verified.github_repo.as_deref(), Some("o/verified"));
+        assert_eq!(verified.path, "/verified");
     }
 }
 

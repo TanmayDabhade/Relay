@@ -33,6 +33,7 @@ pub fn open(db_path: &Path) -> anyhow::Result<Connection> {
         M::up(include_str!("../../migrations/0010_dispatch_loop.sql")),
         M::up(include_str!("../../migrations/0011_session_usage.sql")),
         M::up(include_str!("../../migrations/0012_task_workspaces.sql")),
+        M::up(include_str!("../../migrations/0013_project_github.sql")),
     ]);
     migrations.to_latest(&mut conn)?;
 

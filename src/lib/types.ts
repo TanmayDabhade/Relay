@@ -157,6 +157,8 @@ export interface ReportTagRow {
 export interface ReportData {
   range_days: number;
   since_epoch: number;
+  /** The project the report is scoped to, or null for an all-projects report. */
+  project_name: string | null;
   totals: ReportTotals;
   by_project: ReportProjectRow[];
   /** A session with multiple tags contributes to each — spend here can sum to more than

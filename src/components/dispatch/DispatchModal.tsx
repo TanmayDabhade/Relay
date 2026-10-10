@@ -31,12 +31,20 @@ function saveOpenPr(value: boolean) {
 
 interface DispatchModalProps {
   projectId?: string;
+  /** Preselects this project in the picker shown when `projectId` isn't fixed. */
+  defaultProjectId?: string;
   card?: Card | null;
   onClose: () => void;
   onDispatched?: (dispatch: CreatedDispatch) => void;
 }
 
-export function DispatchModal({ projectId, card, onClose, onDispatched }: DispatchModalProps) {
+export function DispatchModal({
+  projectId,
+  defaultProjectId,
+  card,
+  onClose,
+  onDispatched,
+}: DispatchModalProps) {
   const queryClient = useQueryClient();
   const { data: connections = [], isLoading } = useQuery({
     queryKey: ["agent-connections"],
@@ -47,7 +55,7 @@ export function DispatchModal({ projectId, card, onClose, onDispatched }: Dispat
     queryFn: listProjects,
     enabled: projectId == null,
   });
-  const [projectOverride, setProjectOverride] = useState("");
+  const [projectOverride, setProjectOverride] = useState(defaultProjectId ?? "");
   const selectedProjectId = projectId ?? (projectOverride || projects[0]?.id || "");
   const available = useMemo(
     () => connections.filter((connection) => connection.enabled && connection.installed),

@@ -5,6 +5,7 @@ import { Button } from "../components/ui/Button";
 import { ActivityHeatmap } from "../components/ui/ActivityHeatmap";
 import { ProjectDot } from "../components/ui/ProjectDot";
 import { StatTile } from "../components/ui/StatTile";
+import { useActiveProject } from "../hooks/useActiveProject";
 import { agentMeta, KNOWN_AGENT_IDS } from "../lib/agents";
 import { formatCost, formatRelativeTime, isOngoingDispatch } from "../lib/format";
 import { colorForProject } from "../lib/projectColor";
@@ -32,18 +33,20 @@ interface DashboardViewProps {
     taskId: string;
     runId: string;
     startedAt: number;
+    projectId?: string;
   }) => void;
 }
 
 export function DashboardView({ onOpenAgentWork }: DashboardViewProps) {
   const [showComposer, setShowComposer] = useState(false);
+  const { activeProjectId, activeProject } = useActiveProject();
   const {
     data,
     isLoading: statsLoading,
     isError: statsError,
   } = useQuery({
-    queryKey: ["dashboard"],
-    queryFn: getDashboardStats,
+    queryKey: ["dashboard", activeProjectId],
+    queryFn: () => getDashboardStats(activeProjectId),
   });
   const {
     data: relayEntries = [],
@@ -54,7 +57,11 @@ export function DashboardView({ onOpenAgentWork }: DashboardViewProps) {
     queryFn: () => listDispatchTasks(0, Math.floor(Date.now() / 1000) + 86_400),
   });
 
-  const ongoingEntries = relayEntries.filter((entry) => isOngoingDispatch(entry.run.status));
+  const ongoingEntries = relayEntries.filter(
+    (entry) =>
+      isOngoingDispatch(entry.run.status) &&
+      (activeProjectId === null || entry.project_id === activeProjectId),
+  );
   const visibleEntries = ongoingEntries.slice(0, 6);
   const usageByAgent = new Map<string, AgentUsage>(
     data?.agent_usage.map((usage) => [usage.agent, usage]) ?? [],
@@ -118,6 +125,7 @@ export function DashboardView({ onOpenAgentWork }: DashboardViewProps) {
                     taskId: entry.id,
                     runId: entry.run.id,
                     startedAt,
+                    projectId: entry.project_id,
                   })
                 }
                 aria-label={`Open ${entry.title} in Agent work`}
@@ -157,8 +165,14 @@ export function DashboardView({ onOpenAgentWork }: DashboardViewProps) {
       <section className="home-insights" aria-labelledby="workspace-pulse-heading">
         <div className="home-section-heading">
           <div>
-            <h2 id="workspace-pulse-heading">Workspace pulse</h2>
-            <span>Your local agent activity at a glance</span>
+            <h2 id="workspace-pulse-heading">
+              {activeProject ? `${activeProject.name} pulse` : "Workspace pulse"}
+            </h2>
+            <span>
+              {activeProject
+                ? "This project's agent activity at a glance"
+                : "Agent activity across all projects at a glance"}
+            </span>
           </div>
         </div>
 
@@ -171,11 +185,15 @@ export function DashboardView({ onOpenAgentWork }: DashboardViewProps) {
             <div className="dashboard-stats-row">
               <StatTile value={`$${data.total_cost_usd.toFixed(2)}`} label="Total spend" />
               <StatTile value={data.total_sessions} label="Total sessions" />
-              <StatTile value={data.total_projects} label="Indexed projects" />
-              <StatTile
-                value={topProject ? topProject.name : "—"}
-                label="Highest usage project"
-              />
+              {activeProjectId === null ? (
+                <>
+                  <StatTile value={data.total_projects} label="Indexed projects" />
+                  <StatTile
+                    value={topProject ? topProject.name : "—"}
+                    label="Highest usage project"
+                  />
+                </>
+              ) : null}
             </div>
 
             <section className="dashboard-section">
@@ -185,7 +203,10 @@ export function DashboardView({ onOpenAgentWork }: DashboardViewProps) {
               </div>
             </section>
 
-            <div className="dashboard-columns">
+            <div
+              className={`dashboard-columns${activeProjectId === null ? "" : " dashboard-columns-single"}`}
+            >
+              {activeProjectId === null ? (
               <section className="dashboard-section dashboard-column">
                 <h3 className="dashboard-section-title">Highest usage projects</h3>
                 <div className="dashboard-card dashboard-project-list">
@@ -228,6 +249,7 @@ export function DashboardView({ onOpenAgentWork }: DashboardViewProps) {
                   })}
                 </div>
               </section>
+              ) : null}
 
               <section className="dashboard-section dashboard-column">
                 <h3 className="dashboard-section-title">Spend by agent</h3>
@@ -270,6 +292,7 @@ export function DashboardView({ onOpenAgentWork }: DashboardViewProps) {
 
       {showComposer ? (
         <DispatchModal
+          defaultProjectId={activeProjectId ?? undefined}
           onClose={() => setShowComposer(false)}
           onDispatched={(created) => {
             const startedAt = created.run.started_at ?? created.run.created_at;
@@ -277,6 +300,7 @@ export function DashboardView({ onOpenAgentWork }: DashboardViewProps) {
               taskId: created.task.id,
               runId: created.run.id,
               startedAt,
+              projectId: created.task.project_id,
             });
           }}
         />

@@ -63,18 +63,20 @@ export function getProjectGitInsights(projectPath: string): Promise<GitInsights>
   return invoke("project_git_insights", { projectPath });
 }
 
-export function getDashboardStats(): Promise<DashboardStats> {
-  return invoke("dashboard_stats");
+/** `projectId` scopes every number to one project; `null` covers all projects. */
+export function getDashboardStats(projectId: string | null): Promise<DashboardStats> {
+  return invoke("dashboard_stats", { projectId });
 }
 
-export function generateReport(rangeDays: number): Promise<ReportData> {
-  return invoke("generate_report", { rangeDays });
+/** `projectId` scopes the report to one project; `null` reports on all projects. */
+export function generateReport(rangeDays: number, projectId: string | null): Promise<ReportData> {
+  return invoke("generate_report", { rangeDays, projectId });
 }
 
 /** Writes the report as Markdown to the user's Downloads folder and resolves to the
  * absolute path it was saved at, for a "Reveal in Finder" follow-up action. */
-export function exportReport(rangeDays: number): Promise<string> {
-  return invoke("export_report", { rangeDays });
+export function exportReport(rangeDays: number, projectId: string | null): Promise<string> {
+  return invoke("export_report", { rangeDays, projectId });
 }
 
 export function revealInFinder(path: string): Promise<void> {

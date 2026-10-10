@@ -74,3 +74,106 @@
   font-size: var(--text-xs);
   color: var(--text-muted);
 }
+
+/* Active-project switcher under the "Workspace" label. */
+.sidebar-switcher {
+  position: relative;
+  margin-bottom: var(--space-3);
+}
+
+.sidebar-switcher-button {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  padding: var(--space-2);
+  border: 1px solid var(--border-default);
+  border-radius: 7px;
+  background: var(--surface-card);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: var(--text-base);
+  font-weight: 500;
+  text-align: left;
+  cursor: pointer;
+}
+
+.sidebar-switcher-button:hover {
+  border-color: var(--border-strong);
+}
+
+.sidebar-switcher-button:focus-visible,
+.sidebar-switcher-option:focus-visible {
+  outline: 0.125rem solid var(--accent-border);
+  outline-offset: 0.0625rem;
+}
+
+.sidebar-switcher-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar-switcher-caret {
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+}
+
+.sidebar-switcher-all {
+  width: 0.5rem;
+  display: inline-flex;
+  justify-content: center;
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+.sidebar-switcher-menu {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + var(--space-1));
+  left: 0;
+  right: 0;
+  max-height: 18rem;
+  overflow-y: auto;
+  margin: 0;
+  padding: var(--space-1);
+  list-style: none;
+  border: 1px solid var(--border-default);
+  border-radius: 8px;
+  background: var(--surface-card);
+  box-shadow: 0 0.5rem 1.5rem rgba(0, 0, 0, 0.12);
+}
+
+.sidebar-switcher-option {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  padding: var(--space-2);
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: var(--text-base);
+  text-align: left;
+  cursor: pointer;
+}
+
+.sidebar-switcher-option:hover {
+  background: var(--surface-raised);
+}
+
+.sidebar-switcher-option.selected {
+  background: var(--accent-muted);
+  color: var(--accent);
+  font-weight: 500;
+}
+
+.sidebar-switcher-empty {
+  padding: var(--space-2);
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}

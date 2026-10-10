@@ -1469,6 +1469,15 @@ pub fn project_path(conn: &Connection, project_id: &str) -> rusqlite::Result<Opt
     .optional()
 }
 
+pub fn project_name(conn: &Connection, project_id: &str) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT name FROM projects WHERE id = ?1",
+        params![project_id],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
 /// Keeps a dispatched task's board card aligned with the lifecycle Relay owns even when an
 /// agent does not expose an ingestible native session log. If an ingested session is linked,
 /// the existing session-based sync remains compatible because both target the same role.
@@ -2283,15 +2292,21 @@ pub fn sessions_needing_usage_rebuild(
 /// watchers have actually ingested sessions — Claude Code, Codex, Gemini, and Cursor all write
 /// their own `agent` value via `upsert_session` (see `parser/{claude_jsonl,codex_jsonl,
 /// gemini_log,cursor_jsonl}.rs`).
-pub fn agent_usage(conn: &Connection) -> rusqlite::Result<Vec<AgentUsage>> {
+///
+/// `project_id` scopes it to one project (the active workspace project); `None` is every project.
+pub fn agent_usage(
+    conn: &Connection,
+    project_id: Option<&str>,
+) -> rusqlite::Result<Vec<AgentUsage>> {
     let mut stmt = conn.prepare(
         "SELECT agent, COUNT(*) as session_count, COALESCE(SUM(cost_usd), 0.0) as total_cost_usd,
                 COALESCE(SUM(cost_unpriced), 0)
          FROM sessions
+         WHERE ?1 IS NULL OR project_id = ?1
          GROUP BY agent
          ORDER BY total_cost_usd DESC",
     )?;
-    let rows = stmt.query_map([], |row| {
+    let rows = stmt.query_map(params![project_id], |row| {
         Ok(AgentUsage {
             agent: row.get(0)?,
             session_count: row.get(1)?,
@@ -2309,6 +2324,9 @@ pub fn agent_usage(conn: &Connection) -> rusqlite::Result<Vec<AgentUsage>> {
 // `started_at` is nullable, so windowing on it would silently drop sessions that never got a
 // `started_at` recorded. "Report window" therefore means "sessions with activity in this
 // window," not "sessions started in this window."
+//
+// Each takes `project_id` to scope the report to the active workspace project; `None` reports
+// on every project.
 
 /// Headline totals for the report window: overall spend, session count, and raw token
 /// totals across every ingested agent. `avg_cost_per_session` is left for the caller to
@@ -2324,14 +2342,18 @@ pub struct ReportTotals {
     pub cache_creation_tokens: i64,
 }
 
-pub fn report_totals(conn: &Connection, since_epoch: i64) -> rusqlite::Result<ReportTotals> {
+pub fn report_totals(
+    conn: &Connection,
+    since_epoch: i64,
+    project_id: Option<&str>,
+) -> rusqlite::Result<ReportTotals> {
     conn.query_row(
         "SELECT COALESCE(SUM(cost_usd), 0.0), COUNT(*),
                 COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0),
                 COALESCE(SUM(cache_read_tokens), 0), COALESCE(SUM(cache_creation_tokens), 0)
          FROM sessions
-         WHERE last_activity_at >= ?1",
-        params![since_epoch],
+         WHERE last_activity_at >= ?1 AND (?2 IS NULL OR project_id = ?2)",
+        params![since_epoch, project_id],
         |row| {
             Ok(ReportTotals {
                 total_cost_usd: row.get(0)?,
@@ -2360,15 +2382,16 @@ pub struct ReportProjectRow {
 pub fn report_by_project(
     conn: &Connection,
     since_epoch: i64,
+    project_id: Option<&str>,
 ) -> rusqlite::Result<Vec<ReportProjectRow>> {
     let mut stmt = conn.prepare(
         "SELECT p.id, p.name, COUNT(s.id), COALESCE(SUM(s.cost_usd), 0.0)
          FROM sessions s JOIN projects p ON p.id = s.project_id
-         WHERE s.last_activity_at >= ?1
+         WHERE s.last_activity_at >= ?1 AND (?2 IS NULL OR s.project_id = ?2)
          GROUP BY p.id
          ORDER BY 4 DESC",
     )?;
-    let rows = stmt.query_map(params![since_epoch], |row| {
+    let rows = stmt.query_map(params![since_epoch, project_id], |row| {
         Ok(ReportProjectRow {
             project_id: row.get(0)?,
             project_name: row.get(1)?,
@@ -2382,16 +2405,20 @@ pub fn report_by_project(
 /// Same shape as `agent_usage` but windowed to the report period — kept as a separate query
 /// rather than adding a `since` parameter to `agent_usage` itself, since the Dashboard's
 /// all-time call site has no window to pass.
-pub fn agent_usage_since(conn: &Connection, since_epoch: i64) -> rusqlite::Result<Vec<AgentUsage>> {
+pub fn agent_usage_since(
+    conn: &Connection,
+    since_epoch: i64,
+    project_id: Option<&str>,
+) -> rusqlite::Result<Vec<AgentUsage>> {
     let mut stmt = conn.prepare(
         "SELECT agent, COUNT(*) as session_count, COALESCE(SUM(cost_usd), 0.0) as total_cost_usd,
                 COALESCE(SUM(cost_unpriced), 0)
          FROM sessions
-         WHERE last_activity_at >= ?1
+         WHERE last_activity_at >= ?1 AND (?2 IS NULL OR project_id = ?2)
          GROUP BY agent
          ORDER BY total_cost_usd DESC",
     )?;
-    let rows = stmt.query_map(params![since_epoch], |row| {
+    let rows = stmt.query_map(params![since_epoch, project_id], |row| {
         Ok(AgentUsage {
             agent: row.get(0)?,
             session_count: row.get(1)?,
@@ -2416,11 +2443,16 @@ pub struct ReportTagRow {
     pub total_cost_usd: f64,
 }
 
-pub fn report_by_tag(conn: &Connection, since_epoch: i64) -> rusqlite::Result<Vec<ReportTagRow>> {
+pub fn report_by_tag(
+    conn: &Connection,
+    since_epoch: i64,
+    project_id: Option<&str>,
+) -> rusqlite::Result<Vec<ReportTagRow>> {
     let mut stmt = conn.prepare(
-        "SELECT tags, cost_usd FROM sessions WHERE last_activity_at >= ?1 AND tags IS NOT NULL",
+        "SELECT tags, cost_usd FROM sessions
+         WHERE last_activity_at >= ?1 AND tags IS NOT NULL AND (?2 IS NULL OR project_id = ?2)",
     )?;
-    let rows = stmt.query_map(params![since_epoch], |row| {
+    let rows = stmt.query_map(params![since_epoch, project_id], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
     })?;
 
@@ -2469,15 +2501,16 @@ pub struct ActiveSessionSummary {
 
 pub fn most_recent_active_session(
     conn: &Connection,
+    project_id: Option<&str>,
 ) -> rusqlite::Result<Option<ActiveSessionSummary>> {
     conn.query_row(
         "SELECT s.id, s.title, s.summary, s.project_id, p.name
          FROM sessions s
          JOIN projects p ON p.id = s.project_id
-         WHERE s.status = 'active'
+         WHERE s.status = 'active' AND (?1 IS NULL OR s.project_id = ?1)
          ORDER BY s.last_activity_at DESC
          LIMIT 1",
-        [],
+        params![project_id],
         |row| {
             Ok(ActiveSessionSummary {
                 session_id: row.get(0)?,
@@ -2515,25 +2548,31 @@ pub fn most_recent_active_session_id_for_project(
 /// activity) — the caller fills in zero-activity days when building a fixed-length window,
 /// since walking 365 dense days here would mean serializing hundreds of zero rows out of SQL
 /// for no reason.
+///
+/// `project_id` scopes both kinds of event to one project; `None` counts every project.
 pub fn daily_activity_counts(
     conn: &Connection,
     since_epoch: i64,
+    project_id: Option<&str>,
 ) -> rusqlite::Result<HashMap<String, i64>> {
     let mut stmt = conn.prepare(
         "SELECT d, SUM(c) FROM (
             SELECT date(started_at, 'unixepoch') AS d, COUNT(*) AS c
             FROM sessions
             WHERE started_at IS NOT NULL AND started_at >= ?1
+              AND (?2 IS NULL OR project_id = ?2)
             GROUP BY d
             UNION ALL
-            SELECT date(occurred_at, 'unixepoch') AS d, COUNT(*) AS c
-            FROM files_changed
-            WHERE occurred_at >= ?1
+            SELECT date(f.occurred_at, 'unixepoch') AS d, COUNT(*) AS c
+            FROM files_changed f
+            WHERE f.occurred_at >= ?1
+              AND (?2 IS NULL
+                   OR f.session_id IN (SELECT id FROM sessions WHERE project_id = ?2))
             GROUP BY d
          )
          GROUP BY d",
     )?;
-    let rows = stmt.query_map(params![since_epoch], |row| {
+    let rows = stmt.query_map(params![since_epoch, project_id], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
     })?;
     rows.collect()
@@ -3228,13 +3267,43 @@ mod report_tests {
     }
 
     #[test]
+    fn report_and_dashboard_queries_scope_to_one_project_when_asked() {
+        let conn = in_memory_db();
+        upsert_project(&conn, "p1", "one", "/one", 1000).unwrap();
+        upsert_project(&conn, "p2", "two", "/two", 1000).unwrap();
+        seed_session(&conn, "s1", "p1", "claude", 2000, 1.0, Some("[\"bugfix\"]"));
+        seed_session(&conn, "s2", "p2", "codex", 2000, 4.0, Some("[\"feature\"]"));
+        insert_file_changed(&conn, "s2", "a.rs", "edit", 1, 0, 2000, None, None).unwrap();
+
+        assert_eq!(report_totals(&conn, 1000, None).unwrap().total_cost_usd, 5.0);
+        let p1 = report_totals(&conn, 1000, Some("p1")).unwrap();
+        assert_eq!((p1.session_count, p1.total_cost_usd), (1, 1.0));
+        assert_eq!(report_by_project(&conn, 1000, Some("p2")).unwrap()[0].project_name, "two");
+        assert_eq!(report_by_project(&conn, 1000, Some("p2")).unwrap().len(), 1);
+        let tags = report_by_tag(&conn, 1000, Some("p1")).unwrap();
+        assert_eq!(tags.iter().map(|t| t.tag.as_str()).collect::<Vec<_>>(), vec!["bugfix"]);
+        let agents = agent_usage_since(&conn, 1000, Some("p2")).unwrap();
+        assert_eq!(agents.iter().map(|a| a.agent.as_str()).collect::<Vec<_>>(), vec!["codex"]);
+        assert_eq!(agent_usage(&conn, Some("p1")).unwrap().len(), 1);
+        assert_eq!(agent_usage(&conn, None).unwrap().len(), 2);
+
+        // Heatmap: p2's day has its session start plus its file edit; p1 only its start.
+        let all: i64 = daily_activity_counts(&conn, 0, None).unwrap().values().sum();
+        let p1: i64 = daily_activity_counts(&conn, 0, Some("p1")).unwrap().values().sum();
+        let p2: i64 = daily_activity_counts(&conn, 0, Some("p2")).unwrap().values().sum();
+        assert_eq!((all, p1, p2), (3, 1, 2));
+        assert_eq!(project_name(&conn, "p2").unwrap().as_deref(), Some("two"));
+        assert_eq!(project_name(&conn, "nope").unwrap(), None);
+    }
+
+    #[test]
     fn report_totals_sums_only_sessions_inside_the_window() {
         let conn = in_memory_db();
         upsert_project(&conn, "p1", "fixture", "/fixture", 1000).unwrap();
         seed_session(&conn, "s1", "p1", "claude", 2000, 1.50, None);
         seed_session(&conn, "s2", "p1", "claude", 500, 9.00, None); // before the window
 
-        let totals = report_totals(&conn, 1000).unwrap();
+        let totals = report_totals(&conn, 1000, None).unwrap();
         assert_eq!(totals.session_count, 1);
         assert_eq!(totals.total_cost_usd, 1.50);
     }
@@ -3248,7 +3317,7 @@ mod report_tests {
         seed_session(&conn, "s2", "p2", "claude", 2100, 5.0, None);
         // p1 has no sessions at all inside (or outside) the window.
 
-        let rows = report_by_project(&conn, 1000).unwrap();
+        let rows = report_by_project(&conn, 1000, None).unwrap();
         assert_eq!(
             rows.len(),
             1,
@@ -3283,7 +3352,7 @@ mod report_tests {
         );
         seed_session(&conn, "s3", "p1", "claude", 2000, 100.0, None); // untagged, must be skipped
 
-        let rows = report_by_tag(&conn, 1000).unwrap();
+        let rows = report_by_tag(&conn, 1000, None).unwrap();
         let feature = rows.iter().find(|r| r.tag == "feature").unwrap();
         let bugfix = rows.iter().find(|r| r.tag == "bugfix").unwrap();
         assert_eq!(feature.session_count, 2);
@@ -3307,7 +3376,7 @@ mod report_tests {
         );
         seed_session(&conn, "s2", "p1", "claude", 2000, 1.0, Some(r#"["docs"]"#));
 
-        let rows = report_by_tag(&conn, 1000).unwrap();
+        let rows = report_by_tag(&conn, 1000, None).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].tag, "docs");
     }
@@ -3319,7 +3388,7 @@ mod report_tests {
         seed_session(&conn, "s1", "p1", "claude", 2000, 3.0, None);
         seed_session(&conn, "s2", "p1", "codex", 500, 7.0, None); // before the window
 
-        let rows = agent_usage_since(&conn, 1000).unwrap();
+        let rows = agent_usage_since(&conn, 1000, None).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].agent, "claude");
         assert_eq!(rows[0].total_cost_usd, 3.0);

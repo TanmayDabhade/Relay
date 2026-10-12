@@ -121,6 +121,7 @@ pub fn run() {
       commands::shutdown_dispatch_conversation,
       commands::get_task_workspace,
       commands::list_card_ships,
+      commands::get_card_changes,
       commands::ship_task,
       commands::draft_task,
       commands::plan_tasks,

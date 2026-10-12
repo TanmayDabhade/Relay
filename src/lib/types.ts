@@ -363,6 +363,68 @@ export interface CardShip {
   pr_url: string | null;
 }
 
+/** One commit on a task branch beyond its base (`get_card_changes`). */
+export interface CommitInfo {
+  sha: string;
+  short_sha: string;
+  subject: string;
+  author: string;
+  /** Author date, unix seconds. */
+  timestamp: number;
+}
+
+export type BranchFileStatus = "added" | "modified" | "deleted" | "renamed";
+
+export interface HunkLine {
+  kind: "context" | "add" | "del";
+  /** Base-side line number; null for an added line. */
+  old_line: number | null;
+  /** Branch-side line number; null for a deleted line. */
+  new_line: number | null;
+  content: string;
+  /** git's "\ No newline at end of file" followed this line. */
+  no_newline: boolean;
+}
+
+export interface DiffHunk {
+  /** The whole `@@ -a,b +c,d @@ context` line. */
+  header: string;
+  old_start: number;
+  old_lines: number;
+  new_start: number;
+  new_lines: number;
+  lines: HunkLine[];
+}
+
+/** One file in a task branch's diff. Named apart from the session `FileDiff` above. */
+export interface BranchFileDiff {
+  /** Branch-side path (the base-side path for a deleted file). */
+  path: string;
+  /** Base-side path, for renames only. */
+  old_path: string | null;
+  status: BranchFileStatus;
+  additions: number;
+  deletions: number;
+  /** No hunks or line counts: git reported the file as binary. */
+  binary: boolean;
+  hunks: DiffHunk[];
+  /** Some of this file's lines were left out (per-file line cap or the total size cap). */
+  truncated: boolean;
+}
+
+export interface BranchDiff {
+  files: BranchFileDiff[];
+  /** The diff hit its total size cap; files after the last one listed are missing. */
+  truncated: boolean;
+}
+
+/** A card's task branch as its PR would show it: commits (oldest first) and files changed. */
+export interface CardChanges {
+  workspace: TaskWorkspace;
+  commits: CommitInfo[];
+  diff: BranchDiff;
+}
+
 export interface TaskDraft {
   title: string;
   prompt: string;

@@ -12,6 +12,7 @@ import type {
   DispatchConversation,
   DispatchTaskWithRun,
   FileDiff,
+  CardChanges,
   CardShip,
   GitInsights,
   Plan,
@@ -232,6 +233,12 @@ export function getTaskWorkspace(taskId: string): Promise<TaskWorkspace | null> 
 
 export function listCardShips(projectId: string): Promise<CardShip[]> {
   return invoke("list_card_ships", { projectId });
+}
+
+/** The commits and per-file diff of the branch behind a card's newest PR-bound task, or
+ * null when the card has none. Reads local git only; nothing is fetched from GitHub. */
+export function getCardChanges(cardId: string): Promise<CardChanges | null> {
+  return invoke("get_card_changes", { cardId });
 }
 
 /** Commits, pushes, and opens (or updates) the task's PR now. Resolves once the ship has

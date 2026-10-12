@@ -7,6 +7,7 @@
 use crate::db::queries::TaskWorkspace;
 use crate::dispatch;
 use crate::tags;
+use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -40,10 +41,12 @@ pub struct ShipContext<'a> {
     pub summary: Option<&'a str>,
 }
 
-fn run(program: &str, dir: &Path, args: &[&str]) -> anyhow::Result<String> {
+/// The hardened command every git/gh process Relay starts goes through (see `run`).
+fn command(program: &str, dir: &Path, args: &[&str]) -> anyhow::Result<Command> {
     let executable = dispatch::resolve_executable(program)
         .ok_or_else(|| anyhow::anyhow!("`{program}` was not found on this machine's PATH"))?;
-    let output = Command::new(executable)
+    let mut command = Command::new(executable);
+    command
         .args(args)
         .current_dir(dir)
         // A Finder-launched app has launchd's bare PATH; git hooks and gh's credential
@@ -64,8 +67,12 @@ fn run(program: &str, dir: &Path, args: &[&str]) -> anyhow::Result<String> {
         // `ext::` remote URLs run a command; git refuses them by default, and this keeps a
         // repo-level override from turning them back on.
         .env("GIT_CONFIG_KEY_2", "protocol.ext.allow")
-        .env("GIT_CONFIG_VALUE_2", "never")
-        .output()?;
+        .env("GIT_CONFIG_VALUE_2", "never");
+    Ok(command)
+}
+
+fn run(program: &str, dir: &Path, args: &[&str]) -> anyhow::Result<String> {
+    let output = command(program, dir, args)?.output()?;
     if output.status.success() {
         return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
     }
@@ -183,13 +190,66 @@ fn ensure_safe_worktree_config(workspace: &TaskWorkspace) -> anyhow::Result<()> 
     )?)
 }
 
-/// Runs git inside a task's worktree with the repository pinned to `trusted_git_dir`, so
+/// `run`, but for output that can be arbitrarily large (a branch's whole diff): stdout is kept
+/// untrimmed and read up to `max_bytes`, after which git is stopped instead of buffering the
+/// rest in memory. Returns the output and whether it was cut short.
+fn run_capped(
+    program: &str,
+    dir: &Path,
+    args: &[&str],
+    max_bytes: usize,
+) -> anyhow::Result<(String, bool)> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut child = command(program, dir, args)?
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let (Some(stdout), Some(mut stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        let _ = child.kill();
+        anyhow::bail!("`{program}` started without its output pipes");
+    };
+    // Drained on its own thread so a chatty stderr can't fill its pipe and stall the process
+    // while stdout is still being read.
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = stderr.read_to_end(&mut buffer);
+        buffer
+    });
+    let mut output = Vec::new();
+    let read = stdout.take(max_bytes as u64 + 1).read_to_end(&mut output);
+    let cut_short = output.len() > max_bytes;
+    if cut_short || read.is_err() {
+        let _ = child.kill();
+    }
+    let status = child.wait()?;
+    let stderr = stderr_reader.join().unwrap_or_default();
+    read?;
+    if cut_short {
+        output.truncate(max_bytes);
+        return Ok((String::from_utf8_lossy(&output).into_owned(), true));
+    }
+    if !status.success() {
+        let detail = String::from_utf8_lossy(&stderr).trim().to_string();
+        anyhow::bail!("`{program} {}` failed: {detail}", args.join(" "));
+    }
+    Ok((String::from_utf8_lossy(&output).into_owned(), false))
+}
+
+/// The arguments that pin git to a task's worktree: `--git-dir` from `trusted_git_dir`, so
 /// nothing the agent wrote in its folder decides which repository or config git uses.
-fn worktree_git(workspace: &TaskWorkspace, args: &[&str]) -> anyhow::Result<String> {
+fn worktree_git_args(workspace: &TaskWorkspace) -> anyhow::Result<Vec<String>> {
     let git_dir = trusted_git_dir(workspace)?;
-    let git_dir_arg = format!("--git-dir={}", git_dir.display());
-    let work_tree_arg = format!("--work-tree={}", workspace.worktree_path);
-    let mut full = vec![git_dir_arg.as_str(), work_tree_arg.as_str()];
+    Ok(vec![
+        format!("--git-dir={}", git_dir.display()),
+        format!("--work-tree={}", workspace.worktree_path),
+    ])
+}
+
+/// Runs git inside a task's worktree with the repository pinned to `trusted_git_dir`.
+fn worktree_git(workspace: &TaskWorkspace, args: &[&str]) -> anyhow::Result<String> {
+    let pinned = worktree_git_args(workspace)?;
+    let mut full: Vec<&str> = pinned.iter().map(String::as_str).collect();
     full.extend_from_slice(args);
     run("git", Path::new(&workspace.worktree_path), &full)
 }
@@ -709,6 +769,490 @@ pub fn discard_workspace(workspace: &TaskWorkspace) -> anyhow::Result<()> {
     Ok(())
 }
 
+// --- A task branch's commits and diff (what a PR's Commits and Files changed tabs show) ---
+
+/// Most commits listed for one branch (newest kept). GitHub's own PR commit list stops at 250.
+const MAX_BRANCH_COMMITS: usize = 250;
+/// Bytes of `git log` output read for the commit list; far beyond what 250 subjects need.
+const MAX_LOG_BYTES: usize = 1_000_000;
+/// Bytes of patch text read for a branch's diff. Past it git is stopped, the files seen so far
+/// are kept and the diff is flagged truncated — a branch that commits a generated bundle or a
+/// lockfile would otherwise ship megabytes over IPC.
+const MAX_BRANCH_DIFF_BYTES: usize = 2_000_000;
+/// Diff lines kept per file, matching the session diff cap (`commands::MAX_DIFF_LINES`).
+/// Additions/deletions still count every line past it.
+const MAX_FILE_DIFF_LINES: usize = 2_000;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CommitInfo {
+    pub sha: String,
+    pub short_sha: String,
+    pub subject: String,
+    pub author: String,
+    /// Author date, unix seconds.
+    pub timestamp: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileStatus {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LineKind {
+    Context,
+    Add,
+    Del,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HunkLine {
+    pub kind: LineKind,
+    /// Line number on the base side; `None` for an added line.
+    pub old_line: Option<u32>,
+    /// Line number on the branch side; `None` for a deleted line.
+    pub new_line: Option<u32>,
+    pub content: String,
+    /// git's `\ No newline at end of file` followed this line.
+    pub no_newline: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Hunk {
+    /// The whole `@@ -a,b +c,d @@ context` line.
+    pub header: String,
+    pub old_start: u32,
+    pub old_lines: u32,
+    pub new_start: u32,
+    pub new_lines: u32,
+    pub lines: Vec<HunkLine>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FileDiff {
+    /// Path on the branch side (the base side's path for a deleted file).
+    pub path: String,
+    /// The base side's path, for renames only.
+    pub old_path: Option<String>,
+    pub status: FileStatus,
+    pub additions: u32,
+    pub deletions: u32,
+    /// git reported "Binary files … differ": no hunks, no line counts.
+    pub binary: bool,
+    pub hunks: Vec<Hunk>,
+    /// Some of this file's lines were left out (`MAX_FILE_DIFF_LINES`, or the whole diff hit
+    /// `MAX_BRANCH_DIFF_BYTES` inside this file).
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BranchDiff {
+    pub files: Vec<FileDiff>,
+    /// The diff was cut at `MAX_BRANCH_DIFF_BYTES`, so files after the last one listed are
+    /// missing.
+    pub truncated: bool,
+}
+
+/// Runs a read-only git command against a task's branch, through the same checks as every
+/// other git call here. While the worktree exists git is pinned to it (`worktree_git_args`)
+/// after `ensure_safe_worktree_config`; once it is gone (shut down, or deleted by hand) the
+/// branch ref is read from the user's checkout at `repo_root`, after `ensure_safe_config` on
+/// that repository. Only refs and objects are read: nothing is checked out or written.
+fn read_branch(
+    workspace: &TaskWorkspace,
+    args: &[&str],
+    max_bytes: usize,
+) -> anyhow::Result<(String, bool)> {
+    let worktree = Path::new(&workspace.worktree_path);
+    if workspace.removed_at.is_none() && worktree.is_dir() {
+        ensure_safe_worktree_config(workspace)?;
+        let pinned = worktree_git_args(workspace)?;
+        let mut full: Vec<&str> = pinned.iter().map(String::as_str).collect();
+        full.extend_from_slice(args);
+        return run_capped("git", worktree, &full, max_bytes);
+    }
+    let repo = Path::new(&workspace.repo_root);
+    ensure_safe_config(&git(repo, &["config", "--show-scope", "--list"])?)?;
+    run_capped("git", repo, args, max_bytes)
+}
+
+/// The commits on the task branch that its base doesn't have (`base..branch`), oldest first
+/// like a PR's Commits tab. Committed work only: anything the agent left uncommitted in the
+/// worktree isn't on the branch yet, so it isn't in the PR either.
+pub fn branch_commits(workspace: &TaskWorkspace) -> anyhow::Result<Vec<CommitInfo>> {
+    let range = format!("{}..{}", workspace.base_branch, workspace.branch);
+    let max_count = format!("--max-count={MAX_BRANCH_COMMITS}");
+    let (output, _) = read_branch(
+        workspace,
+        &[
+            "log",
+            "--no-color",
+            "--no-decorate",
+            // `log.showSignature` in the user's config would run gpg for every commit.
+            "--no-show-signature",
+            "--reverse",
+            &max_count,
+            "--format=%H%x1f%h%x1f%an%x1f%at%x1f%s%x1e",
+            &range,
+            "--",
+        ],
+        MAX_LOG_BYTES,
+    )?;
+    Ok(parse_commit_log(&output))
+}
+
+/// Parses `git log` output in the `%x1f`-separated, `%x1e`-terminated format above. A record
+/// that doesn't have all five fields (the output was cut mid-record) is skipped.
+pub fn parse_commit_log(output: &str) -> Vec<CommitInfo> {
+    output
+        .split('\x1e')
+        .filter_map(|record| {
+            let mut fields = record.trim_start_matches('\n').split('\x1f');
+            let sha = fields.next()?.to_string();
+            let short_sha = fields.next()?.to_string();
+            let author = fields.next()?.to_string();
+            let timestamp = fields.next()?.parse().ok()?;
+            let subject = fields.next()?.to_string();
+            (!sha.is_empty()).then_some(CommitInfo {
+                sha,
+                short_sha,
+                subject,
+                author,
+                timestamp,
+            })
+        })
+        .collect()
+}
+
+/// The branch's changes against the point it forked from its base (`base...branch`, the
+/// diff a PR's Files changed tab shows), parsed per file.
+pub fn branch_diff(workspace: &TaskWorkspace) -> anyhow::Result<BranchDiff> {
+    let range = format!("{}...{}", workspace.base_branch, workspace.branch);
+    let (output, cut_short) = read_branch(
+        workspace,
+        &[
+            "diff",
+            "--no-color",
+            // External diff drivers and textconv filters are programs named by config.
+            "--no-ext-diff",
+            "--no-textconv",
+            "--find-renames",
+            // Pinned so the user's diff config (`diff.noprefix`, `diff.mnemonicPrefix`,
+            // `diff.relative`, `diff.submodule`) can't change the format being parsed.
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
+            "--no-relative",
+            "--submodule=short",
+            &range,
+            "--",
+        ],
+        MAX_BRANCH_DIFF_BYTES,
+    )?;
+    Ok(parse_branch_diff(&output, cut_short, MAX_FILE_DIFF_LINES))
+}
+
+/// Parses a whole `git diff` that may have been cut at a byte cap (`cut_short`). The cut
+/// usually lands mid-line, so the partial last line is dropped and the file it was in is
+/// flagged truncated, along with the diff as a whole.
+pub fn parse_branch_diff(patch: &str, cut_short: bool, max_file_lines: usize) -> BranchDiff {
+    let complete = if cut_short {
+        patch.rfind('\n').map_or("", |end| &patch[..end])
+    } else {
+        patch
+    };
+    let mut files = parse_diff(complete, max_file_lines);
+    if cut_short {
+        if let Some(last) = files.last_mut() {
+            last.truncated = true;
+        }
+    }
+    BranchDiff {
+        files,
+        truncated: cut_short,
+    }
+}
+
+/// The hunk currently being read: its index in `FileDiff::hunks` (`None` once the file is
+/// over its line budget) and the next line numbers / lines left on each side.
+struct HunkCursor {
+    index: Option<usize>,
+    old_line: u32,
+    new_line: u32,
+    old_left: u32,
+    new_left: u32,
+}
+
+/// Parses `git diff` patch output into one `FileDiff` per file. Defensive like the log
+/// parsers: anything unrecognized is skipped, never a panic. Each file keeps at most
+/// `max_file_lines` lines (then `truncated`), while its additions/deletions count them all.
+pub fn parse_diff(patch: &str, max_file_lines: usize) -> Vec<FileDiff> {
+    let mut files: Vec<FileDiff> = Vec::new();
+    let mut kept_lines = 0usize;
+    let mut cursor: Option<HunkCursor> = None;
+    // Not `lines()`: that would also strip a `\r` that belongs to a CRLF file's content.
+    for line in patch.split('\n') {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            let path = parse_diff_git_paths(rest).unwrap_or_default();
+            files.push(FileDiff {
+                path,
+                old_path: None,
+                status: FileStatus::Modified,
+                additions: 0,
+                deletions: 0,
+                binary: false,
+                hunks: Vec::new(),
+                truncated: false,
+            });
+            kept_lines = 0;
+            cursor = None;
+            continue;
+        }
+        let Some(file) = files.last_mut() else {
+            continue;
+        };
+
+        if line.starts_with("@@") {
+            let Some((old_start, old_lines, new_start, new_lines)) = parse_hunk_header(line) else {
+                cursor = None;
+                continue;
+            };
+            let index = if kept_lines < max_file_lines {
+                file.hunks.push(Hunk {
+                    header: line.to_string(),
+                    old_start,
+                    old_lines,
+                    new_start,
+                    new_lines,
+                    lines: Vec::new(),
+                });
+                Some(file.hunks.len() - 1)
+            } else {
+                file.truncated = true;
+                None
+            };
+            cursor = Some(HunkCursor {
+                index,
+                old_line: old_start,
+                new_line: new_start,
+                old_left: old_lines,
+                new_left: new_lines,
+            });
+            continue;
+        }
+
+        if line.starts_with('\\') {
+            // `\ No newline at end of file` (wording is localized) marks the line before it,
+            // and can sit mid-hunk: after the old side's last line, before the new side's.
+            if let Some(last) = cursor
+                .as_ref()
+                .and_then(|c| c.index)
+                .and_then(|index| file.hunks[index].lines.last_mut())
+            {
+                last.no_newline = true;
+            }
+            continue;
+        }
+
+        if let Some(hunk) = cursor.as_mut().filter(|c| c.old_left > 0 || c.new_left > 0) {
+            // `diff.suppressBlankEmpty` writes a blank context line as an empty line.
+            let (kind, content) = match line.as_bytes().first() {
+                Some(b'+') => (LineKind::Add, &line[1..]),
+                Some(b'-') => (LineKind::Del, &line[1..]),
+                Some(b' ') => (LineKind::Context, &line[1..]),
+                None => (LineKind::Context, ""),
+                Some(_) => {
+                    cursor = None;
+                    continue;
+                }
+            };
+            let (old_line, new_line) = match kind {
+                LineKind::Add => {
+                    file.additions += 1;
+                    hunk.new_left = hunk.new_left.saturating_sub(1);
+                    hunk.new_line += 1;
+                    (None, Some(hunk.new_line - 1))
+                }
+                LineKind::Del => {
+                    file.deletions += 1;
+                    hunk.old_left = hunk.old_left.saturating_sub(1);
+                    hunk.old_line += 1;
+                    (Some(hunk.old_line - 1), None)
+                }
+                LineKind::Context => {
+                    hunk.old_left = hunk.old_left.saturating_sub(1);
+                    hunk.new_left = hunk.new_left.saturating_sub(1);
+                    hunk.old_line += 1;
+                    hunk.new_line += 1;
+                    (Some(hunk.old_line - 1), Some(hunk.new_line - 1))
+                }
+            };
+            if kept_lines >= max_file_lines {
+                hunk.index = None;
+                file.truncated = true;
+            }
+            if let Some(index) = hunk.index {
+                file.hunks[index].lines.push(HunkLine {
+                    kind,
+                    old_line,
+                    new_line,
+                    content: content.to_string(),
+                    no_newline: false,
+                });
+                kept_lines += 1;
+            }
+            continue;
+        }
+
+        // Extended header lines between `diff --git` and the first hunk.
+        if line.starts_with("new file mode ") {
+            file.status = FileStatus::Added;
+        } else if line.starts_with("deleted file mode ") {
+            file.status = FileStatus::Deleted;
+        } else if let Some(from) = line.strip_prefix("rename from ") {
+            file.status = FileStatus::Renamed;
+            file.old_path = Some(unquote_path(from));
+        } else if let Some(to) = line.strip_prefix("rename to ") {
+            file.status = FileStatus::Renamed;
+            file.path = unquote_path(to);
+        } else if let Some(new) = line.strip_prefix("+++ ") {
+            if let Some(path) = side_path(new, "b/") {
+                file.path = path;
+            }
+        } else if let Some(old) = line.strip_prefix("--- ") {
+            // A deleted file's only path is on the `---` side.
+            if file.status == FileStatus::Deleted {
+                if let Some(path) = side_path(old, "a/") {
+                    file.path = path;
+                }
+            }
+        } else if line.starts_with("Binary files ") || line == "GIT binary patch" {
+            file.binary = true;
+        }
+    }
+    files
+}
+
+/// `@@ -a,b +c,d @@ …` → (a, b, c, d); an omitted count means 1.
+fn parse_hunk_header(line: &str) -> Option<(u32, u32, u32, u32)> {
+    let mut parts = line.strip_prefix("@@ ")?.split(' ');
+    let old = parts.next()?.strip_prefix('-')?;
+    let new = parts.next()?.strip_prefix('+')?;
+    let range = |spec: &str| -> Option<(u32, u32)> {
+        match spec.split_once(',') {
+            Some((start, count)) => Some((start.parse().ok()?, count.parse().ok()?)),
+            None => Some((spec.parse().ok()?, 1)),
+        }
+    };
+    let (old_start, old_lines) = range(old)?;
+    let (new_start, new_lines) = range(new)?;
+    Some((old_start, old_lines, new_start, new_lines))
+}
+
+/// The path from a `---`/`+++` line, without its `a/`/`b/` prefix; `None` for `/dev/null`.
+/// git appends a tab to a name containing spaces, and C-quotes unusual names.
+fn side_path(spec: &str, prefix: &str) -> Option<String> {
+    let spec = spec.strip_suffix('\t').unwrap_or(spec);
+    if spec == "/dev/null" {
+        return None;
+    }
+    let path = unquote_path(spec);
+    Some(
+        path.strip_prefix(prefix)
+            .map(str::to_string)
+            .unwrap_or(path),
+    )
+}
+
+/// The path from `diff --git a/<p> b/<p>`. Only a fallback, used as-is for binary and
+/// mode-only changes (no `---`/`+++` lines): renames always carry `rename from/to`, so here
+/// both sides name the same file, which is how a path containing ` b/` is split correctly.
+fn parse_diff_git_paths(rest: &str) -> Option<String> {
+    if rest.starts_with('"') {
+        let (first, _) = split_quoted(rest)?;
+        return Some(
+            first
+                .strip_prefix("a/")
+                .map(str::to_string)
+                .unwrap_or(first),
+        );
+    }
+    // `a/<p> b/<p>`: 2 + p + 1 + 2 + p bytes.
+    let len = rest.len();
+    if len >= 5 && (len - 5) % 2 == 0 {
+        let p = (len - 5) / 2;
+        if let (Some(a), Some(b)) = (rest.get(2..2 + p), rest.get(5 + p..)) {
+            if rest.starts_with("a/") && rest.get(2 + p..5 + p) == Some(" b/") && a == b {
+                return Some(a.to_string());
+            }
+        }
+    }
+    let (a, _) = rest.split_once(" b/")?;
+    Some(a.strip_prefix("a/").unwrap_or(a).to_string())
+}
+
+/// Splits a leading C-quoted token off `text`, returning it unquoted and the remainder.
+fn split_quoted(text: &str) -> Option<(String, &str)> {
+    let bytes = text.as_bytes();
+    let mut i = 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'"' => return Some((unquote_path(&text[..=i]), &text[i + 1..])),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Undoes git's C-style path quoting (`core.quotePath`): `"tab\there"`, octal escapes for
+/// non-ASCII bytes. An unquoted path is returned unchanged.
+fn unquote_path(text: &str) -> String {
+    let Some(inner) = text
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+    else {
+        return text.to_string();
+    };
+    let bytes = inner.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' || i + 1 >= bytes.len() {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        let escaped = bytes[i + 1];
+        i += 2;
+        match escaped {
+            b'a' => out.push(0x07),
+            b'b' => out.push(0x08),
+            b'f' => out.push(0x0c),
+            b'n' => out.push(b'\n'),
+            b'r' => out.push(b'\r'),
+            b't' => out.push(b'\t'),
+            b'v' => out.push(0x0b),
+            b'0'..=b'7' => {
+                let mut value = u32::from(escaped - b'0');
+                let mut digits = 1;
+                while digits < 3 && i < bytes.len() && (b'0'..=b'7').contains(&bytes[i]) {
+                    value = value * 8 + u32::from(bytes[i] - b'0');
+                    i += 1;
+                    digits += 1;
+                }
+                out.push(value as u8);
+            }
+            other => out.push(other),
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1029,6 +1573,364 @@ local\tremote.evil.url=ext::sh -c touch% /tmp/pwned";
         assert!(!ensure_worktree(&ws).unwrap());
 
         let _ = remove_worktree(&ws);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn commit_log_records_parse_and_cut_records_are_skipped() {
+        let output = "aaaa\x1faa\x1fAda\x1f100\x1ffeat: one\x1e\nbbbb\x1fbb\x1fBo\x1f200\x1ffix: two | x\x1e\ncccc\x1fcc\x1fCy";
+        let commits = parse_commit_log(output);
+        assert_eq!(commits.len(), 2);
+        assert_eq!(
+            commits[1],
+            CommitInfo {
+                sha: "bbbb".into(),
+                short_sha: "bb".into(),
+                subject: "fix: two | x".into(),
+                author: "Bo".into(),
+                timestamp: 200,
+            }
+        );
+        assert!(parse_commit_log("").is_empty());
+    }
+
+    const ADDED: &str = "diff --git a/new.txt b/new.txt
+new file mode 100644
+index 0000000..3b18e51
+--- /dev/null
++++ b/new.txt
+@@ -0,0 +1,2 @@
++hello
++world
+";
+
+    #[test]
+    fn added_files_number_new_lines_only() {
+        let files = parse_diff(ADDED, 100);
+        assert_eq!(files.len(), 1);
+        let file = &files[0];
+        assert_eq!(file.path, "new.txt");
+        assert_eq!(file.status, FileStatus::Added);
+        assert_eq!((file.additions, file.deletions), (2, 0));
+        assert_eq!(file.old_path, None);
+        let hunk = &file.hunks[0];
+        assert_eq!(
+            (
+                hunk.old_start,
+                hunk.old_lines,
+                hunk.new_start,
+                hunk.new_lines
+            ),
+            (0, 0, 1, 2)
+        );
+        assert_eq!(
+            hunk.lines[1],
+            HunkLine {
+                kind: LineKind::Add,
+                old_line: None,
+                new_line: Some(2),
+                content: "world".into(),
+                no_newline: false,
+            }
+        );
+    }
+
+    #[test]
+    fn modified_files_track_both_sides_and_keep_header_lookalikes_as_content() {
+        let patch = "diff --git a/src/lib.rs b/src/lib.rs
+index 1111111..2222222 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -10,4 +10,4 @@ fn main() {
+ keep
+--- a removed line that looks like a header
++++ an added line that looks like a header
+ 
+ tail
+@@ -40 +40,2 @@
+-x
++y
++z
+";
+        let files = parse_diff(patch, 100);
+        assert_eq!(files.len(), 1);
+        let file = &files[0];
+        assert_eq!(file.path, "src/lib.rs");
+        assert_eq!(file.status, FileStatus::Modified);
+        assert_eq!((file.additions, file.deletions), (3, 2));
+        assert_eq!(file.hunks.len(), 2);
+        let first = &file.hunks[0];
+        assert_eq!(first.header, "@@ -10,4 +10,4 @@ fn main() {");
+        let numbers: Vec<_> = first
+            .lines
+            .iter()
+            .map(|l| (l.kind, l.old_line, l.new_line))
+            .collect();
+        assert_eq!(
+            numbers,
+            vec![
+                (LineKind::Context, Some(10), Some(10)),
+                (LineKind::Del, Some(11), None),
+                (LineKind::Add, None, Some(11)),
+                (LineKind::Context, Some(12), Some(12)),
+                (LineKind::Context, Some(13), Some(13)),
+            ]
+        );
+        assert_eq!(
+            first.lines[1].content,
+            "-- a removed line that looks like a header"
+        );
+        assert_eq!(first.lines[3].content, "");
+        // `@@ -40 +40,2 @@`: an omitted count is 1.
+        assert_eq!(file.hunks[1].old_lines, 1);
+        assert_eq!(file.hunks[1].lines.len(), 3);
+    }
+
+    #[test]
+    fn deleted_files_take_their_path_from_the_base_side() {
+        let patch = "diff --git a/old dir/gone.txt b/old dir/gone.txt
+deleted file mode 100644
+index 3b18e51..0000000
+--- a/old dir/gone.txt\t
++++ /dev/null
+@@ -1 +0,0 @@
+-bye
+";
+        let file = &parse_diff(patch, 100)[0];
+        assert_eq!(file.status, FileStatus::Deleted);
+        assert_eq!(file.path, "old dir/gone.txt");
+        assert_eq!((file.additions, file.deletions), (0, 1));
+        assert_eq!(file.hunks[0].lines[0].old_line, Some(1));
+    }
+
+    #[test]
+    fn renames_keep_both_paths_with_or_without_edits() {
+        let patch = "diff --git a/a.txt b/b.txt
+similarity index 100%
+rename from a.txt
+rename to b.txt
+diff --git \"a/tab\\there.txt\" \"b/caf\\303\\251.txt\"
+similarity index 80%
+rename from \"tab\\there.txt\"
+rename to \"caf\\303\\251.txt\"
+index 1111111..2222222 100644
+--- \"a/tab\\there.txt\"
++++ \"b/caf\\303\\251.txt\"
+@@ -1,2 +1,2 @@
+ same
+-old
++new
+";
+        let files = parse_diff(patch, 100);
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].status, FileStatus::Renamed);
+        assert_eq!(files[0].old_path.as_deref(), Some("a.txt"));
+        assert_eq!(files[0].path, "b.txt");
+        assert!(files[0].hunks.is_empty());
+        assert_eq!(files[1].status, FileStatus::Renamed);
+        assert_eq!(files[1].old_path.as_deref(), Some("tab\there.txt"));
+        assert_eq!(files[1].path, "café.txt");
+        assert_eq!((files[1].additions, files[1].deletions), (1, 1));
+    }
+
+    #[test]
+    fn binary_files_are_flagged_without_hunks() {
+        let patch = "diff --git a/img/logo b/x.png b/img/logo b/x.png
+new file mode 100644
+index 0000000..1234567
+Binary files /dev/null and b/img/logo b/x.png differ
+diff --git a/after.txt b/after.txt
+index 1111111..2222222 100644
+--- a/after.txt
++++ b/after.txt
+@@ -1 +1 @@
+-a
++b
+";
+        let files = parse_diff(patch, 100);
+        assert_eq!(files.len(), 2);
+        // A path containing ` b/` is still split right: both sides of the header match.
+        assert_eq!(files[0].path, "img/logo b/x.png");
+        assert!(files[0].binary);
+        assert_eq!(files[0].status, FileStatus::Added);
+        assert!(files[0].hunks.is_empty());
+        assert_eq!((files[0].additions, files[0].deletions), (0, 0));
+        assert!(!files[1].binary);
+        assert_eq!(files[1].path, "after.txt");
+    }
+
+    #[test]
+    fn missing_trailing_newlines_mark_their_line_even_mid_hunk() {
+        let patch = "diff --git a/f.txt b/f.txt
+index 1111111..2222222 100644
+--- a/f.txt
++++ b/f.txt
+@@ -1,2 +1,2 @@
+ keep\r
+-old
+\\ No newline at end of file
++new
+\\ No newline at end of file
+";
+        let file = &parse_diff(patch, 100)[0];
+        let lines = &file.hunks[0].lines;
+        assert_eq!(lines.len(), 3, "the + line after a mid-hunk marker is kept");
+        // A CRLF file's `\r` is content, not a line ending to strip.
+        assert_eq!(lines[0].content, "keep\r");
+        assert!(!lines[0].no_newline);
+        assert!(lines[1].no_newline && lines[1].kind == LineKind::Del);
+        assert!(lines[2].no_newline && lines[2].kind == LineKind::Add);
+        assert_eq!((file.additions, file.deletions), (1, 1));
+    }
+
+    #[test]
+    fn long_files_keep_a_bounded_number_of_lines_but_count_them_all() {
+        let mut patch = String::from(
+            "diff --git a/big.txt b/big.txt\n--- a/big.txt\n+++ b/big.txt\n@@ -1,3 +1,3 @@\n",
+        );
+        patch.push_str("-a\n-b\n-c\n+A\n+B\n+C\n@@ -10 +10 @@\n-x\n+X\n");
+        patch.push_str(ADDED);
+        let files = parse_diff(&patch, 4);
+        assert_eq!(files.len(), 2);
+        let big = &files[0];
+        assert!(big.truncated);
+        assert_eq!(big.hunks.len(), 1, "hunks past the budget are dropped");
+        assert_eq!(big.hunks[0].lines.len(), 4);
+        assert_eq!((big.additions, big.deletions), (4, 4));
+        // The budget is per file.
+        assert!(!files[1].truncated);
+        assert_eq!(files[1].hunks[0].lines.len(), 2);
+    }
+
+    #[test]
+    fn a_diff_cut_at_the_byte_cap_drops_the_partial_line_and_flags_it() {
+        let whole = format!("{ADDED}diff --git a/z.txt b/z.txt\n--- a/z.txt\n+++ b/z.txt\n@@ -1,2 +1,2 @@\n-one\n+tw");
+        let cut = parse_branch_diff(&whole, true, 100);
+        assert!(cut.truncated);
+        assert_eq!(cut.files.len(), 2);
+        assert!(!cut.files[0].truncated);
+        let last = &cut.files[1];
+        assert!(last.truncated);
+        assert_eq!(
+            last.hunks[0].lines.len(),
+            1,
+            "the half-read `+tw` line is dropped"
+        );
+        assert_eq!(last.hunks[0].lines[0].content, "one");
+
+        let full = parse_branch_diff(ADDED, false, 100);
+        assert!(!full.truncated);
+        assert!(!full.files[0].truncated);
+        assert!(parse_branch_diff("", false, 100).files.is_empty());
+    }
+
+    /// A real (local, network-free) repo: the branch's commits and diff, read through the
+    /// worktree while it exists and from the main checkout once it's gone.
+    #[test]
+    fn branch_changes_against_a_local_repo() {
+        let base = std::env::temp_dir().join(format!(
+            "relay-changes-test-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let g = |dir: &Path, args: &[&str]| git(dir, args).unwrap();
+        g(&repo, &["init", "-q", "-b", "main"]);
+        g(&repo, &["config", "user.email", "relay@test"]);
+        g(&repo, &["config", "user.name", "Relay Test"]);
+        g(&repo, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.join("keep.txt"), "one\ntwo\nthree\n").unwrap();
+        std::fs::write(repo.join("gone.txt"), "bye\n").unwrap();
+        std::fs::write(repo.join("move.txt"), "a\nb\nc\nd\ne\n").unwrap();
+        g(&repo, &["add", "-A"]);
+        g(&repo, &["commit", "-q", "-m", "init"]);
+
+        let mut ws = prepare_workspace(
+            &base.join("app").join("worktrees"),
+            repo.to_str().unwrap(),
+            "fedcba98-7654",
+            "Tidy files",
+            true,
+            1,
+        )
+        .unwrap();
+        let worktree = PathBuf::from(&ws.worktree_path);
+        assert!(branch_commits(&ws).unwrap().is_empty());
+        assert!(branch_diff(&ws).unwrap().files.is_empty());
+
+        std::fs::write(worktree.join("keep.txt"), "one\nTWO\nthree\n").unwrap();
+        std::fs::remove_file(worktree.join("gone.txt")).unwrap();
+        std::fs::write(worktree.join("new.bin"), [0u8, 159, 146, 150, 0, 1]).unwrap();
+        g(&worktree, &["add", "-A"]);
+        g(&worktree, &["commit", "-q", "-m", "feat: first"]);
+        g(&worktree, &["mv", "move.txt", "moved.txt"]);
+        g(&worktree, &["commit", "-q", "-m", "refactor: second"]);
+        // Uncommitted work isn't on the branch, so it isn't part of the PR.
+        std::fs::write(worktree.join("scratch.txt"), "wip\n").unwrap();
+        // Work that lands on the base after the fork isn't part of the PR either.
+        std::fs::write(repo.join("later.txt"), "base\n").unwrap();
+        g(&repo, &["add", "-A"]);
+        g(&repo, &["commit", "-q", "-m", "on main"]);
+
+        let check = |ws: &TaskWorkspace| {
+            let commits = branch_commits(ws).unwrap();
+            let subjects: Vec<_> = commits.iter().map(|c| c.subject.as_str()).collect();
+            assert_eq!(subjects, ["feat: first", "refactor: second"]);
+            assert_eq!(commits[0].author, "Relay Test");
+            assert!(commits[0].sha.starts_with(&commits[0].short_sha));
+            assert!(commits[0].timestamp > 0);
+
+            let diff = branch_diff(ws).unwrap();
+            assert!(!diff.truncated);
+            let summary: Vec<_> = diff
+                .files
+                .iter()
+                .map(|f| {
+                    (
+                        f.path.as_str(),
+                        f.status,
+                        f.binary,
+                        f.additions,
+                        f.deletions,
+                    )
+                })
+                .collect();
+            assert_eq!(
+                summary,
+                [
+                    ("gone.txt", FileStatus::Deleted, false, 0, 1),
+                    ("keep.txt", FileStatus::Modified, false, 1, 1),
+                    ("moved.txt", FileStatus::Renamed, false, 0, 0),
+                    ("new.bin", FileStatus::Added, true, 0, 0),
+                ]
+            );
+            assert_eq!(diff.files[2].old_path.as_deref(), Some("move.txt"));
+        };
+        check(&ws);
+
+        // Repository config that would run a program stops the read before git can act on it.
+        g(&repo, &["config", "diff.pwn.textconv", "touch pwned; cat"]);
+        let error = branch_diff(&ws).unwrap_err();
+        assert!(error.to_string().contains("diff.pwn.textconv"), "{error}");
+        g(&repo, &["config", "--unset", "diff.pwn.textconv"]);
+
+        // Once the worktree is gone, the same answers come from the branch ref in the checkout.
+        std::fs::remove_file(worktree.join("scratch.txt")).unwrap();
+        assert!(remove_worktree(&ws).unwrap());
+        ws.removed_at = Some(2);
+        check(&ws);
+        g(&repo, &["config", "diff.pwn.textconv", "touch pwned; cat"]);
+        let error = branch_commits(&ws).unwrap_err();
+        assert!(error.to_string().contains("diff.pwn.textconv"), "{error}");
+        g(&repo, &["config", "--unset", "diff.pwn.textconv"]);
+        // Output past the byte cap stops git and comes back cut, not as an error.
+        let (head, cut_short) = run_capped("git", &repo, &["log", "-p", "--all"], 16).unwrap();
+        assert!(cut_short);
+        assert_eq!(head.len(), 16);
+        // Reads never check anything out: the checkout is still on its own branch.
+        assert_eq!(current_branch(&repo).as_deref(), Some("main"));
+
         let _ = std::fs::remove_dir_all(&base);
     }
 }

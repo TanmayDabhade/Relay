@@ -1468,6 +1468,46 @@ pub fn list_card_ships(
     queries::list_card_ships(&conn, &project_id).map_err(|e| e.to_string())
 }
 
+/// A card's task branch as a pull request would show it: the workspace, its commits beyond
+/// the base, and the per-file diff.
+#[derive(Debug, Clone, Serialize)]
+pub struct CardChanges {
+    pub workspace: queries::TaskWorkspace,
+    pub commits: Vec<ship::git::CommitInfo>,
+    pub diff: ship::git::BranchDiff,
+}
+
+/// The commits and diff of the branch behind a card's newest PR-bound task, or `None` when
+/// the card never had one. Gather/compute like `ship::spawn_ship`: the DB lock is held only
+/// for the workspace lookup, and the git reads (which can take a while on a big branch) run
+/// after it is released, on a blocking thread so they don't stall the UI thread either.
+#[tauri::command]
+pub async fn get_card_changes(
+    db: State<'_, Db>,
+    card_id: String,
+) -> Result<Option<CardChanges>, String> {
+    let workspace = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        queries::latest_task_workspace_for_card(&conn, &card_id).map_err(|e| e.to_string())?
+    };
+    let Some(workspace) = workspace else {
+        return Ok(None);
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let commits = ship::git::branch_commits(&workspace)?;
+        let diff = ship::git::branch_diff(&workspace)?;
+        anyhow::Ok(CardChanges {
+            workspace,
+            commits,
+            diff,
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map(Some)
+    .map_err(|e| format!("{e:#}"))
+}
+
 /// Manual "Ship": commit, push, and open (or update) the PR now, regardless of the task's
 /// auto-ship toggle. Refused while a turn is running, since the agent may still be editing.
 #[tauri::command]

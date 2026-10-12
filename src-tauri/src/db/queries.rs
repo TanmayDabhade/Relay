@@ -19,6 +19,9 @@ pub struct ProjectSummary {
     /// meaningful. Lets the UI show one badge per agent instead of assuming every project is
     /// Claude-only.
     pub agents: Vec<String>,
+    /// `owner/name` of the GitHub repository `gh` confirmed this folder belongs to. Always set
+    /// for listed projects — `list_projects` only returns verified ones.
+    pub github_repo: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1466,6 +1469,15 @@ pub fn project_path(conn: &Connection, project_id: &str) -> rusqlite::Result<Opt
     .optional()
 }
 
+pub fn project_name(conn: &Connection, project_id: &str) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT name FROM projects WHERE id = ?1",
+        params![project_id],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
 /// Keeps a dispatched task's board card aligned with the lifecycle Relay owns even when an
 /// agent does not expose an ingestible native session log. If an ingested session is linked,
 /// the existing session-based sync remains compatible because both target the same role.
@@ -1526,21 +1538,266 @@ pub fn clear_pending_launch_for_dispatch_run(
     Ok(())
 }
 
+// --- Task workspaces (git worktree + PR shipping) ---
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskWorkspace {
+    pub task_id: String,
+    pub project_path: String,
+    pub repo_root: String,
+    pub worktree_path: String,
+    pub work_dir: String,
+    pub branch: String,
+    pub base_branch: String,
+    pub auto_ship: bool,
+    pub ship_status: String,
+    pub ship_error: Option<String>,
+    pub pr_url: Option<String>,
+    pub last_shipped_at: Option<i64>,
+    pub removed_at: Option<i64>,
+    pub created_at: i64,
+}
+
+/// A workspace together with the board card its task drives, for badging cards on a board.
+#[derive(Debug, Clone, Serialize)]
+pub struct CardShip {
+    pub card_id: String,
+    pub task_id: String,
+    pub branch: String,
+    pub ship_status: String,
+    pub pr_url: Option<String>,
+}
+
+const TASK_WORKSPACE_COLUMNS: &str =
+    "task_id, project_path, repo_root, worktree_path, work_dir, branch, base_branch, auto_ship,
+     ship_status, ship_error, pr_url, last_shipped_at, removed_at, created_at";
+
+fn row_to_task_workspace(row: &Row) -> rusqlite::Result<TaskWorkspace> {
+    Ok(TaskWorkspace {
+        task_id: row.get(0)?,
+        project_path: row.get(1)?,
+        repo_root: row.get(2)?,
+        worktree_path: row.get(3)?,
+        work_dir: row.get(4)?,
+        branch: row.get(5)?,
+        base_branch: row.get(6)?,
+        auto_ship: row.get::<_, i64>(7)? != 0,
+        ship_status: row.get(8)?,
+        ship_error: row.get(9)?,
+        pr_url: row.get(10)?,
+        last_shipped_at: row.get(11)?,
+        removed_at: row.get(12)?,
+        created_at: row.get(13)?,
+    })
+}
+
+pub fn insert_task_workspace(conn: &Connection, workspace: &TaskWorkspace) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO task_workspaces
+         (task_id, project_path, repo_root, worktree_path, work_dir, branch, base_branch,
+          auto_ship, ship_status, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', ?9)",
+        params![
+            workspace.task_id,
+            workspace.project_path,
+            workspace.repo_root,
+            workspace.worktree_path,
+            workspace.work_dir,
+            workspace.branch,
+            workspace.base_branch,
+            workspace.auto_ship as i64,
+            workspace.created_at,
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn get_task_workspace(
+    conn: &Connection,
+    task_id: &str,
+) -> rusqlite::Result<Option<TaskWorkspace>> {
+    let sql = format!("SELECT {TASK_WORKSPACE_COLUMNS} FROM task_workspaces WHERE task_id = ?1");
+    conn.query_row(&sql, params![task_id], row_to_task_workspace)
+        .optional()
+}
+
+/// Maps a session cwd that lies inside a task worktree back to the real project path, keeping
+/// any subdirectory suffix. `None` for every ordinary cwd. Compares by prefix + `/` rather than
+/// `LIKE` so `%`/`_` in a path can't act as wildcards, and case-insensitively to match
+/// `project_id_for_path` (macOS paths are case-insensitive). SQLite's `lower()` only folds
+/// ASCII, so byte lengths are unchanged and the suffix slice below stays on the same boundary.
+pub fn project_path_for_worktree_cwd(
+    conn: &Connection,
+    cwd: &str,
+) -> rusqlite::Result<Option<String>> {
+    let found: Option<(String, String)> = conn
+        .query_row(
+            "SELECT work_dir, project_path FROM task_workspaces
+             WHERE lower(?1) = lower(work_dir)
+                OR lower(substr(?1, 1, length(work_dir) + 1)) = lower(work_dir || '/')
+             ORDER BY length(work_dir) DESC LIMIT 1",
+            params![cwd],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    Ok(found.map(|(work_dir, project_path)| format!("{project_path}{}", &cwd[work_dir.len()..])))
+}
+
+/// Claims the workspace for one ship attempt. Conditional on the current status so an
+/// auto-ship and a manual "Ship" click racing on one task can't both push.
+pub fn claim_task_ship(conn: &Connection, task_id: &str) -> rusqlite::Result<bool> {
+    let changed = conn.execute(
+        "UPDATE task_workspaces SET ship_status = 'shipping', ship_error = NULL
+         WHERE task_id = ?1 AND ship_status != 'shipping'",
+        params![task_id],
+    )?;
+    Ok(changed > 0)
+}
+
+pub fn finish_task_ship(
+    conn: &Connection,
+    task_id: &str,
+    status: &str,
+    error: Option<&str>,
+    pr_url: Option<&str>,
+    now: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE task_workspaces
+         SET ship_status = ?2, ship_error = ?3, pr_url = COALESCE(?4, pr_url),
+             last_shipped_at = CASE WHEN ?2 = 'shipped' THEN ?5 ELSE last_shipped_at END
+         WHERE task_id = ?1",
+        params![task_id, status, error, pr_url, now],
+    )?;
+    Ok(())
+}
+
+/// A ship left in 'shipping' by a crash or app quit would block every later ship of the task.
+/// Called once at startup, when no ship can be in flight.
+pub fn reset_interrupted_task_ships(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE task_workspaces
+         SET ship_status = 'failed', ship_error = 'Relay closed while this task was shipping'
+         WHERE ship_status = 'shipping'",
+        [],
+    )?;
+    Ok(())
+}
+
+pub fn set_task_workspace_removed(
+    conn: &Connection,
+    task_id: &str,
+    removed_at: Option<i64>,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE task_workspaces SET removed_at = ?2 WHERE task_id = ?1",
+        params![task_id, removed_at],
+    )?;
+    Ok(())
+}
+
+pub fn list_card_ships(conn: &Connection, project_id: &str) -> rusqlite::Result<Vec<CardShip>> {
+    let mut stmt = conn.prepare(
+        "SELECT t.card_id, w.task_id, w.branch, w.ship_status, w.pr_url
+         FROM task_workspaces w
+         JOIN dispatch_tasks t ON t.id = w.task_id
+         WHERE t.project_id = ?1 AND t.card_id IS NOT NULL
+         ORDER BY w.created_at ASC",
+    )?;
+    let rows = stmt.query_map(params![project_id], |row| {
+        Ok(CardShip {
+            card_id: row.get(0)?,
+            task_id: row.get(1)?,
+            branch: row.get(2)?,
+            ship_status: row.get(3)?,
+            pr_url: row.get(4)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// The workspace of the newest task dispatched from a card — the same newest-wins rule the
+/// board applies to `list_card_ships` (which it reads oldest first, so later rows win).
+pub fn latest_task_workspace_for_card(
+    conn: &Connection,
+    card_id: &str,
+) -> rusqlite::Result<Option<TaskWorkspace>> {
+    let columns = TASK_WORKSPACE_COLUMNS
+        .split(',')
+        .map(|column| format!("w.{}", column.trim()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT {columns}
+         FROM task_workspaces w
+         JOIN dispatch_tasks t ON t.id = w.task_id
+         WHERE t.card_id = ?1
+         ORDER BY w.created_at DESC, w.rowid DESC
+         LIMIT 1"
+    );
+    conn.query_row(&sql, params![card_id], row_to_task_workspace)
+        .optional()
+}
+
+/// The newest assistant message across every turn of a run — the agent's own account of what
+/// it did, used as the body of the pull request.
+pub fn last_assistant_message_for_run(
+    conn: &Connection,
+    run_id: &str,
+) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT content FROM dispatch_events
+         WHERE run_id = ?1 AND kind = 'assistant_message' AND content != ''
+         ORDER BY sequence DESC LIMIT 1",
+        params![run_id],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+/// The newest run of a task, which is the one a ship notice belongs to.
+pub fn latest_run_for_task(
+    conn: &Connection,
+    task_id: &str,
+) -> rusqlite::Result<Option<DispatchRun>> {
+    let sql = format!(
+        "SELECT {DISPATCH_RUN_COLUMNS} FROM dispatch_runs WHERE task_id = ?1
+         ORDER BY attempt DESC LIMIT 1"
+    );
+    conn.query_row(&sql, params![task_id], row_to_dispatch_run)
+        .optional()
+}
+
+pub fn todo_column_for_project(
+    conn: &Connection,
+    project_id: &str,
+) -> rusqlite::Result<(String, String)> {
+    let board_id = ensure_board_for_project(conn, project_id)?;
+    let column_id = conn.query_row(
+        "SELECT id FROM columns WHERE board_id = ?1 AND role = 'todo'",
+        params![board_id],
+        |row| row.get(0),
+    )?;
+    Ok((board_id, column_id))
+}
+
 // --- Read side (frontend commands) ---
 
-/// Lists projects for display. A project row can exist for a directory Relay noticed but that
-/// never actually ran a session (e.g. a bare `.claude` dir with no activity yet); the inner
-/// `JOIN sessions` excludes those — a directory with 0 sessions and $0 spent isn't something
-/// the user should see listed.
+/// Lists projects for display: only folders `projects::spawn_github_verifier` (or an explicit
+/// clone/add) confirmed are GitHub repositories the user's `gh` can access. Every other cwd an
+/// agent ran in keeps its row (its sessions still need a project) but is not listed. A verified
+/// project with no sessions yet — one the user just cloned or added — is listed, hence the
+/// `LEFT JOIN`.
 pub fn list_projects(conn: &Connection) -> rusqlite::Result<Vec<ProjectSummary>> {
     let sql = "SELECT p.id, p.name, p.path, p.lang, p.stack, p.created_at, p.last_active,
                 COUNT(s.id) as session_count,
                 COALESCE(SUM(s.cost_usd), 0.0) as total_cost_usd,
-                GROUP_CONCAT(DISTINCT s.agent) as agents
+                GROUP_CONCAT(DISTINCT s.agent) as agents,
+                p.github_repo
          FROM projects p
-         JOIN sessions s ON s.project_id = p.id
+         LEFT JOIN sessions s ON s.project_id = p.id
+         WHERE p.github_repo IS NOT NULL
          GROUP BY p.id
-         HAVING COUNT(s.id) > 0
          ORDER BY p.last_active DESC";
     let mut stmt = conn.prepare(sql)?;
     let rows = stmt.query_map([], |row| {
@@ -1558,9 +1815,85 @@ pub fn list_projects(conn: &Connection) -> rusqlite::Result<Vec<ProjectSummary>>
             agents: agents
                 .map(|s| s.split(',').map(String::from).collect())
                 .unwrap_or_default(),
+            github_repo: row.get(10)?,
         })
     })?;
     rows.collect()
+}
+
+/// A project row the GitHub verifier should (re-)check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectGithubCheck {
+    pub id: String,
+    pub path: String,
+    pub github_repo: Option<String>,
+}
+
+/// Projects never checked, or whose last check is older than its TTL: verified projects are
+/// re-checked rarely (access is rarely lost), unverified ones more often (the user may have
+/// just added a remote or run `gh auth login`). Most recently active first, so the projects
+/// the user cares about appear first on a cold start with many folders to check.
+pub fn projects_needing_github_check(
+    conn: &Connection,
+    now: i64,
+    verified_ttl_secs: i64,
+    unverified_ttl_secs: i64,
+) -> rusqlite::Result<Vec<ProjectGithubCheck>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, path, github_repo FROM projects
+         WHERE github_checked_at IS NULL
+            OR (github_repo IS NOT NULL AND github_checked_at < ?1 - ?2)
+            OR (github_repo IS NULL AND github_checked_at < ?1 - ?3)
+         ORDER BY last_active DESC",
+    )?;
+    let rows = stmt.query_map(
+        params![now, verified_ttl_secs, unverified_ttl_secs],
+        |row| {
+            Ok(ProjectGithubCheck {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                github_repo: row.get(2)?,
+            })
+        },
+    )?;
+    rows.collect()
+}
+
+/// Records a finished check: sets (or, with `None`, clears) the project's GitHub repository.
+/// Returns whether the stored repository changed, i.e. whether the project list did.
+pub fn set_project_github(
+    conn: &Connection,
+    project_id: &str,
+    github_repo: Option<&str>,
+    checked_at: i64,
+) -> rusqlite::Result<bool> {
+    let changed = conn.execute(
+        "UPDATE projects SET github_repo = ?2, github_checked_at = ?3
+         WHERE id = ?1 AND github_repo IS NOT ?2",
+        params![project_id, github_repo, checked_at],
+    )? > 0;
+    if !changed {
+        conn.execute(
+            "UPDATE projects SET github_checked_at = ?2 WHERE id = ?1",
+            params![project_id, checked_at],
+        )?;
+    }
+    Ok(changed)
+}
+
+/// Records a check that couldn't decide either way (gh missing, logged out, offline): keeps
+/// whatever repository was stored and only moves `github_checked_at`, so an offline moment
+/// never hides a project that was verified before.
+pub fn touch_project_github_check(
+    conn: &Connection,
+    project_id: &str,
+    checked_at: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE projects SET github_checked_at = ?2 WHERE id = ?1",
+        params![project_id, checked_at],
+    )?;
+    Ok(())
 }
 
 /// Lists every session for display, most-recently-active first.
@@ -1982,15 +2315,21 @@ pub fn sessions_needing_usage_rebuild(
 /// watchers have actually ingested sessions — Claude Code, Codex, Gemini, and Cursor all write
 /// their own `agent` value via `upsert_session` (see `parser/{claude_jsonl,codex_jsonl,
 /// gemini_log,cursor_jsonl}.rs`).
-pub fn agent_usage(conn: &Connection) -> rusqlite::Result<Vec<AgentUsage>> {
+///
+/// `project_id` scopes it to one project (the active workspace project); `None` is every project.
+pub fn agent_usage(
+    conn: &Connection,
+    project_id: Option<&str>,
+) -> rusqlite::Result<Vec<AgentUsage>> {
     let mut stmt = conn.prepare(
         "SELECT agent, COUNT(*) as session_count, COALESCE(SUM(cost_usd), 0.0) as total_cost_usd,
                 COALESCE(SUM(cost_unpriced), 0)
          FROM sessions
+         WHERE ?1 IS NULL OR project_id = ?1
          GROUP BY agent
          ORDER BY total_cost_usd DESC",
     )?;
-    let rows = stmt.query_map([], |row| {
+    let rows = stmt.query_map(params![project_id], |row| {
         Ok(AgentUsage {
             agent: row.get(0)?,
             session_count: row.get(1)?,
@@ -2008,6 +2347,9 @@ pub fn agent_usage(conn: &Connection) -> rusqlite::Result<Vec<AgentUsage>> {
 // `started_at` is nullable, so windowing on it would silently drop sessions that never got a
 // `started_at` recorded. "Report window" therefore means "sessions with activity in this
 // window," not "sessions started in this window."
+//
+// Each takes `project_id` to scope the report to the active workspace project; `None` reports
+// on every project.
 
 /// Headline totals for the report window: overall spend, session count, and raw token
 /// totals across every ingested agent. `avg_cost_per_session` is left for the caller to
@@ -2023,14 +2365,18 @@ pub struct ReportTotals {
     pub cache_creation_tokens: i64,
 }
 
-pub fn report_totals(conn: &Connection, since_epoch: i64) -> rusqlite::Result<ReportTotals> {
+pub fn report_totals(
+    conn: &Connection,
+    since_epoch: i64,
+    project_id: Option<&str>,
+) -> rusqlite::Result<ReportTotals> {
     conn.query_row(
         "SELECT COALESCE(SUM(cost_usd), 0.0), COUNT(*),
                 COALESCE(SUM(prompt_tokens), 0), COALESCE(SUM(completion_tokens), 0),
                 COALESCE(SUM(cache_read_tokens), 0), COALESCE(SUM(cache_creation_tokens), 0)
          FROM sessions
-         WHERE last_activity_at >= ?1",
-        params![since_epoch],
+         WHERE last_activity_at >= ?1 AND (?2 IS NULL OR project_id = ?2)",
+        params![since_epoch, project_id],
         |row| {
             Ok(ReportTotals {
                 total_cost_usd: row.get(0)?,
@@ -2059,15 +2405,16 @@ pub struct ReportProjectRow {
 pub fn report_by_project(
     conn: &Connection,
     since_epoch: i64,
+    project_id: Option<&str>,
 ) -> rusqlite::Result<Vec<ReportProjectRow>> {
     let mut stmt = conn.prepare(
         "SELECT p.id, p.name, COUNT(s.id), COALESCE(SUM(s.cost_usd), 0.0)
          FROM sessions s JOIN projects p ON p.id = s.project_id
-         WHERE s.last_activity_at >= ?1
+         WHERE s.last_activity_at >= ?1 AND (?2 IS NULL OR s.project_id = ?2)
          GROUP BY p.id
          ORDER BY 4 DESC",
     )?;
-    let rows = stmt.query_map(params![since_epoch], |row| {
+    let rows = stmt.query_map(params![since_epoch, project_id], |row| {
         Ok(ReportProjectRow {
             project_id: row.get(0)?,
             project_name: row.get(1)?,
@@ -2081,16 +2428,20 @@ pub fn report_by_project(
 /// Same shape as `agent_usage` but windowed to the report period — kept as a separate query
 /// rather than adding a `since` parameter to `agent_usage` itself, since the Dashboard's
 /// all-time call site has no window to pass.
-pub fn agent_usage_since(conn: &Connection, since_epoch: i64) -> rusqlite::Result<Vec<AgentUsage>> {
+pub fn agent_usage_since(
+    conn: &Connection,
+    since_epoch: i64,
+    project_id: Option<&str>,
+) -> rusqlite::Result<Vec<AgentUsage>> {
     let mut stmt = conn.prepare(
         "SELECT agent, COUNT(*) as session_count, COALESCE(SUM(cost_usd), 0.0) as total_cost_usd,
                 COALESCE(SUM(cost_unpriced), 0)
          FROM sessions
-         WHERE last_activity_at >= ?1
+         WHERE last_activity_at >= ?1 AND (?2 IS NULL OR project_id = ?2)
          GROUP BY agent
          ORDER BY total_cost_usd DESC",
     )?;
-    let rows = stmt.query_map(params![since_epoch], |row| {
+    let rows = stmt.query_map(params![since_epoch, project_id], |row| {
         Ok(AgentUsage {
             agent: row.get(0)?,
             session_count: row.get(1)?,
@@ -2115,11 +2466,16 @@ pub struct ReportTagRow {
     pub total_cost_usd: f64,
 }
 
-pub fn report_by_tag(conn: &Connection, since_epoch: i64) -> rusqlite::Result<Vec<ReportTagRow>> {
+pub fn report_by_tag(
+    conn: &Connection,
+    since_epoch: i64,
+    project_id: Option<&str>,
+) -> rusqlite::Result<Vec<ReportTagRow>> {
     let mut stmt = conn.prepare(
-        "SELECT tags, cost_usd FROM sessions WHERE last_activity_at >= ?1 AND tags IS NOT NULL",
+        "SELECT tags, cost_usd FROM sessions
+         WHERE last_activity_at >= ?1 AND tags IS NOT NULL AND (?2 IS NULL OR project_id = ?2)",
     )?;
-    let rows = stmt.query_map(params![since_epoch], |row| {
+    let rows = stmt.query_map(params![since_epoch, project_id], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
     })?;
 
@@ -2168,15 +2524,16 @@ pub struct ActiveSessionSummary {
 
 pub fn most_recent_active_session(
     conn: &Connection,
+    project_id: Option<&str>,
 ) -> rusqlite::Result<Option<ActiveSessionSummary>> {
     conn.query_row(
         "SELECT s.id, s.title, s.summary, s.project_id, p.name
          FROM sessions s
          JOIN projects p ON p.id = s.project_id
-         WHERE s.status = 'active'
+         WHERE s.status = 'active' AND (?1 IS NULL OR s.project_id = ?1)
          ORDER BY s.last_activity_at DESC
          LIMIT 1",
-        [],
+        params![project_id],
         |row| {
             Ok(ActiveSessionSummary {
                 session_id: row.get(0)?,
@@ -2214,25 +2571,31 @@ pub fn most_recent_active_session_id_for_project(
 /// activity) — the caller fills in zero-activity days when building a fixed-length window,
 /// since walking 365 dense days here would mean serializing hundreds of zero rows out of SQL
 /// for no reason.
+///
+/// `project_id` scopes both kinds of event to one project; `None` counts every project.
 pub fn daily_activity_counts(
     conn: &Connection,
     since_epoch: i64,
+    project_id: Option<&str>,
 ) -> rusqlite::Result<HashMap<String, i64>> {
     let mut stmt = conn.prepare(
         "SELECT d, SUM(c) FROM (
             SELECT date(started_at, 'unixepoch') AS d, COUNT(*) AS c
             FROM sessions
             WHERE started_at IS NOT NULL AND started_at >= ?1
+              AND (?2 IS NULL OR project_id = ?2)
             GROUP BY d
             UNION ALL
-            SELECT date(occurred_at, 'unixepoch') AS d, COUNT(*) AS c
-            FROM files_changed
-            WHERE occurred_at >= ?1
+            SELECT date(f.occurred_at, 'unixepoch') AS d, COUNT(*) AS c
+            FROM files_changed f
+            WHERE f.occurred_at >= ?1
+              AND (?2 IS NULL
+                   OR f.session_id IN (SELECT id FROM sessions WHERE project_id = ?2))
             GROUP BY d
          )
          GROUP BY d",
     )?;
-    let rows = stmt.query_map(params![since_epoch], |row| {
+    let rows = stmt.query_map(params![since_epoch, project_id], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
     })?;
     rows.collect()
@@ -2927,13 +3290,64 @@ mod report_tests {
     }
 
     #[test]
+    fn report_and_dashboard_queries_scope_to_one_project_when_asked() {
+        let conn = in_memory_db();
+        upsert_project(&conn, "p1", "one", "/one", 1000).unwrap();
+        upsert_project(&conn, "p2", "two", "/two", 1000).unwrap();
+        seed_session(&conn, "s1", "p1", "claude", 2000, 1.0, Some("[\"bugfix\"]"));
+        seed_session(&conn, "s2", "p2", "codex", 2000, 4.0, Some("[\"feature\"]"));
+        insert_file_changed(&conn, "s2", "a.rs", "edit", 1, 0, 2000, None, None).unwrap();
+
+        assert_eq!(
+            report_totals(&conn, 1000, None).unwrap().total_cost_usd,
+            5.0
+        );
+        let p1 = report_totals(&conn, 1000, Some("p1")).unwrap();
+        assert_eq!((p1.session_count, p1.total_cost_usd), (1, 1.0));
+        assert_eq!(
+            report_by_project(&conn, 1000, Some("p2")).unwrap()[0].project_name,
+            "two"
+        );
+        assert_eq!(report_by_project(&conn, 1000, Some("p2")).unwrap().len(), 1);
+        let tags = report_by_tag(&conn, 1000, Some("p1")).unwrap();
+        assert_eq!(
+            tags.iter().map(|t| t.tag.as_str()).collect::<Vec<_>>(),
+            vec!["bugfix"]
+        );
+        let agents = agent_usage_since(&conn, 1000, Some("p2")).unwrap();
+        assert_eq!(
+            agents.iter().map(|a| a.agent.as_str()).collect::<Vec<_>>(),
+            vec!["codex"]
+        );
+        assert_eq!(agent_usage(&conn, Some("p1")).unwrap().len(), 1);
+        assert_eq!(agent_usage(&conn, None).unwrap().len(), 2);
+
+        // Heatmap: p2's day has its session start plus its file edit; p1 only its start.
+        let all: i64 = daily_activity_counts(&conn, 0, None)
+            .unwrap()
+            .values()
+            .sum();
+        let p1: i64 = daily_activity_counts(&conn, 0, Some("p1"))
+            .unwrap()
+            .values()
+            .sum();
+        let p2: i64 = daily_activity_counts(&conn, 0, Some("p2"))
+            .unwrap()
+            .values()
+            .sum();
+        assert_eq!((all, p1, p2), (3, 1, 2));
+        assert_eq!(project_name(&conn, "p2").unwrap().as_deref(), Some("two"));
+        assert_eq!(project_name(&conn, "nope").unwrap(), None);
+    }
+
+    #[test]
     fn report_totals_sums_only_sessions_inside_the_window() {
         let conn = in_memory_db();
         upsert_project(&conn, "p1", "fixture", "/fixture", 1000).unwrap();
         seed_session(&conn, "s1", "p1", "claude", 2000, 1.50, None);
         seed_session(&conn, "s2", "p1", "claude", 500, 9.00, None); // before the window
 
-        let totals = report_totals(&conn, 1000).unwrap();
+        let totals = report_totals(&conn, 1000, None).unwrap();
         assert_eq!(totals.session_count, 1);
         assert_eq!(totals.total_cost_usd, 1.50);
     }
@@ -2947,7 +3361,7 @@ mod report_tests {
         seed_session(&conn, "s2", "p2", "claude", 2100, 5.0, None);
         // p1 has no sessions at all inside (or outside) the window.
 
-        let rows = report_by_project(&conn, 1000).unwrap();
+        let rows = report_by_project(&conn, 1000, None).unwrap();
         assert_eq!(
             rows.len(),
             1,
@@ -2982,7 +3396,7 @@ mod report_tests {
         );
         seed_session(&conn, "s3", "p1", "claude", 2000, 100.0, None); // untagged, must be skipped
 
-        let rows = report_by_tag(&conn, 1000).unwrap();
+        let rows = report_by_tag(&conn, 1000, None).unwrap();
         let feature = rows.iter().find(|r| r.tag == "feature").unwrap();
         let bugfix = rows.iter().find(|r| r.tag == "bugfix").unwrap();
         assert_eq!(feature.session_count, 2);
@@ -3006,7 +3420,7 @@ mod report_tests {
         );
         seed_session(&conn, "s2", "p1", "claude", 2000, 1.0, Some(r#"["docs"]"#));
 
-        let rows = report_by_tag(&conn, 1000).unwrap();
+        let rows = report_by_tag(&conn, 1000, None).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].tag, "docs");
     }
@@ -3018,7 +3432,7 @@ mod report_tests {
         seed_session(&conn, "s1", "p1", "claude", 2000, 3.0, None);
         seed_session(&conn, "s2", "p1", "codex", 500, 7.0, None); // before the window
 
-        let rows = agent_usage_since(&conn, 1000).unwrap();
+        let rows = agent_usage_since(&conn, 1000, None).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].agent, "claude");
         assert_eq!(rows[0].total_cost_usd, 3.0);
@@ -3430,16 +3844,25 @@ mod list_query_tests {
             .unwrap();
         conn.execute_batch(include_str!("../../migrations/0011_session_usage.sql"))
             .unwrap();
+        conn.execute_batch(include_str!("../../migrations/0013_project_github.sql"))
+            .unwrap();
         conn
     }
 
-    /// Insert a project plus one session per id in `session_ids`.
+    /// Insert a verified project plus one session per id in `session_ids`.
     fn seed(conn: &Connection, project_id: &str, created_at: i64, session_ids: &[&str]) {
         upsert_project(
             conn,
             project_id,
             project_id,
             &format!("/{project_id}"),
+            created_at,
+        )
+        .unwrap();
+        set_project_github(
+            conn,
+            project_id,
+            Some(&format!("o/{project_id}")),
             created_at,
         )
         .unwrap();
@@ -3494,14 +3917,69 @@ mod list_query_tests {
     }
 
     #[test]
-    fn a_project_with_no_sessions_is_not_listed() {
+    fn only_github_verified_projects_are_listed_even_without_sessions() {
         let conn = in_memory_db();
-        // A directory Relay noticed but that never ran a session.
-        upsert_project(&conn, "empty", "empty", "/empty", 1000).unwrap();
         seed(&conn, "active", 2000, &["s1"]);
+        // A cwd an agent ran in that was never verified (or isn't on GitHub): not listed,
+        // but its sessions are kept.
+        upsert_project(&conn, "plain", "plain", "/plain", 3000).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, project_id, agent, started_at, last_activity_at, status, raw_log_path)
+             VALUES ('s2', 'plain', 'claude', 3000, 3000, 'active', '')",
+            [],
+        )
+        .unwrap();
+        // Just cloned: verified, no sessions yet. Listed.
+        upsert_project(&conn, "cloned", "cloned", "/cloned", 4000).unwrap();
+        set_project_github(&conn, "cloned", Some("o/cloned"), 4000).unwrap();
 
         let projects = list_projects(&conn).unwrap();
-        assert_eq!(ids(&projects, |p| p.id.clone()), set(&["active"]));
+        assert_eq!(ids(&projects, |p| p.id.clone()), set(&["active", "cloned"]));
+        let cloned = projects.iter().find(|p| p.id == "cloned").unwrap();
+        assert_eq!(cloned.session_count, 0);
+        assert!(cloned.agents.is_empty());
+        assert_eq!(cloned.github_repo.as_deref(), Some("o/cloned"));
+        assert_eq!(list_sessions(&conn).unwrap().len(), 2);
+
+        // Losing access hides it again.
+        assert!(set_project_github(&conn, "cloned", None, 5000).unwrap());
+        assert_eq!(
+            ids(&list_projects(&conn).unwrap(), |p| p.id.clone()),
+            set(&["active"])
+        );
+    }
+
+    #[test]
+    fn github_checks_target_unchecked_and_stale_projects_and_report_changes() {
+        let conn = in_memory_db();
+        upsert_project(&conn, "new", "new", "/new", 1000).unwrap();
+        upsert_project(&conn, "verified", "verified", "/verified", 2000).unwrap();
+        upsert_project(&conn, "plain", "plain", "/plain", 3000).unwrap();
+        // Checked at t=10000: one verified, one not on GitHub.
+        assert!(set_project_github(&conn, "verified", Some("o/verified"), 10_000).unwrap());
+        assert!(!set_project_github(&conn, "plain", None, 10_000).unwrap());
+
+        let due = |now| {
+            projects_needing_github_check(&conn, now, 1000, 100)
+                .unwrap()
+                .into_iter()
+                .map(|p| p.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(due(10_050), vec!["new"]);
+        // The unverified TTL lapses first; most recently active comes first.
+        assert_eq!(due(10_200), vec!["plain", "new"]);
+        assert_eq!(due(11_500), vec!["plain", "verified", "new"]);
+
+        // Re-confirming the same repository is not a change, but still counts as a check.
+        assert!(!set_project_github(&conn, "verified", Some("o/verified"), 20_000).unwrap());
+        // An inconclusive check keeps the repository and only moves the timestamp.
+        touch_project_github_check(&conn, "plain", 20_000).unwrap();
+        assert_eq!(due(20_050), vec!["new"]);
+        let verified = projects_needing_github_check(&conn, 50_000, 1000, 100).unwrap();
+        let verified = verified.iter().find(|p| p.id == "verified").unwrap();
+        assert_eq!(verified.github_repo.as_deref(), Some("o/verified"));
+        assert_eq!(verified.path, "/verified");
     }
 }
 
@@ -3532,6 +4010,8 @@ mod dispatch_query_tests {
         conn.execute_batch(include_str!("../../migrations/0010_dispatch_loop.sql"))
             .unwrap();
         conn.execute_batch(include_str!("../../migrations/0011_session_usage.sql"))
+            .unwrap();
+        conn.execute_batch(include_str!("../../migrations/0012_task_workspaces.sql"))
             .unwrap();
         conn
     }
@@ -4013,6 +4493,7 @@ mod session_deletion_tests {
             include_str!("../../migrations/0009_dispatch_chat.sql"),
             include_str!("../../migrations/0010_dispatch_loop.sql"),
             include_str!("../../migrations/0011_session_usage.sql"),
+            include_str!("../../migrations/0012_task_workspaces.sql"),
         ] {
             conn.execute_batch(migration).unwrap();
         }
@@ -4082,5 +4563,193 @@ mod session_deletion_tests {
             )
             .unwrap();
         assert_eq!(run_link, None);
+    }
+}
+
+#[cfg(test)]
+mod task_workspace_tests {
+    use super::*;
+
+    fn in_memory_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        for migration in [
+            include_str!("../../migrations/0001_init.sql"),
+            include_str!("../../migrations/0002_file_diff_content.sql"),
+            include_str!("../../migrations/0003_kanban.sql"),
+            include_str!("../../migrations/0004_session_title.sql"),
+            include_str!("../../migrations/0005_plan.sql"),
+            include_str!("../../migrations/0006_card_pending_launch.sql"),
+            include_str!("../../migrations/0007_dispatch.sql"),
+            include_str!("../../migrations/0008_deleted_sessions.sql"),
+            include_str!("../../migrations/0009_dispatch_chat.sql"),
+            include_str!("../../migrations/0010_dispatch_loop.sql"),
+            include_str!("../../migrations/0011_session_usage.sql"),
+            include_str!("../../migrations/0012_task_workspaces.sql"),
+        ] {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn
+    }
+
+    fn seed(conn: &Connection) -> CreatedDispatch {
+        upsert_project(conn, "p1", "relay", "/work/relay", 1_000).unwrap();
+        let (board_id, todo_id) = todo_column_for_project(conn, "p1").unwrap();
+        let card = create_card(conn, &board_id, &todo_id, "Add dark mode", None).unwrap();
+        let created = create_dispatch_task(
+            conn,
+            "p1",
+            Some(&card.id),
+            "Add dark mode",
+            "Add a dark theme",
+            "claude",
+            "default",
+            None,
+            1_000,
+        )
+        .unwrap();
+        insert_task_workspace(
+            conn,
+            &TaskWorkspace {
+                task_id: created.task.id.clone(),
+                project_path: "/work/relay".into(),
+                repo_root: "/work/relay".into(),
+                worktree_path: "/data/worktrees/relay-abc".into(),
+                work_dir: "/data/worktrees/relay-abc".into(),
+                branch: "relay/add-dark-mode-abc".into(),
+                base_branch: "main".into(),
+                auto_ship: true,
+                ship_status: "pending".into(),
+                ship_error: None,
+                pr_url: None,
+                last_shipped_at: None,
+                removed_at: None,
+                created_at: 1_000,
+            },
+        )
+        .unwrap();
+        created
+    }
+
+    #[test]
+    fn worktree_cwds_map_back_to_the_real_project_path() {
+        let conn = in_memory_db();
+        seed(&conn);
+        let map = |cwd: &str| project_path_for_worktree_cwd(&conn, cwd).unwrap();
+        assert_eq!(
+            map("/data/worktrees/relay-abc").as_deref(),
+            Some("/work/relay")
+        );
+        assert_eq!(
+            map("/data/worktrees/relay-abc/src").as_deref(),
+            Some("/work/relay/src")
+        );
+        // A sibling folder sharing the prefix is not inside the worktree.
+        assert_eq!(map("/data/worktrees/relay-abcdef"), None);
+        assert_eq!(
+            map("/DATA/Worktrees/relay-abc/src").as_deref(),
+            Some("/work/relay/src")
+        );
+        assert_eq!(map("/work/relay"), None);
+    }
+
+    #[test]
+    fn a_ship_can_only_be_claimed_once_until_it_finishes() {
+        let conn = in_memory_db();
+        let created = seed(&conn);
+        let task_id = &created.task.id;
+        assert!(claim_task_ship(&conn, task_id).unwrap());
+        assert!(!claim_task_ship(&conn, task_id).unwrap());
+
+        finish_task_ship(
+            &conn,
+            task_id,
+            "shipped",
+            None,
+            Some("https://gh/pull/1"),
+            2_000,
+        )
+        .unwrap();
+        let shipped = get_task_workspace(&conn, task_id).unwrap().unwrap();
+        assert_eq!(shipped.ship_status, "shipped");
+        assert_eq!(shipped.pr_url.as_deref(), Some("https://gh/pull/1"));
+        assert_eq!(shipped.last_shipped_at, Some(2_000));
+
+        // A later ship that reports no new URL keeps the PR it already has.
+        assert!(claim_task_ship(&conn, task_id).unwrap());
+        finish_task_ship(&conn, task_id, "failed", Some("push rejected"), None, 3_000).unwrap();
+        let failed = get_task_workspace(&conn, task_id).unwrap().unwrap();
+        assert_eq!(failed.pr_url.as_deref(), Some("https://gh/pull/1"));
+        assert_eq!(failed.ship_error.as_deref(), Some("push rejected"));
+        assert_eq!(failed.last_shipped_at, Some(2_000));
+    }
+
+    #[test]
+    fn interrupted_ships_are_released_at_startup() {
+        let conn = in_memory_db();
+        let created = seed(&conn);
+        assert!(claim_task_ship(&conn, &created.task.id).unwrap());
+        reset_interrupted_task_ships(&conn).unwrap();
+        let workspace = get_task_workspace(&conn, &created.task.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(workspace.ship_status, "failed");
+        assert!(claim_task_ship(&conn, &created.task.id).unwrap());
+    }
+
+    #[test]
+    fn card_ships_badge_the_card_their_task_drives() {
+        let conn = in_memory_db();
+        let created = seed(&conn);
+        let ships = list_card_ships(&conn, "p1").unwrap();
+        assert_eq!(ships.len(), 1);
+        assert_eq!(Some(ships[0].card_id.clone()), created.task.card_id);
+        assert_eq!(ships[0].branch, "relay/add-dark-mode-abc");
+    }
+
+    #[test]
+    fn a_card_resolves_to_its_newest_task_workspace() {
+        let conn = in_memory_db();
+        let created = seed(&conn);
+        let card_id = created.task.card_id.clone().unwrap();
+        assert_eq!(
+            latest_task_workspace_for_card(&conn, "no-such-card")
+                .unwrap()
+                .map(|w| w.task_id),
+            None
+        );
+        let first = latest_task_workspace_for_card(&conn, &card_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.task_id, created.task.id);
+
+        let again = create_dispatch_task(
+            &conn,
+            "p1",
+            Some(&card_id),
+            "Add dark mode",
+            "Try again",
+            "claude",
+            "default",
+            None,
+            2_000,
+        )
+        .unwrap();
+        insert_task_workspace(
+            &conn,
+            &TaskWorkspace {
+                task_id: again.task.id.clone(),
+                worktree_path: "/data/worktrees/relay-def".into(),
+                work_dir: "/data/worktrees/relay-def".into(),
+                branch: "relay/add-dark-mode-def".into(),
+                created_at: 2_000,
+                ..first
+            },
+        )
+        .unwrap();
+        let newest = latest_task_workspace_for_card(&conn, &card_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(newest.task_id, again.task.id);
+        assert_eq!(newest.branch, "relay/add-dark-mode-def");
     }
 }

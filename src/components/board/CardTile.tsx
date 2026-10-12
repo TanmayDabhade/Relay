@@ -1,15 +1,18 @@
 import { agentMeta } from "../../lib/agents";
-import type { Card, Session } from "../../lib/types";
+import { openUrl } from "../../lib/tauri";
+import type { Card, CardShip, Session } from "../../lib/types";
+import { prLabel, SHIP_LABELS } from "../../lib/ship";
 import "./CardTile.css";
 
 interface CardTileProps {
   card: Card;
   linkedSession: Session | null;
+  ship?: CardShip | null;
   onClick: () => void;
   onDragStart: (cardId: string) => void;
 }
 
-export function CardTile({ card, linkedSession, onClick, onDragStart }: CardTileProps) {
+export function CardTile({ card, linkedSession, ship, onClick, onDragStart }: CardTileProps) {
   return (
     <div
       className="card-tile"
@@ -29,6 +32,25 @@ export function CardTile({ card, linkedSession, onClick, onDragStart }: CardTile
           {agentMeta(linkedSession.agent).icon} {linkedSession.model ?? agentMeta(linkedSession.agent).label}
           {linkedSession.cost_usd > 0 ? ` · $${linkedSession.cost_usd.toFixed(2)}` : ""}
         </div>
+      ) : null}
+      {ship ? (
+        ship.pr_url ? (
+          <button
+            type="button"
+            className={`ship-badge is-${ship.ship_status}`}
+            title={`${ship.branch} — open the pull request`}
+            onClick={(event) => {
+              event.stopPropagation();
+              void openUrl(ship.pr_url!);
+            }}
+          >
+            ↗ {prLabel(ship.pr_url)}
+          </button>
+        ) : (
+          <span className={`ship-badge is-${ship.ship_status}`} title={ship.branch}>
+            {SHIP_LABELS[ship.ship_status]}
+          </span>
+        )
       ) : null}
     </div>
   );

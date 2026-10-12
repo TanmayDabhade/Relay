@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  AddedProject,
   AgentConnection,
   BoardColumn,
   BoardData,
@@ -11,15 +12,32 @@ import type {
   DispatchConversation,
   DispatchTaskWithRun,
   FileDiff,
+  CardChanges,
+  CardShip,
   GitInsights,
+  Plan,
   ProjectSummary,
   ReportData,
   Session,
   SessionDetail,
+  TaskDraft,
+  TaskWorkspace,
 } from "./types";
 
 export function listProjects(): Promise<ProjectSummary[]> {
   return invoke("list_projects");
+}
+
+/** Clones a pasted GitHub link (or `owner/name`) with `gh` into `parentDir` (default
+ * `~/RelayProjects`) and registers it as a project. Can take a while for large repos. */
+export function cloneProject(url: string, parentDir?: string): Promise<AddedProject> {
+  return invoke("clone_project", { url, parentDir: parentDir ?? null });
+}
+
+/** Registers a folder already on disk as a project, once `gh` confirms it's a GitHub
+ * repository the user can access. */
+export function addExistingProject(path: string): Promise<AddedProject> {
+  return invoke("add_existing_project", { path });
 }
 
 export function listSessions(): Promise<Session[]> {
@@ -46,18 +64,20 @@ export function getProjectGitInsights(projectPath: string): Promise<GitInsights>
   return invoke("project_git_insights", { projectPath });
 }
 
-export function getDashboardStats(): Promise<DashboardStats> {
-  return invoke("dashboard_stats");
+/** `projectId` scopes every number to one project; `null` covers all projects. */
+export function getDashboardStats(projectId: string | null): Promise<DashboardStats> {
+  return invoke("dashboard_stats", { projectId });
 }
 
-export function generateReport(rangeDays: number): Promise<ReportData> {
-  return invoke("generate_report", { rangeDays });
+/** `projectId` scopes the report to one project; `null` reports on all projects. */
+export function generateReport(rangeDays: number, projectId: string | null): Promise<ReportData> {
+  return invoke("generate_report", { rangeDays, projectId });
 }
 
 /** Writes the report as Markdown to the user's Downloads folder and resolves to the
  * absolute path it was saved at, for a "Reveal in Finder" follow-up action. */
-export function exportReport(rangeDays: number): Promise<string> {
-  return invoke("export_report", { rangeDays });
+export function exportReport(rangeDays: number, projectId: string | null): Promise<string> {
+  return invoke("export_report", { rangeDays, projectId });
 }
 
 export function revealInFinder(path: string): Promise<void> {
@@ -152,11 +172,14 @@ export function dispatchTask(request: {
   model: string;
   /** Loop until the agent reports done, up to this many continuations; omit for one turn. */
   loopMaxIterations?: number | null;
+  /** Run in an isolated git worktree and commit, push, and open a PR when the task finishes. */
+  openPr?: boolean;
 }): Promise<CreatedDispatch> {
   return invoke("dispatch_task", {
     ...request,
     cardId: request.cardId ?? null,
     loopMaxIterations: request.loopMaxIterations ?? null,
+    openPr: request.openPr ?? false,
   });
 }
 
@@ -202,4 +225,48 @@ export function resolveDispatchApproval(
 
 export function shutdownDispatchConversation(runId: string): Promise<void> {
   return invoke("shutdown_dispatch_conversation", { runId });
+}
+
+export function getTaskWorkspace(taskId: string): Promise<TaskWorkspace | null> {
+  return invoke("get_task_workspace", { taskId });
+}
+
+export function listCardShips(projectId: string): Promise<CardShip[]> {
+  return invoke("list_card_ships", { projectId });
+}
+
+/** The commits and per-file diff of the branch behind a card's newest PR-bound task, or
+ * null when the card has none. Reads local git only; nothing is fetched from GitHub. */
+export function getCardChanges(cardId: string): Promise<CardChanges | null> {
+  return invoke("get_card_changes", { cardId });
+}
+
+/** Commits, pushes, and opens (or updates) the task's PR now. Resolves once the ship has
+ * started; the outcome arrives as a `data-changed` event and a notice in the conversation. */
+export function shipTask(taskId: string): Promise<void> {
+  return invoke("ship_task", { taskId });
+}
+
+/** Turns a rough note into a precise agent task by running the local claude CLI read-only in
+ * the project. Takes tens of seconds. */
+export function draftTask(
+  projectId: string,
+  rough: string,
+  currentTitle?: string,
+): Promise<TaskDraft> {
+  return invoke("draft_task", { projectId, rough, currentTitle: currentTitle ?? null });
+}
+
+/** Breaks a goal into ordered, dispatchable tasks after reading the project. Takes a minute
+ * or more on larger repos. */
+export function planTasks(projectId: string, goal: string): Promise<Plan> {
+  return invoke("plan_tasks", { projectId, goal });
+}
+
+/** Adds approved plan tasks to the project's Todo column, in order. */
+export function createPlannedCards(
+  projectId: string,
+  tasks: { title: string; prompt: string }[],
+): Promise<Card[]> {
+  return invoke("create_planned_cards", { projectId, tasks });
 }

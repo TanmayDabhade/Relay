@@ -208,6 +208,7 @@ fn process_file(app_handle: &AppHandle, path: &Path, source: &AgentSource) {
     let raw_log_path = path.to_string_lossy().to_string();
     let mut anything_changed = false;
     let mut session_created = false;
+    let mut project_touched = false;
 
     for line in lines {
         let Some(record) = (source.parse_line)(&line, path) else {
@@ -224,12 +225,20 @@ fn process_file(app_handle: &AppHandle, path: &Path, source: &AgentSource) {
                 if outcome.session_created.is_some() {
                     session_created = true;
                 }
+                project_touched |= outcome.project_touched.is_some();
             }
             Err(e) => log::warn!("failed to ingest record from {}: {e:#}", path.display()),
         }
     }
 
     drop(conn);
+
+    // A cwd seen for the first time needs a GitHub check before it can be listed. The
+    // verifier coalesces wakes and only checks unchecked/stale rows, so waking on every touch
+    // is cheap.
+    if project_touched {
+        crate::projects::wake_github_verifier(app_handle);
+    }
 
     if anything_changed {
         let _ = app_handle.emit(

@@ -348,6 +348,11 @@
   align-items: start;
 }
 
+/* Scoped to one project: no project ranking, so spend by agent takes the full width. */
+.dashboard-columns.dashboard-columns-single {
+  grid-template-columns: minmax(0, 1fr);
+}
+
 .dashboard-column {
   min-width: 0;
 }

@@ -1,7 +1,10 @@
 use crate::activity;
+use crate::assist;
 use crate::db::{queries, Db};
 use crate::dispatch::{self, looping, AgentCommand, Runtime};
 use crate::parser;
+use crate::projects;
+use crate::ship::{self, ShipTrigger};
 use crate::terminal;
 use chrono::{Duration, NaiveDate, Utc};
 use serde::Serialize;
@@ -16,6 +19,109 @@ const HEATMAP_DAYS: i64 = 365;
 pub fn list_projects(db: State<'_, Db>) -> Result<Vec<queries::ProjectSummary>, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
     queries::list_projects(&conn).map_err(|e| e.to_string())
+}
+
+/// Clones a pasted GitHub link (or `owner/name`) with `gh` into `parent_dir` (default
+/// `~/RelayProjects`, created if missing) and registers it as a project. A destination that
+/// already holds a checkout of the same repository is registered as-is; anything else there is
+/// an error, never overwritten. Async + `spawn_blocking`: the clone can take minutes and must
+/// neither block the UI thread nor hold the DB lock, which is only taken for the final write.
+#[tauri::command]
+pub async fn clone_project(
+    app: tauri::AppHandle,
+    db: State<'_, Db>,
+    url: String,
+    parent_dir: Option<String>,
+) -> Result<projects::AddedProject, String> {
+    let (owner, name) = projects::parse_github_repo(&url).ok_or_else(|| {
+        "that doesn't look like a GitHub repository — paste a link like \
+         https://github.com/owner/name or just owner/name"
+            .to_string()
+    })?;
+    let parent = match parent_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
+        Some(custom) => {
+            let custom = std::path::PathBuf::from(custom);
+            if !custom.is_absolute() || !custom.is_dir() {
+                return Err(format!("{} is not an existing folder", custom.display()));
+            }
+            custom
+        }
+        None => {
+            let default = projects::default_clone_parent()
+                .ok_or("couldn't find your home folder to clone into")?;
+            std::fs::create_dir_all(&default).map_err(|e| e.to_string())?;
+            default
+        }
+    };
+    let (dest, github_repo) = tauri::async_runtime::spawn_blocking(move || {
+        let dest = match projects::plan_clone_target(&parent, &owner, &name)? {
+            projects::CloneTarget::Clone(dest) => {
+                ship::git::clone_github_repo(&format!("{owner}/{name}"), &dest)?;
+                dest
+            }
+            projects::CloneTarget::AlreadyCloned(dest) => dest,
+        };
+        let repo = verified_github_repo(&dest)?;
+        anyhow::Ok((dest, repo))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| format!("{e:#}"))?;
+    let added = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        projects::register_project(&conn, &dest, &github_repo, Utc::now().timestamp())
+            .map_err(|e| format!("{e:#}"))?
+    };
+    emit_data_changed(&app);
+    Ok(added)
+}
+
+/// Registers a folder already on disk as a project, once `gh` confirms it's a GitHub
+/// repository the user can access.
+#[tauri::command]
+pub async fn add_existing_project(
+    app: tauri::AppHandle,
+    db: State<'_, Db>,
+    path: String,
+) -> Result<projects::AddedProject, String> {
+    let path = path.trim().to_string();
+    let (folder, github_repo) = tauri::async_runtime::spawn_blocking(move || {
+        let folder = std::path::Path::new(&path)
+            .canonicalize()
+            .map_err(|_| anyhow::anyhow!("{path} doesn't exist"))?;
+        anyhow::ensure!(folder.is_dir(), "{path} is not a folder");
+        let repo = verified_github_repo(&folder)?;
+        anyhow::Ok((folder, repo))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| format!("{e:#}"))?;
+    let added = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        projects::register_project(&conn, &folder, &github_repo, Utc::now().timestamp())
+            .map_err(|e| format!("{e:#}"))?
+    };
+    emit_data_changed(&app);
+    Ok(added)
+}
+
+/// The folder's GitHub repository, or an error saying why it can't be added. Blocking.
+fn verified_github_repo(folder: &std::path::Path) -> anyhow::Result<String> {
+    match ship::git::check_folder_github(folder) {
+        ship::git::GithubCheck::Verified(repo) => Ok(repo),
+        ship::git::GithubCheck::NotGithub(reason)
+        | ship::git::GithubCheck::Inconclusive(reason) => {
+            anyhow::bail!(
+                "{} can't be added as a project: {reason}. Relay only lists GitHub repositories \
+                 your `gh` can access (check `gh auth status`).",
+                folder.display()
+            )
+        }
+    }
 }
 
 #[tauri::command]
@@ -271,12 +377,20 @@ pub struct DashboardStats {
 const TOP_PROJECTS_LIMIT: usize = 5;
 
 #[tauri::command]
-pub fn dashboard_stats(db: State<'_, Db>) -> Result<DashboardStats, String> {
+pub fn dashboard_stats(
+    db: State<'_, Db>,
+    project_id: Option<String>,
+) -> Result<DashboardStats, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
+    // `Some` scopes every number to the active workspace project.
+    let project_id = project_id.as_deref();
 
     // Headline numbers (total_cost_usd/total_sessions/total_projects/top_projects) all derive
     // from this one list.
     let mut projects = queries::list_projects(&conn).map_err(|e| e.to_string())?;
+    if let Some(project_id) = project_id {
+        projects.retain(|project| project.id == project_id);
+    }
     let total_cost_usd: f64 = projects.iter().map(|p| p.total_cost_usd).sum();
     let total_sessions: i64 = projects.iter().map(|p| p.session_count).sum();
     let total_projects = projects.len() as i64;
@@ -290,8 +404,9 @@ pub fn dashboard_stats(db: State<'_, Db>) -> Result<DashboardStats, String> {
     });
     projects.truncate(TOP_PROJECTS_LIMIT);
 
-    let agent_usage = queries::agent_usage(&conn).map_err(|e| e.to_string())?;
-    let active_session = queries::most_recent_active_session(&conn).map_err(|e| e.to_string())?;
+    let agent_usage = queries::agent_usage(&conn, project_id).map_err(|e| e.to_string())?;
+    let active_session =
+        queries::most_recent_active_session(&conn, project_id).map_err(|e| e.to_string())?;
 
     let today = Utc::now().date_naive();
     let window_start = today - Duration::days(HEATMAP_DAYS - 1);
@@ -300,8 +415,8 @@ pub fn dashboard_stats(db: State<'_, Db>) -> Result<DashboardStats, String> {
         .expect("midnight is always a valid time")
         .and_utc()
         .timestamp();
-    let counts_by_day =
-        queries::daily_activity_counts(&conn, since_epoch).map_err(|e| e.to_string())?;
+    let counts_by_day = queries::daily_activity_counts(&conn, since_epoch, project_id)
+        .map_err(|e| e.to_string())?;
 
     let daily_activity = dense_daily_activity(window_start, today, &counts_by_day);
 
@@ -345,29 +460,48 @@ fn dense_daily_activity(
 pub struct ReportData {
     pub range_days: i64,
     pub since_epoch: i64,
+    /// The project the report is scoped to, or `None` for an all-projects report.
+    pub project_name: Option<String>,
     pub totals: queries::ReportTotals,
     pub by_project: Vec<queries::ReportProjectRow>,
     pub by_tag: Vec<queries::ReportTagRow>,
     pub by_agent: Vec<queries::AgentUsage>,
 }
 
-fn build_report(conn: &rusqlite::Connection, range_days: i64) -> Result<ReportData, String> {
+/// `project_id` scopes the report to one project (the active workspace project); `None`
+/// reports on every project.
+fn build_report(
+    conn: &rusqlite::Connection,
+    range_days: i64,
+    project_id: Option<&str>,
+) -> Result<ReportData, String> {
     let since_epoch = (Utc::now() - Duration::days(range_days)).timestamp();
+    let project_name = match project_id {
+        Some(id) => queries::project_name(conn, id).map_err(|e| e.to_string())?,
+        None => None,
+    };
 
     Ok(ReportData {
         range_days,
         since_epoch,
-        totals: queries::report_totals(conn, since_epoch).map_err(|e| e.to_string())?,
-        by_project: queries::report_by_project(conn, since_epoch).map_err(|e| e.to_string())?,
-        by_tag: queries::report_by_tag(conn, since_epoch).map_err(|e| e.to_string())?,
-        by_agent: queries::agent_usage_since(conn, since_epoch).map_err(|e| e.to_string())?,
+        project_name,
+        totals: queries::report_totals(conn, since_epoch, project_id).map_err(|e| e.to_string())?,
+        by_project: queries::report_by_project(conn, since_epoch, project_id)
+            .map_err(|e| e.to_string())?,
+        by_tag: queries::report_by_tag(conn, since_epoch, project_id).map_err(|e| e.to_string())?,
+        by_agent: queries::agent_usage_since(conn, since_epoch, project_id)
+            .map_err(|e| e.to_string())?,
     })
 }
 
 #[tauri::command]
-pub fn generate_report(db: State<'_, Db>, range_days: i64) -> Result<ReportData, String> {
+pub fn generate_report(
+    db: State<'_, Db>,
+    range_days: i64,
+    project_id: Option<String>,
+) -> Result<ReportData, String> {
     let conn = db.0.lock().map_err(|e| e.to_string())?;
-    build_report(&conn, range_days)
+    build_report(&conn, range_days, project_id.as_deref())
 }
 
 /// Renders the same data `generate_report` returns as a standalone Markdown document, writes
@@ -377,10 +511,14 @@ pub fn generate_report(db: State<'_, Db>, range_days: i64) -> Result<ReportData,
 /// locked-down sandbox) rather than the app-data directory, since the whole point is for the
 /// user to find this file and hand it to someone else.
 #[tauri::command]
-pub fn export_report(db: State<'_, Db>, range_days: i64) -> Result<String, String> {
+pub fn export_report(
+    db: State<'_, Db>,
+    range_days: i64,
+    project_id: Option<String>,
+) -> Result<String, String> {
     let report = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
-        build_report(&conn, range_days)?
+        build_report(&conn, range_days, project_id.as_deref())?
     };
 
     let dir = dirs::download_dir()
@@ -397,10 +535,16 @@ pub fn export_report(db: State<'_, Db>, range_days: i64) -> Result<String, Strin
 
 fn render_report_markdown(report: &ReportData) -> String {
     let mut out = String::new();
-    out.push_str(&format!(
-        "# Relay spend report — last {} days\n\n",
-        report.range_days
-    ));
+    match &report.project_name {
+        Some(project) => out.push_str(&format!(
+            "# Relay spend report — {project}, last {} days\n\n",
+            report.range_days
+        )),
+        None => out.push_str(&format!(
+            "# Relay spend report — last {} days\n\n",
+            report.range_days
+        )),
+    }
     out.push_str(&format!(
         "Generated {}\n\n",
         Utc::now().format("%Y-%m-%d %H:%M UTC")
@@ -696,6 +840,7 @@ pub fn dispatch_task(
     agent: String,
     model: String,
     loop_max_iterations: Option<i64>,
+    open_pr: Option<bool>,
 ) -> Result<queries::CreatedDispatch, String> {
     let loop_max_iterations = looping::validate_max_iterations(loop_max_iterations)?;
     let title = title.trim();
@@ -725,7 +870,38 @@ pub fn dispatch_task(
     };
     let command = configured_command(&config, &model, &agent_prompt, None)?;
 
-    let created = {
+    // The worktree is created before any task row exists (git I/O, so no DB lock), keyed by a
+    // throwaway id that only names the branch/folder. Every failure after this point must
+    // discard it, or a dead branch and folder would be left behind.
+    let workspace = if open_pr.unwrap_or(false) {
+        let root = ship::worktrees_root(&app).map_err(|e| e.to_string())?;
+        let naming_id = uuid::Uuid::new_v4().to_string();
+        Some(
+            ship::git::prepare_workspace(
+                &root,
+                &project_path,
+                &naming_id,
+                title,
+                true,
+                Utc::now().timestamp(),
+            )
+            .map_err(|e| format!("{e:#}"))?,
+        )
+    } else {
+        None
+    };
+    let discard_workspace = |workspace: &Option<queries::TaskWorkspace>| {
+        if let Some(workspace) = workspace {
+            if let Err(error) = ship::git::discard_workspace(workspace) {
+                log::warn!(
+                    "could not discard worktree {}: {error:#}",
+                    workspace.worktree_path
+                );
+            }
+        }
+    };
+
+    let created = (|| -> Result<queries::CreatedDispatch, String> {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
         let transaction = conn.unchecked_transaction().map_err(|e| e.to_string())?;
         if queries::has_active_dispatch_for_project_agent(&transaction, &project_id, &agent)
@@ -784,9 +960,25 @@ pub fn dispatch_task(
             Utc::now().timestamp(),
         )
         .map_err(|e| e.to_string())?;
+        if let Some(workspace) = &workspace {
+            let mut row = workspace.clone();
+            row.task_id = created.task.id.clone();
+            queries::insert_task_workspace(&transaction, &row).map_err(|e| e.to_string())?;
+        }
         transaction.commit().map_err(|e| e.to_string())?;
-        created
+        Ok(created)
+    })();
+    let created = match created {
+        Ok(created) => created,
+        Err(error) => {
+            discard_workspace(&workspace);
+            return Err(error);
+        }
     };
+    let working_dir = workspace
+        .as_ref()
+        .map(|workspace| workspace.work_dir.clone())
+        .unwrap_or_else(|| project_path.clone());
 
     let (turn, user_event) = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
@@ -804,7 +996,7 @@ pub fn dispatch_task(
         created.run.id.clone(),
         turn.id.clone(),
         agent.clone(),
-        &project_path,
+        &working_dir,
         command,
     ) {
         let message = error.to_string();
@@ -824,7 +1016,7 @@ pub fn retry_dispatch_task(
     agent: String,
     model: String,
 ) -> Result<queries::CreatedDispatch, String> {
-    let (task, config, project_path, loop_max_iterations) = {
+    let gathered = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
         let task = queries::get_dispatch_task(&conn, &task_id)
             .map_err(|e| e.to_string())?
@@ -853,7 +1045,21 @@ pub fn retry_dispatch_task(
         if active {
             return Err("this task already has an active run".to_string());
         }
-        (task, config, project_path, loop_max_iterations)
+        let workspace = queries::get_task_workspace(&conn, &task_id).map_err(|e| e.to_string())?;
+        (task, config, project_path, loop_max_iterations, workspace)
+    };
+    let (task, config, project_path, loop_max_iterations, workspace) = gathered;
+    // A shut-down conversation's worktree was removed; recreate it on the same branch so the
+    // retry keeps building (and shipping) onto the same PR. Git I/O, so outside the lock.
+    let working_dir = match &workspace {
+        Some(workspace) => {
+            ship::git::ensure_worktree(workspace).map_err(|e| format!("{e:#}"))?;
+            let conn = db.0.lock().map_err(|e| e.to_string())?;
+            queries::set_task_workspace_removed(&conn, &task_id, None)
+                .map_err(|e| e.to_string())?;
+            workspace.work_dir.clone()
+        }
+        None => project_path,
     };
     let agent_prompt = match loop_max_iterations {
         Some(_) => looping::initial_prompt(&task.prompt),
@@ -900,7 +1106,7 @@ pub fn retry_dispatch_task(
         created.run.id.clone(),
         turn.id.clone(),
         agent.clone(),
-        &project_path,
+        &working_dir,
         command,
     ) {
         let message = error.to_string();
@@ -980,7 +1186,13 @@ fn start_follow_up_turn(app: &tauri::AppHandle, run_id: &str, prompt: &str) -> R
         let project_path = queries::project_path(&conn, &task.project_id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("project {} was not found", task.project_id))?;
-        (run, config, project_path)
+        // A PR-bound task keeps every turn in its worktree; the provider session it resumes
+        // was started there too.
+        let working_dir = queries::get_task_workspace(&conn, &task.id)
+            .map_err(|e| e.to_string())?
+            .map(|workspace| workspace.work_dir)
+            .unwrap_or(project_path);
+        (run, config, working_dir)
     };
     let command = configured_command(
         &config,
@@ -1042,7 +1254,16 @@ pub fn continue_dispatch_loop(
         run.loop_iterations,
         last_message.as_deref(),
     ) {
-        looping::LoopDecision::Stop => {}
+        looping::LoopDecision::Stop => {
+            // A non-looping turn that completed cleanly is the task's finish line. Every such
+            // turn ships, so a follow-up's new commits are pushed onto the same PR.
+            if turn_status == "completed"
+                && run.status == "idle"
+                && run.loop_max_iterations.is_none()
+            {
+                auto_ship(app, &run.task_id);
+            }
+        }
         looping::LoopDecision::Done => {
             append_loop_notice(
                 app,
@@ -1051,6 +1272,7 @@ pub fn continue_dispatch_loop(
                 "completed",
                 "Loop finished: the agent reported the task is done.",
             );
+            auto_ship(app, &run.task_id);
         }
         looping::LoopDecision::CapReached { max } => {
             append_loop_notice(
@@ -1087,6 +1309,13 @@ pub fn continue_dispatch_loop(
             }
             emit_data_changed(app);
         }
+    }
+}
+
+/// Ships a finished task if it opted into auto-shipping (see `ship::spawn_ship`).
+fn auto_ship(app: &tauri::AppHandle, task_id: &str) {
+    if let Err(error) = ship::spawn_ship(app, task_id, ShipTrigger::Auto) {
+        log::warn!("could not start shipping task {task_id}: {error:#}");
     }
 }
 
@@ -1200,16 +1429,230 @@ pub fn shutdown_dispatch_conversation(
     runtime
         .stop_for_shutdown(&run_id)
         .map_err(|e| e.to_string())?;
-    {
+    let task_id = {
         let conn = db.0.lock().map_err(|e| e.to_string())?;
         queries::shutdown_dispatch_conversation(&conn, &run_id, Utc::now().timestamp())
             .map_err(|e| e.to_string())?;
         queries::clear_pending_launch_for_dispatch_run(&conn, &run_id)
             .map_err(|e| e.to_string())?;
         queries::sync_card_for_dispatch_run(&conn, &run_id, "review").map_err(|e| e.to_string())?;
+        queries::get_dispatch_run(&conn, &run_id)
+            .map_err(|e| e.to_string())?
+            .map(|run| run.task_id)
+    };
+    // Nothing can run in the worktree any more, so free it. A retry recreates it.
+    if let Some(task_id) = task_id {
+        ship::spawn_cleanup(&app, &task_id);
     }
     emit_data_changed(&app);
     Ok(())
+}
+
+// --- Shipping (commit + push + PR) ---
+
+#[tauri::command]
+pub fn get_task_workspace(
+    db: State<'_, Db>,
+    task_id: String,
+) -> Result<Option<queries::TaskWorkspace>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    queries::get_task_workspace(&conn, &task_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn list_card_ships(
+    db: State<'_, Db>,
+    project_id: String,
+) -> Result<Vec<queries::CardShip>, String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    queries::list_card_ships(&conn, &project_id).map_err(|e| e.to_string())
+}
+
+/// A card's task branch as a pull request would show it: the workspace, its commits beyond
+/// the base, and the per-file diff.
+#[derive(Debug, Clone, Serialize)]
+pub struct CardChanges {
+    pub workspace: queries::TaskWorkspace,
+    pub commits: Vec<ship::git::CommitInfo>,
+    pub diff: ship::git::BranchDiff,
+}
+
+/// The commits and diff of the branch behind a card's newest PR-bound task, or `None` when
+/// the card never had one. Gather/compute like `ship::spawn_ship`: the DB lock is held only
+/// for the workspace lookup, and the git reads (which can take a while on a big branch) run
+/// after it is released, on a blocking thread so they don't stall the UI thread either.
+#[tauri::command]
+pub async fn get_card_changes(
+    db: State<'_, Db>,
+    card_id: String,
+) -> Result<Option<CardChanges>, String> {
+    let workspace = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        queries::latest_task_workspace_for_card(&conn, &card_id).map_err(|e| e.to_string())?
+    };
+    let Some(workspace) = workspace else {
+        return Ok(None);
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let commits = ship::git::branch_commits(&workspace)?;
+        let diff = ship::git::branch_diff(&workspace)?;
+        anyhow::Ok(CardChanges {
+            workspace,
+            commits,
+            diff,
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map(Some)
+    .map_err(|e| format!("{e:#}"))
+}
+
+/// Manual "Ship": commit, push, and open (or update) the PR now, regardless of the task's
+/// auto-ship toggle. Refused while a turn is running, since the agent may still be editing.
+#[tauri::command]
+pub fn ship_task(app: tauri::AppHandle, db: State<'_, Db>, task_id: String) -> Result<(), String> {
+    {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        let workspace = queries::get_task_workspace(&conn, &task_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "this task was not dispatched with “Open PR when done”".to_string())?;
+        if workspace.removed_at.is_some() {
+            return Err("this task's worktree was cleaned up; retry the task to ship again".into());
+        }
+        let busy = queries::latest_run_for_task(&conn, &task_id)
+            .map_err(|e| e.to_string())?
+            .is_some_and(|run| {
+                matches!(
+                    run.status.as_str(),
+                    "queued" | "starting" | "running" | "awaiting_approval" | "interrupting"
+                )
+            });
+        if busy {
+            return Err("wait for the agent's current turn to finish before shipping".into());
+        }
+    }
+    let started =
+        ship::spawn_ship(&app, &task_id, ShipTrigger::Manual).map_err(|e| format!("{e:#}"))?;
+    if !started {
+        return Err("this task is already being shipped".into());
+    }
+    Ok(())
+}
+
+// --- Planner & task-draft assistants ---
+
+fn assist_context(db: &Db, project_id: &str) -> Result<(String, String, Vec<String>), String> {
+    let conn = db.0.lock().map_err(|e| e.to_string())?;
+    let config = queries::get_agent_config(&conn, "claude")
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "the claude agent is not configured in Connections".to_string())?;
+    if !config.enabled {
+        return Err("the assistants use the claude CLI, which is disabled in Connections".into());
+    }
+    let project_path = queries::project_path(&conn, project_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("project {project_id} was not found"))?;
+    let (_, _, cards) = queries::get_board(&conn, project_id).map_err(|e| e.to_string())?;
+    let titles = cards.into_iter().map(|card| card.title).collect();
+    Ok((config.executable, project_path, titles))
+}
+
+/// Turns a rough note into a precise agent task. Async + `spawn_blocking`: the CLI call takes
+/// tens of seconds and must neither block the UI thread nor hold the DB lock.
+#[tauri::command]
+pub async fn draft_task(
+    db: State<'_, Db>,
+    project_id: String,
+    rough: String,
+    current_title: Option<String>,
+) -> Result<assist::TaskDraft, String> {
+    if rough.trim().is_empty() {
+        return Err("write a rough note first".into());
+    }
+    let (executable, project_path, _) = assist_context(&db, &project_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        assist::draft_task(
+            &executable,
+            std::path::Path::new(&project_path),
+            &rough,
+            current_title.as_deref().unwrap_or(""),
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+pub async fn plan_tasks(
+    db: State<'_, Db>,
+    project_id: String,
+    goal: String,
+) -> Result<assist::Plan, String> {
+    if goal.trim().is_empty() {
+        return Err("describe what you want to get done first".into());
+    }
+    let (executable, project_path, titles) = assist_context(&db, &project_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        assist::plan_tasks(
+            &executable,
+            std::path::Path::new(&project_path),
+            &goal,
+            &titles,
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| format!("{e:#}"))
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct NewPlannedCard {
+    pub title: String,
+    pub prompt: String,
+}
+
+/// Adds approved plan tasks to the board's Todo column, in plan order, as one transaction.
+/// The prompt becomes the card description, which is what dispatching a card sends.
+#[tauri::command]
+pub fn create_planned_cards(
+    app: tauri::AppHandle,
+    db: State<'_, Db>,
+    project_id: String,
+    tasks: Vec<NewPlannedCard>,
+) -> Result<Vec<queries::Card>, String> {
+    let tasks: Vec<_> = tasks
+        .into_iter()
+        .filter(|task| !task.title.trim().is_empty())
+        .collect();
+    if tasks.is_empty() {
+        return Err("select at least one task".into());
+    }
+    let cards = {
+        let conn = db.0.lock().map_err(|e| e.to_string())?;
+        let transaction = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        let (board_id, todo_id) = queries::todo_column_for_project(&transaction, &project_id)
+            .map_err(|e| e.to_string())?;
+        let mut cards = Vec::with_capacity(tasks.len());
+        for task in &tasks {
+            let prompt = task.prompt.trim();
+            cards.push(
+                queries::create_card(
+                    &transaction,
+                    &board_id,
+                    &todo_id,
+                    task.title.trim(),
+                    (!prompt.is_empty()).then_some(prompt),
+                )
+                .map_err(|e| e.to_string())?,
+            );
+        }
+        transaction.commit().map_err(|e| e.to_string())?;
+        cards
+    };
+    emit_data_changed(&app);
+    Ok(cards)
 }
 
 // --- Kanban board ---

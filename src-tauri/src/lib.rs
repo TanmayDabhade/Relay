@@ -1,9 +1,12 @@
 mod activity;
+mod assist;
 mod commands;
 mod cost;
 mod db;
 mod dispatch;
 mod parser;
+mod projects;
+mod ship;
 mod summarize;
 mod tags;
 mod terminal;
@@ -44,6 +47,10 @@ pub fn run() {
       {
         log::warn!("failed to mark prior dispatched runs interrupted: {error:#}");
       }
+      // Same reasoning for a git push/PR that was in flight when Relay exited.
+      if let Err(error) = db::queries::reset_interrupted_task_ships(&conn) {
+        log::warn!("failed to reset interrupted task ships: {error:#}");
+      }
       app.manage(db::Db(Mutex::new(conn)));
       app.manage(dispatch::Runtime::default());
       // Warm the login-shell PATH probe off the main thread so the first Connections view
@@ -66,6 +73,8 @@ pub fn run() {
       app.manage(summarize::HttpClient(reqwest::Client::new()));
       app.manage(activity::ActivityCache::new());
 
+      // Before the watcher, so its first ingest wakes find the verifier already listening.
+      projects::spawn_github_verifier(app.handle().clone());
       watcher::start(app.handle().clone());
       cost::rebuild::spawn(app.handle().clone(), usage_rebuild_targets);
       spawn_idle_sweep(app.handle().clone());
@@ -74,6 +83,8 @@ pub fn run() {
     })
     .invoke_handler(tauri::generate_handler![
       commands::list_projects,
+      commands::clone_project,
+      commands::add_existing_project,
       commands::list_sessions,
       commands::get_session_detail,
       commands::delete_session,
@@ -108,6 +119,13 @@ pub fn run() {
       commands::interrupt_dispatch_turn,
       commands::resolve_dispatch_approval,
       commands::shutdown_dispatch_conversation,
+      commands::get_task_workspace,
+      commands::list_card_ships,
+      commands::get_card_changes,
+      commands::ship_task,
+      commands::draft_task,
+      commands::plan_tasks,
+      commands::create_planned_cards,
       commands::open_url,
     ])
     .run(tauri::generate_context!())

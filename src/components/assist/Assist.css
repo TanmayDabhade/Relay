@@ -1,0 +1,233 @@
+.assist-draft {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.assist-draft-button {
+  border: 1px solid var(--border-default);
+  border-radius: 0.375rem;
+  background: var(--surface-card);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: var(--text-xs);
+  font-weight: 600;
+  padding: var(--space-1) var(--space-2);
+  cursor: pointer;
+}
+
+.assist-draft-button:hover:not(:disabled) {
+  border-color: var(--accent-border);
+  background: var(--accent-subtle);
+}
+
+.assist-draft-button:disabled {
+  color: var(--text-muted);
+  cursor: default;
+}
+
+.assist-error {
+  color: var(--red);
+  font-size: var(--text-xs);
+  font-weight: 400;
+}
+
+.planner {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.planner-goal {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.planner-goal-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.planner-goal-actions small {
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  line-height: 1.45;
+}
+
+.planner-summary {
+  margin: 0;
+  padding: var(--space-3) var(--space-4);
+  border-left: 0.1875rem solid var(--accent);
+  background: var(--accent-subtle);
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+
+.planner-tasks {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  max-height: 50vh;
+  overflow-y: auto;
+}
+
+.planner-task {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--border-default);
+  border-radius: 0.5rem;
+  background: var(--surface-card);
+}
+
+.planner-task.is-dropped {
+  opacity: 0.5;
+}
+
+.planner-task-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.planner-task-index {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+.planner-task-title {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid transparent;
+  border-radius: 0.375rem;
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  font-weight: 600;
+  padding: var(--space-1) var(--space-2);
+}
+
+.planner-task-title:hover,
+.planner-task-title:focus {
+  border-color: var(--border-default);
+  outline: none;
+}
+
+.planner-task-toggle {
+  border: none;
+  background: none;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: var(--text-xs);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.planner-task-toggle:hover {
+  color: var(--text-primary);
+}
+
+.planner-task-rationale {
+  margin: 0;
+  padding-left: 3.25rem;
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  line-height: 1.45;
+}
+
+.planner-task-prompt {
+  width: 100%;
+  border: 1px solid var(--border-default);
+  border-radius: 0.375rem;
+  background: var(--surface-card);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: 1.5;
+  padding: var(--space-2) var(--space-3);
+  resize: vertical;
+}
+
+/* Ship state, shared by the board card badge and the run inspector panel. */
+.ship-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  width: fit-content;
+  border: 1px solid var(--border-default);
+  border-radius: 999px;
+  background: var(--surface-card);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  padding: 0 var(--space-2);
+}
+
+.ship-badge.is-shipped {
+  border-color: var(--green-border);
+  background: var(--green-bg);
+  color: var(--green);
+}
+
+.ship-badge.is-failed {
+  background: var(--red-bg);
+  color: var(--red);
+}
+
+.ship-badge.is-shipping,
+.ship-badge.is-no_changes {
+  background: var(--amber-bg);
+  color: var(--amber);
+}
+
+button.ship-badge {
+  cursor: pointer;
+}
+
+.ship-panel {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border-default);
+  border-radius: 0.375rem;
+  font-size: var(--text-sm);
+}
+
+.ship-panel-branch {
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+.ship-panel-link {
+  border: none;
+  background: none;
+  color: var(--text-primary);
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+  padding: 0;
+}
+
+.ship-panel-spacer {
+  flex: 1;
+}
+
+.ship-panel-error {
+  flex-basis: 100%;
+  margin: 0;
+  color: var(--red);
+  font-size: var(--text-xs);
+  white-space: pre-wrap;
+}

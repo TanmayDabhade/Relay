@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { ActivityHeatmap } from "../components/ui/ActivityHeatmap";
-import { ProjectBoard } from "../components/board/ProjectBoard";
+import { Button } from "../components/ui/Button";
 import { StatTile } from "../components/ui/StatTile";
 import { formatRelativeTime } from "../lib/format";
 import { getProjectGitInsights, listSessions } from "../lib/tauri";
@@ -12,24 +12,23 @@ import "./ProjectDetail.css";
 
 interface ProjectDetailProps {
   project: ProjectSummary;
+  /** Makes this the active project and opens its board in the Workspace. */
+  onOpenWorkspace: () => void;
 }
 
-type ProjectTab = "overview" | "board" | "sessions";
+type ProjectTab = "overview" | "sessions";
 
 const TABS: { id: ProjectTab; label: string }[] = [
   { id: "overview", label: "Overview" },
-  { id: "board", label: "Board" },
   { id: "sessions", label: "Sessions" },
 ];
 
 /**
- * Full-page detail shown in `ProjectsView` once a project card is clicked. Three tabs
- * (Overview / Board / Sessions) behind a top tab bar rather than one long scrolling
- * column — the Kanban board in particular wants its own uncluttered page. Reuses
- * `SessionRow` rather than re-implementing row rendering
- * here, and `ProjectBoard` (shared with the old standalone Board page) for the Kanban tab.
+ * Full-page detail shown in `ProjectsView` once a project card is clicked, with Overview and
+ * Sessions tabs. The project's kanban board lives in the Workspace (`WorkspaceView`), reached
+ * through "Open workspace". Reuses `SessionRow` rather than re-implementing row rendering.
  */
-export function ProjectDetail({ project }: ProjectDetailProps) {
+export function ProjectDetail({ project, onOpenWorkspace }: ProjectDetailProps) {
   const [activeTab, setActiveTab] = useState<ProjectTab>("overview");
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
 
@@ -53,8 +52,14 @@ export function ProjectDetail({ project }: ProjectDetailProps) {
   return (
     <div className="project-detail">
       <div className="project-detail-header">
-        <h1 className="project-detail-name">{project.name}</h1>
-        <div className="project-detail-path">{project.path}</div>
+        <div className="project-detail-title-row">
+          <h1 className="project-detail-name">{project.name}</h1>
+          <Button onClick={onOpenWorkspace}>Open workspace</Button>
+        </div>
+        <div className="project-detail-path">
+          {project.github_repo ? `${project.github_repo} · ` : ""}
+          {project.path}
+        </div>
       </div>
 
       <div className="project-detail-tabs">
@@ -105,12 +110,6 @@ export function ProjectDetail({ project }: ProjectDetailProps) {
               </ul>
             )}
           </div>
-        </div>
-      )}
-
-      {activeTab === "board" && (
-        <div className="project-detail-board">
-          <ProjectBoard projectId={project.id} />
         </div>
       )}
 

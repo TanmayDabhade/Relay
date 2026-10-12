@@ -29,6 +29,8 @@ export function useDataChangedEvents() {
       queryClient.invalidateQueries({ queryKey: ["dispatch-tasks"] });
       queryClient.invalidateQueries({ queryKey: ["dispatch-runs"] });
       queryClient.invalidateQueries({ queryKey: ["dispatch-conversation"] });
+      queryClient.invalidateQueries({ queryKey: ["task-workspace"] });
+      queryClient.invalidateQueries({ queryKey: ["card-ships"] });
     });
 
     return () => {

@@ -10,6 +10,17 @@ export interface ProjectSummary {
   total_cost_usd: number;
   /** Every distinct agent with at least one session in this project. */
   agents: string[];
+  /** `owner/name` of the GitHub repository `gh` confirmed this folder belongs to. Listed
+   * projects are always verified, so this is set for every project `listProjects` returns. */
+  github_repo: string | null;
+}
+
+/** A project the user just cloned or added (`cloneProject` / `addExistingProject`). */
+export interface AddedProject {
+  id: string;
+  name: string;
+  path: string;
+  github_repo: string;
 }
 
 export interface FileChanged {
@@ -146,6 +157,8 @@ export interface ReportTagRow {
 export interface ReportData {
   range_days: number;
   since_epoch: number;
+  /** The project the report is scoped to, or null for an all-projects report. */
+  project_name: string | null;
   totals: ReportTotals;
   by_project: ReportProjectRow[];
   /** A session with multiple tags contributes to each — spend here can sum to more than
@@ -319,3 +332,111 @@ export type DispatchApprovalDecision =
   | "allowed_once"
   | "allowed_for_session"
   | "denied";
+
+export type ShipStatus = "pending" | "shipping" | "shipped" | "no_changes" | "failed";
+
+/** A PR-bound task's isolated git worktree and where its pull request stands. */
+export interface TaskWorkspace {
+  task_id: string;
+  project_path: string;
+  repo_root: string;
+  worktree_path: string;
+  /** Where the agent runs: the worktree plus the project's subdirectory within its repo. */
+  work_dir: string;
+  branch: string;
+  base_branch: string;
+  auto_ship: boolean;
+  ship_status: ShipStatus;
+  ship_error: string | null;
+  pr_url: string | null;
+  last_shipped_at: number | null;
+  /** Set once the worktree folder is cleaned up (the branch and PR remain). */
+  removed_at: number | null;
+  created_at: number;
+}
+
+export interface CardShip {
+  card_id: string;
+  task_id: string;
+  branch: string;
+  ship_status: ShipStatus;
+  pr_url: string | null;
+}
+
+/** One commit on a task branch beyond its base (`get_card_changes`). */
+export interface CommitInfo {
+  sha: string;
+  short_sha: string;
+  subject: string;
+  author: string;
+  /** Author date, unix seconds. */
+  timestamp: number;
+}
+
+export type BranchFileStatus = "added" | "modified" | "deleted" | "renamed";
+
+export interface HunkLine {
+  kind: "context" | "add" | "del";
+  /** Base-side line number; null for an added line. */
+  old_line: number | null;
+  /** Branch-side line number; null for a deleted line. */
+  new_line: number | null;
+  content: string;
+  /** git's "\ No newline at end of file" followed this line. */
+  no_newline: boolean;
+}
+
+export interface DiffHunk {
+  /** The whole `@@ -a,b +c,d @@ context` line. */
+  header: string;
+  old_start: number;
+  old_lines: number;
+  new_start: number;
+  new_lines: number;
+  lines: HunkLine[];
+}
+
+/** One file in a task branch's diff. Named apart from the session `FileDiff` above. */
+export interface BranchFileDiff {
+  /** Branch-side path (the base-side path for a deleted file). */
+  path: string;
+  /** Base-side path, for renames only. */
+  old_path: string | null;
+  status: BranchFileStatus;
+  additions: number;
+  deletions: number;
+  /** No hunks or line counts: git reported the file as binary. */
+  binary: boolean;
+  hunks: DiffHunk[];
+  /** Some of this file's lines were left out (per-file line cap or the total size cap). */
+  truncated: boolean;
+}
+
+export interface BranchDiff {
+  files: BranchFileDiff[];
+  /** The diff hit its total size cap; files after the last one listed are missing. */
+  truncated: boolean;
+}
+
+/** A card's task branch as its PR would show it: commits (oldest first) and files changed. */
+export interface CardChanges {
+  workspace: TaskWorkspace;
+  commits: CommitInfo[];
+  diff: BranchDiff;
+}
+
+export interface TaskDraft {
+  title: string;
+  prompt: string;
+}
+
+export interface PlannedTask {
+  title: string;
+  prompt: string;
+  rationale: string;
+}
+
+export interface Plan {
+  summary: string;
+  tasks: PlannedTask[];
+}

@@ -69,10 +69,11 @@
   flex: 1;
 }
 
-.project-detail-board {
+.project-detail-title-row {
   display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
 }
 
 .project-detail-commits {

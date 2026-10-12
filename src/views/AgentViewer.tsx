@@ -15,6 +15,8 @@ import type { DispatchRun, DispatchStatus } from "../lib/types";
 import { Button } from "../components/ui/Button";
 import { DispatchModal } from "../components/dispatch/DispatchModal";
 import { RunChat } from "../components/dispatch/RunChat";
+import { ShipPanel } from "../components/dispatch/ShipPanel";
+import { useActiveProject } from "../hooks/useActiveProject";
 import "./AgentViewer.css";
 
 const TURN_IN_FLIGHT_STATUSES: DispatchStatus[] = [
@@ -82,10 +84,20 @@ export function AgentViewer({
   const [actionError, setActionError] = useState<string | null>(null);
   const [busyAction, setBusyAction] = useState<string | null>(null);
 
-  const { data: entries = [], isLoading, isError } = useQuery({
+  const { activeProjectId, activeProject, setActiveProjectId } = useActiveProject();
+  const { data: allEntries, isLoading, isError } = useQuery({
     queryKey: ["dispatch-tasks", dayStart, dayEnd],
     queryFn: () => listDispatchTasks(dayStart, dayEnd),
   });
+  // Scoped to the workspace's active project. Deep links into another project's task switch
+  // the active project first (`openAgentWork` in App), so they never land on a filtered-out run.
+  const entries = useMemo(
+    () =>
+      (allEntries ?? []).filter(
+        (entry) => activeProjectId === null || entry.project_id === activeProjectId,
+      ),
+    [allEntries, activeProjectId],
+  );
   const selectedEntry =
     entries.find((entry) => entry.run.id === selectedRunId) ??
     entries.find((entry) => entry.id === selectedTaskId) ??
@@ -209,7 +221,9 @@ export function AgentViewer({
             </Button>
           ) : null}
           <div>
-            <span className="agent-viewer-eyebrow">Live Relay workspace</span>
+            <span className="agent-viewer-eyebrow">
+              {activeProject ? activeProject.name : "All projects"}
+            </span>
             <h1>Agent work</h1>
           </div>
         </div>
@@ -388,6 +402,8 @@ export function AgentViewer({
                 ) : null}
               </div>
 
+              <ShipPanel taskId={selectedEntry.id} busy={hasActiveTurn} />
+
               <div className="run-console">
                 <RunChat runId={selectedRun.id} active={hasActiveTurn} />
               </div>
@@ -447,8 +463,13 @@ export function AgentViewer({
 
       {showComposer ? (
         <DispatchModal
+          defaultProjectId={activeProjectId ?? undefined}
           onClose={() => setShowComposer(false)}
           onDispatched={(created) => {
+            // A run started for another project would be filtered out of view.
+            if (activeProjectId !== null && created.task.project_id !== activeProjectId) {
+              setActiveProjectId(created.task.project_id);
+            }
             setDate(today);
             setSelectedTaskId(created.task.id);
             setSelectedRunId(created.run.id);

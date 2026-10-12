@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { listProjects, listSessions } from "../lib/tauri";
+import { useActiveProject } from "../hooks/useActiveProject";
+import { listSessions } from "../lib/tauri";
 import { formatCost, formatRelativeTime, sessionDisplayName } from "../lib/format";
 import { colorForProject } from "../lib/projectColor";
 import { Button } from "../components/ui/Button";
@@ -101,7 +102,9 @@ function TimelineEntry({ session, projectName, onClick }: TimelineEntryProps) {
 
 export function TimelineView() {
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
-  const [projectFilter, setProjectFilter] = useState<string>("all");
+  // The project filter *is* the workspace's active project: changing it here switches the
+  // whole workspace, so Timeline never disagrees with the sidebar.
+  const { activeProjectId, activeProject, projects, setActiveProjectId } = useActiveProject();
   const [tagFilter, setTagFilter] = useState<string>("all");
   const [datePreset, setDatePreset] = useState<DatePreset>("all");
 
@@ -110,8 +113,6 @@ export function TimelineView() {
     isLoading,
     isError,
   } = useQuery({ queryKey: ["sessions"], queryFn: listSessions });
-
-  const { data: projects } = useQuery({ queryKey: ["projects"], queryFn: listProjects });
 
   const availableTags = useMemo(() => {
     if (!sessions) return [];
@@ -128,8 +129,12 @@ export function TimelineView() {
   // date preset: a session that is live right now is always relevant, even if it started
   // before "today". Project and tag filters still apply to both lists.
   const { activeSessions, pastSessions } = useMemo(() => {
+    // Only sessions of listed (GitHub-verified) projects: an unlisted folder has no name to
+    // show and nowhere to navigate to.
+    const listedIds = new Set(projects.map((project) => project.id));
     const matchesFilters = (session: Session) =>
-      (projectFilter === "all" || session.project_id === projectFilter) &&
+      listedIds.has(session.project_id) &&
+      (activeProjectId === null || session.project_id === activeProjectId) &&
       (tagFilter === "all" || parseTags(session.tags).includes(tagFilter));
     const matching = (sessions ?? []).filter(matchesFilters);
     return {
@@ -144,12 +149,14 @@ export function TimelineView() {
         )
         .sort((a, b) => timelineTimestamp(b) - timelineTimestamp(a)),
     };
-  }, [sessions, projectFilter, tagFilter, datePreset]);
+  }, [sessions, projects, activeProjectId, tagFilter, datePreset]);
 
   return (
     <div className="timeline-view">
       <div className="view-topbar">
-        <h1 className="view-topbar-title">Timeline</h1>
+        <h1 className="view-topbar-title">
+          Timeline{activeProject ? ` · ${activeProject.name}` : ""}
+        </h1>
       </div>
 
       {isLoading && <p className="timeline-view-status">Loading timeline…</p>}
@@ -171,12 +178,12 @@ export function TimelineView() {
         <>
           <div className="timeline-filters">
             <Select
-              value={projectFilter}
-              onChange={(e) => setProjectFilter(e.target.value)}
+              value={activeProjectId ?? "all"}
+              onChange={(e) => setActiveProjectId(e.target.value === "all" ? null : e.target.value)}
               aria-label="Filter by project"
             >
               <option value="all">All projects</option>
-              {projects?.map((project) => (
+              {projects.map((project) => (
                 <option key={project.id} value={project.id}>
                   {project.name}
                 </option>

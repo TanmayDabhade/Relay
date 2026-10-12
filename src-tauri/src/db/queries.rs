@@ -1716,6 +1716,29 @@ pub fn list_card_ships(conn: &Connection, project_id: &str) -> rusqlite::Result<
     rows.collect()
 }
 
+/// The workspace of the newest task dispatched from a card — the same newest-wins rule the
+/// board applies to `list_card_ships` (which it reads oldest first, so later rows win).
+pub fn latest_task_workspace_for_card(
+    conn: &Connection,
+    card_id: &str,
+) -> rusqlite::Result<Option<TaskWorkspace>> {
+    let columns = TASK_WORKSPACE_COLUMNS
+        .split(',')
+        .map(|column| format!("w.{}", column.trim()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT {columns}
+         FROM task_workspaces w
+         JOIN dispatch_tasks t ON t.id = w.task_id
+         WHERE t.card_id = ?1
+         ORDER BY w.created_at DESC, w.rowid DESC
+         LIMIT 1"
+    );
+    conn.query_row(&sql, params![card_id], row_to_task_workspace)
+        .optional()
+}
+
 /// The newest assistant message across every turn of a run — the agent's own account of what
 /// it did, used as the body of the pull request.
 pub fn last_assistant_message_for_run(
@@ -4681,5 +4704,52 @@ mod task_workspace_tests {
         assert_eq!(ships.len(), 1);
         assert_eq!(Some(ships[0].card_id.clone()), created.task.card_id);
         assert_eq!(ships[0].branch, "relay/add-dark-mode-abc");
+    }
+
+    #[test]
+    fn a_card_resolves_to_its_newest_task_workspace() {
+        let conn = in_memory_db();
+        let created = seed(&conn);
+        let card_id = created.task.card_id.clone().unwrap();
+        assert_eq!(
+            latest_task_workspace_for_card(&conn, "no-such-card")
+                .unwrap()
+                .map(|w| w.task_id),
+            None
+        );
+        let first = latest_task_workspace_for_card(&conn, &card_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.task_id, created.task.id);
+
+        let again = create_dispatch_task(
+            &conn,
+            "p1",
+            Some(&card_id),
+            "Add dark mode",
+            "Try again",
+            "claude",
+            "default",
+            None,
+            2_000,
+        )
+        .unwrap();
+        insert_task_workspace(
+            &conn,
+            &TaskWorkspace {
+                task_id: again.task.id.clone(),
+                worktree_path: "/data/worktrees/relay-def".into(),
+                work_dir: "/data/worktrees/relay-def".into(),
+                branch: "relay/add-dark-mode-def".into(),
+                created_at: 2_000,
+                ..first
+            },
+        )
+        .unwrap();
+        let newest = latest_task_workspace_for_card(&conn, &card_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(newest.task_id, again.task.id);
+        assert_eq!(newest.branch, "relay/add-dark-mode-def");
     }
 }
